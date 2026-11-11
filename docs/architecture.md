@@ -16,8 +16,8 @@ waypoint-billing-service owns what the organization pays for and consumes. NestJ
 | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | Data       | Plans, subscriptions, seats, invoices, payment method reference, usage counters (seats, storage, API calls, automation runs, guests, webhooks). |
 | API        | Plan and plan change, seats, invoices as PDF, quotas and usage, alerts, CSV export.                                                             |
-| Emits      | `subscription.changed`, `quota.threshold-reached` (80% then 90%), `invoice.issued`                                                            |
-| Listens to | `member.joined`, `member.removed`, `file.uploaded`, `file.deleted`, `automation.executed` (updates counters)                                            |
+| Emits      | `subscription.changed`, `quota.threshold-reached` (80% then 90%), `invoice.issued`                                                              |
+| Listens to | `member.joined`, `member.removed`, `file.uploaded`, `file.deleted`, `automation.executed` (updates counters)                                    |
 | External   | Payment provider (hosted payment page).                                                                                                         |
 | Phase      | Extracted later, when needed                                                                                                                    |
 

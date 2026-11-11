@@ -2,14 +2,14 @@
 
 waypoint-billing-service owns what the organization pays for and consumes. NestJS, its own PostgreSQL database (one database and one user in the shared PostgreSQL of the VPS), events over NATS JetStream through `@waypoint/nest-messaging`, internal REST for the API gateway. Local port 3012.
 
-| | |
-| --- | --- |
-| Data | Plans, subscriptions, seats, invoices, payment method reference, usage counters (seats, storage, API calls, automation runs, guests, webhooks). |
-| API | Plan and plan change, seats, invoices as PDF, quotas and usage, alerts, CSV export. |
-| Emits | `subscription.changed`, `quota.threshold-reached (80 % then 90 %)`, `invoice.issued` |
-| Listens to | `member.joined`, `member.removed`, `file.uploaded`, `file.deleted`, `automation.executed (counters)` |
-| External | Payment provider (hosted payment page). |
-| Phase | Extracted later, when needed |
+|            |                                                                                                                                                 |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Data       | Plans, subscriptions, seats, invoices, payment method reference, usage counters (seats, storage, API calls, automation runs, guests, webhooks). |
+| API        | Plan and plan change, seats, invoices as PDF, quotas and usage, alerts, CSV export.                                                             |
+| Emits      | `subscription.changed`, `quota.threshold-reached (80 % then 90 %)`, `invoice.issued`                                                            |
+| Listens to | `member.joined`, `member.removed`, `file.uploaded`, `file.deleted`, `automation.executed (counters)`                                            |
+| External   | Payment provider (hosted payment page).                                                                                                         |
+| Phase      | Extracted later, when needed                                                                                                                    |
 
 Created when paid plans open. Open inconsistency in the mockup: the free plan is "10 members, 5 GB" on the website and "5 members, 2 GB" in the app; settle it before coding limits.
 
