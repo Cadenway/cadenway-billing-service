@@ -1,7 +1,7 @@
 {
-  "name": "waypoint-billing-service",
+  "name": "cadenway-billing-service",
   "version": "0.0.0",
-  "description": "Waypoint billing service: plans, seats, invoices and quotas.",
+  "description": "Cadenway billing service: plans, seats, invoices and quotas.",
   "private": true,
   "license": "UNLICENSED",
   "type": "module",

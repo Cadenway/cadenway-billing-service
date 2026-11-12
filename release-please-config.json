@@ -3,7 +3,7 @@
   "packages": {
     ".": {
       "release-type": "node",
-      "package-name": "waypoint-billing-service",
+      "package-name": "cadenway-billing-service",
       "changelog-path": "CHANGELOG.md",
       "include-component-in-tag": false
     }
