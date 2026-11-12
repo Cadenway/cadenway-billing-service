@@ -1,6 +1,6 @@
 {
   "name": "cadenway-billing-service",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Cadenway billing service: plans, seats, invoices and quotas.",
   "private": true,
   "license": "UNLICENSED",
