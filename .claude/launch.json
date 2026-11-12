@@ -2,7 +2,7 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "waypoint-billing-service",
+      "name": "cadenway-billing-service",
       "runtimeExecutable": "pnpm",
       "runtimeArgs": [
         "start:dev"

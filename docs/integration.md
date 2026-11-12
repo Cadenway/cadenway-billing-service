@@ -4,7 +4,7 @@
 
 **Status:** This page records the target design from repository instructions and skills. Its behavior has not been verified as implemented in this snapshot.
 
-The tables and rules on this page are **target domain behavior**, not proof of a running service or an approved API. Source: `wp-billing-domain` ([Claude](../.claude/skills/wp-billing-domain/SKILL.md), [Codex](../.codex/skills/wp-billing-domain/SKILL.md)). The linked mockup and guides remain the source for product details; confirm ambiguous values before implementation.
+The tables and rules on this page are **target domain behavior**, not proof of a running service or an approved API. Source: `cw-billing-domain` ([Claude](../.claude/skills/cw-billing-domain/SKILL.md), [Codex](../.codex/skills/cw-billing-domain/SKILL.md)). The linked mockup and guides remain the source for product details; confirm ambiguous values before implementation.
 
 ## What this service owns
 
@@ -26,7 +26,7 @@ What the organization pays for and consumes.
 
 - Gauges turn warning at 80 % and critical at 90 %.
 - Downgrading is refused above the target plan limits (5 members or 20 GB in the mockup).
-- Card data never reaches Waypoint: only the provider reference is stored.
+- Card data never reaches Cadenway: only the provider reference is stored.
 
 ## Notes
 
@@ -37,7 +37,7 @@ Everything above comes from the [repositories document](https://claude.ai/artifa
 
 ## Contract and delivery sequence
 
-The `waypoint-api-contracts` repository owns HTTP and event specifications. Consumers use published `@waypoint/contracts` packages and `@waypoint/nest-messaging`; do not redefine payloads or connect to another service's database. Change contracts first, then the producing service, followed by gateways and listeners, and finally the webapp. Planned event names on this page must be checked against the actual published specification before use.
+The `cadenway-api-contracts` repository owns HTTP and event specifications. Consumers use published `@cadenway/contracts` packages and `@cadenway/nest-messaging`; do not redefine payloads or connect to another service's database. Change contracts first, then the producing service, followed by gateways and listeners, and finally the webapp. Planned event names on this page must be checked against the actual published specification before use.
 
 ## References
 

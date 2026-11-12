@@ -1,15 +1,15 @@
-# waypoint-billing-service
+# cadenway-billing-service
 
-waypoint-billing-service owns what the organization pays for and consumes. NestJS, its own PostgreSQL database (one database and one user in the shared PostgreSQL of the VPS), events over NATS JetStream through `@waypoint/nest-messaging`, internal REST for the API gateway. Local port 3012.
+cadenway-billing-service owns what the organization pays for and consumes. NestJS, its own PostgreSQL database (one database and one user in the shared PostgreSQL of the VPS), events over NATS JetStream through `@cadenway/nest-messaging`, internal REST for the API gateway. Local port 3012.
 
-| | |
-| --- | --- |
-| Data | Plans, subscriptions, seats, invoices, payment method reference, usage counters (seats, storage, API calls, automation runs, guests, webhooks). |
-| API | Plan and plan change, seats, invoices as PDF, quotas and usage, alerts, CSV export. |
-| Emits | `subscription.changed`, `quota.threshold-reached (80 % then 90 %)`, `invoice.issued` |
-| Listens to | `member.joined`, `member.removed`, `file.uploaded`, `file.deleted`, `automation.executed (counters)` |
-| External | Payment provider (hosted payment page). |
-| Phase | Extracted later, when needed |
+|            |                                                                                                                                                 |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Data       | Plans, subscriptions, seats, invoices, payment method reference, usage counters (seats, storage, API calls, automation runs, guests, webhooks). |
+| API        | Plan and plan change, seats, invoices as PDF, quotas and usage, alerts, CSV export.                                                             |
+| Emits      | `subscription.changed`, `quota.threshold-reached (80 % then 90 %)`, `invoice.issued`                                                            |
+| Listens to | `member.joined`, `member.removed`, `file.uploaded`, `file.deleted`, `automation.executed (counters)`                                            |
+| External   | Payment provider (hosted payment page).                                                                                                         |
+| Phase      | Extracted later, when needed                                                                                                                    |
 
 Created when paid plans open. Open inconsistency in the mockup: the free plan is "10 members, 5 GB" on the website and "5 members, 2 GB" in the app; settle it before coding limits.
 
@@ -17,12 +17,12 @@ Created when paid plans open. Open inconsistency in the mockup: the free plan is
 
 Requirements: Node.js LTS and pnpm (versions in `package.json`), and Docker.
 
-1. Clone this repository next to the other Waypoint repositories, flat, in one folder.
-2. To run it with the rest of Waypoint, start the stack from `waypoint-ops`; it builds the sibling
+1. Clone this repository next to the other Cadenway repositories, flat, in one folder.
+2. To run it with the rest of Cadenway, start the stack from `cadenway-ops`; it builds the sibling
    folders, this one included (`core` profile; `full` adds every other service):
 
    ```bash
-   cd ../waypoint-ops/compose
+   cd ../cadenway-ops/compose
    docker compose -f compose.yaml -f compose.local.yaml --profile core up -d
    ```
 
@@ -41,7 +41,7 @@ Run the narrowest check first; CI runs them all on every pull request.
 pnpm format:check
 pnpm lint
 pnpm typecheck
-pnpm test -- src/modules/<module>      # targeted
+pnpm test src/modules/<module>      # targeted
 pnpm test:integration                    # PostgreSQL and NATS in Docker
 pnpm test:coverage
 pnpm build

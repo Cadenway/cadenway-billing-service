@@ -1,6 +1,6 @@
-# waypoint-billing-service documentation
+# cadenway-billing-service documentation
 
-Planned role: waypoint-billing-service owns what the organization pays for and consumes. NestJS, its own PostgreSQL database (one database and one user in the shared PostgreSQL of the VPS), events over NATS JetStream through `@waypoint/nest-messaging`, internal REST for the API gateway. Local port 3012.
+Planned role: cadenway-billing-service owns what the organization pays for and consumes. NestJS, its own PostgreSQL database (one database and one user in the shared PostgreSQL of the VPS), events over NATS JetStream through `@cadenway/nest-messaging`, internal REST for the API gateway. Local port 3012.
 
 ## Current status
 

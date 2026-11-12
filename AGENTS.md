@@ -1,4 +1,4 @@
-# waypoint-billing-service: agent instructions
+# cadenway-billing-service: agent instructions
 
 These instructions are mandatory for every AI assistant working in this repository, whatever the
 vendor. [CLAUDE.md](CLAUDE.md) imports them for Claude Code. Explicit user instructions take
@@ -10,8 +10,8 @@ and [Codex](.codex/README.md) for agents, skills, commands and hooks.
 ## First read
 
 - The `MODULE.md` of the module you touch, and `src/app.module.ts` for the module list.
-- `@waypoint/contracts` (installed) and `../waypoint-api-contracts`: `openapi/internal/billing-service.yaml` and `asyncapi/billing-service.yaml`.
-- The [repositories document](https://claude.ai/artifact/BPinmYxoF3mbK8w9BMB43N), section "waypoint-billing-service", and the data model of the [integration guide](https://claude.ai/artifact/CpJHVCiFfF9j3KbHQ2S1Et).
+- `@cadenway/contracts` (installed) and `../cadenway-api-contracts`: `openapi/internal/billing-service.yaml` and `asyncapi/billing-service.yaml`.
+- The [repositories document](https://claude.ai/artifact/BPinmYxoF3mbK8w9BMB43N), section "cadenway-billing-service", and the data model of the [integration guide](https://claude.ai/artifact/CpJHVCiFfF9j3KbHQ2S1Et).
 - The mockup screens this service serves: Organisation › Facturation, Quotas et usage; the "Stockage presque plein" banner.
 - `package.json` for versions and scripts once the repository is bootstrapped. Do not restate
   versions elsewhere: a copy goes stale.
@@ -20,16 +20,16 @@ and [Codex](.codex/README.md) for agents, skills, commands and hooks.
 
 The structure and workflows below describe the bootstrap target. Check the checkout for available files and commands.
 
-waypoint-billing-service owns what the organization pays for and consumes. NestJS, its own PostgreSQL database (one database and one user in the shared PostgreSQL of the VPS), events over NATS JetStream through `@waypoint/nest-messaging`, internal REST for the API gateway. Local port 3012.
+cadenway-billing-service owns what the organization pays for and consumes. NestJS, its own PostgreSQL database (one database and one user in the shared PostgreSQL of the VPS), events over NATS JetStream through `@cadenway/nest-messaging`, internal REST for the API gateway. Local port 3012.
 
-| | |
-| --- | --- |
-| Data | Plans, subscriptions, seats, invoices, payment method reference, usage counters (seats, storage, API calls, automation runs, guests, webhooks). |
-| API | Plan and plan change, seats, invoices as PDF, quotas and usage, alerts, CSV export. |
-| Emits | `subscription.changed`, `quota.threshold-reached` (80% then 90%), `invoice.issued` |
-| Listens to | `member.joined`, `member.removed`, `file.uploaded`, `file.deleted`, `automation.executed` (updates counters) |
-| External | Payment provider (hosted payment page). |
-| Phase | Extracted later, when needed |
+|            |                                                                                                                                                 |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Data       | Plans, subscriptions, seats, invoices, payment method reference, usage counters (seats, storage, API calls, automation runs, guests, webhooks). |
+| API        | Plan and plan change, seats, invoices as PDF, quotas and usage, alerts, CSV export.                                                             |
+| Emits      | `subscription.changed`, `quota.threshold-reached` (80% then 90%), `invoice.issued`                                                              |
+| Listens to | `member.joined`, `member.removed`, `file.uploaded`, `file.deleted`, `automation.executed` (updates counters)                                    |
+| External   | Payment provider (hosted payment page).                                                                                                         |
+| Phase      | Extracted later, when needed                                                                                                                    |
 
 Created when paid plans open. Open inconsistency in the mockup: the free plan is "10 members, 5 GB" on the website and "5 members, 2 GB" in the app; settle it before coding limits.
 
@@ -45,21 +45,21 @@ Created when paid plans open. Open inconsistency in the mockup: the free plan is
 ## Architectural ownership
 
 - Business code lives in modules under `src/modules/<module>/`, each with `domain/`, `application/`, `infrastructure/`, `api/` and a `MODULE.md`.
-- Cross-cutting plumbing (config, logging, tracing, errors, auth guards, messaging) comes from the waypoint-service-kit packages (`@waypoint/nest-common`, `@waypoint/nest-messaging`, `@waypoint/nest-testing`), never re-implemented here.
+- Cross-cutting plumbing (config, logging, tracing, errors, auth guards, messaging) comes from the cadenway-service-kit packages (`@cadenway/nest-common`, `@cadenway/nest-messaging`, `@cadenway/nest-testing`), never re-implemented here.
 - The domain is pure; use cases own transactions; controllers and handlers translate.
 - Rendering of anything user-facing belongs to the webapp; this service returns data and stable error codes.
 
 ## Boundaries (hard rules)
 
-- No access to another service's database or internal code; cross-service needs use `@waypoint/contracts` routes or events.
-- NATS only through `@waypoint/nest-messaging`; config, logs, errors, health and auth guards through `@waypoint/nest-common`.
-- Routes and event payloads come from the installed `@waypoint/contracts`; never redefine them locally.
+- No access to another service's database or internal code; cross-service needs use `@cadenway/contracts` routes or events.
+- NATS only through `@cadenway/nest-messaging`; config, logs, errors, health and auth guards through `@cadenway/nest-common`.
+- Routes and event payloads come from the installed `@cadenway/contracts`; never redefine them locally.
 - The service is internal: no Traefik label, no public route; the API gateway is its only HTTP caller.
 - No sibling sources imported, no `file:` or `link:` dependency on a sibling.
 
 ## GitHub files (`.github/`)
 
-This repository carries everything GitHub reads from it; Waypoint has no organization `.github`
+This repository carries everything GitHub reads from it; Cadenway has no organization `.github`
 repository and nothing is inherited.
 
 - [`.github/README.md`](.github/README.md) is the repository home page; `CONTRIBUTING.md`,
@@ -71,21 +71,20 @@ repository and nothing is inherited.
 - The parts shared with the other repositories are duplicated on purpose; a change to them is repeated
   in each repository through its own pull request.
 
-
 ## Commands and quality gates
 
 The scripts below are this repository's contract. While the repository is being bootstrapped,
 create them with these exact names; afterwards, use them and never an ad-hoc equivalent. Run the
 narrowest check that covers the change first, then widen:
 
-| Changed | Minimum check |
-| --- | --- |
-| Domain or use case code | `pnpm test -- <module>`, then `pnpm test:coverage` |
-| Persistence, events, migrations | `pnpm test:integration -- <module>` |
-| Routes | `pnpm test -- <module>/api` and the contract tests |
-| Any source | `pnpm format:check`, `pnpm lint`, `pnpm typecheck` |
-| Build or runtime configuration | `pnpm build`, `docker compose -f compose.dev.yaml config -q` |
-| Docs or agent instructions only | Scoped formatting and link review |
+| Changed                         | Minimum check                                                |
+| ------------------------------- | ------------------------------------------------------------ |
+| Domain or use case code         | `pnpm test <module>`, then `pnpm test:coverage`              |
+| Persistence, events, migrations | `pnpm test:integration <module>`                             |
+| Routes                          | `pnpm test <module>/api` and the contract tests              |
+| Any source                      | `pnpm format:check`, `pnpm lint`, `pnpm typecheck`           |
+| Build or runtime configuration  | `pnpm build`, `docker compose -f compose.dev.yaml config -q` |
+| Docs or agent instructions only | Scoped formatting and link review                            |
 
 Report the commands you actually ran and their results; a check you did not run is reported as not
 run.
@@ -94,11 +93,11 @@ run.
 
 - Trunk-based: work branches come from `main`, named `<type>/<lowercase-kebab-description>` with a
   type among `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`,
-  `revert`; put the Waypoint task id first when there is one (`feat/way-482-sso-screen`). Never an
+  `revert`; put the Cadenway task id first when there is one (`feat/cad-482-sso-screen`). Never an
   agent name as a prefix. Validate with `git check-ref-format --branch <name>`.
 - Commits and PR titles follow Conventional Commits: `type(scope): subject`, English, imperative,
   lowercase subject, no trailing period, at most 100 characters; `!` only for a breaking change.
-- Pull requests target `main` and are squash-merged after review and green CI. release-please opens the release pull request; its merge tags the version, publishes the image to GHCR, and the deploy workflow of this repository (`.github/workflows/deploy.yml`) writes the new version into waypoint-ops (staging, then production after approval).
+- Pull requests target `main` and are squash-merged after review and green CI. release-please opens the release pull request; its merge tags the version, publishes the image to GHCR, and the deploy workflow of this repository (`.github/workflows/deploy.yml`) writes the new version into cadenway-ops (staging, then production after approval).
 - Stage only the files of your task; preserve other people's changes in the working tree.
 
 ## Hard limits (never without the user's explicit request in this conversation)
@@ -107,11 +106,11 @@ run.
 - Never run a registry publish (`npm publish`, `pnpm publish`): this repository ships as a Docker image built by CI.
 - Never force-push, and never amend or rebase commits that are already pushed.
 - Never bypass the Git hooks (`--no-verify`, `core.hooksPath` overrides, `ALLOW_MAIN_PUSH=1`,
-  `WP_SKIP_PUSH_CHECKS=1`).
+  `CW_SKIP_PUSH_CHECKS=1`).
 - Never write a token, password or private key anywhere; `.npmrc` keeps `${NODE_AUTH_TOKEN}`. Do
   not read or write secret environment files; new variables are documented in `.env.example`.
 - Never edit generated trees (`dist/`, `node_modules/`, `coverage/`, generated clients) or lockfiles by hand.
-- Never modify a sibling checkout (`../waypoint-*`) from a task in this repository.
+- Never modify a sibling checkout (`../cadenway-*`) from a task in this repository.
 - Never write into another service's database, even for a "quick fix".
 - Never edit a merged migration.
 
@@ -121,11 +120,11 @@ not to find another way around it.
 ## Agent tooling
 
 - **Claude Code**: [CLAUDE.md](CLAUDE.md) and [.claude/README.md](.claude/README.md): the
-  `wp-billing-*` agents, the `/wp-*` commands (`/wp-quality` runs the whole local gate),
+  `cw-billing-*` agents, the `/cw-*` commands (`/cw-quality` runs the whole local gate),
   path-scoped rules and hooks.
-- **Codex**: [.codex/README.md](.codex/README.md) covers the specialists, `$wp-*` skills, rules and hooks.
-- **Builders** (assigned writes): `wp-billing-module-builder`, `wp-billing-domain-builder`, `wp-billing-usecase-builder`, `wp-billing-endpoint-builder`, `wp-billing-event-builder`, `wp-billing-persistence-builder`, `wp-billing-migration-builder`, `wp-billing-test-writer`, `wp-billing-deploy-maintainer`, `wp-billing-github-maintainer`.
-- **Reviewers** (read-only): `wp-billing-module-explorer`, `wp-billing-architecture-reviewer`, `wp-billing-contract-reviewer`, `wp-billing-security-auditor`, `wp-billing-observability-reviewer`, `wp-billing-performance-reviewer`.
+- **Codex**: [.codex/README.md](.codex/README.md) covers the specialists, `$cw-*` skills, rules and hooks.
+- **Builders** (assigned writes): `cw-billing-module-builder`, `cw-billing-domain-builder`, `cw-billing-usecase-builder`, `cw-billing-endpoint-builder`, `cw-billing-event-builder`, `cw-billing-persistence-builder`, `cw-billing-migration-builder`, `cw-billing-test-writer`, `cw-billing-deploy-maintainer`, `cw-billing-github-maintainer`.
+- **Reviewers** (read-only): `cw-billing-module-explorer`, `cw-billing-architecture-reviewer`, `cw-billing-contract-reviewer`, `cw-billing-security-auditor`, `cw-billing-observability-reviewer`, `cw-billing-performance-reviewer`.
 - Specialists are available, not mandatory. Delegate a bounded responsibility with explicit files and
   checks, assign disjoint files to parallel agents and integrate their results yourself.
 
