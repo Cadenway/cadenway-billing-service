@@ -27,6 +27,17 @@ What the organization pays for and consumes.
 - Downgrading is refused above the target plan limits (5 members or 20 GB in the mockup).
 - Card data never reaches Cadenway: only the provider reference is stored.
 
+## Payment provider
+
+- The provider is Stripe, with Stripe-hosted pages for payment; the `stripe` SDK sits behind one
+  port.
+- A webhook is verified with `Stripe-Signature` over the **raw request body**, before any parsing.
+- An invoice PDF is the file Stripe hosts: keep its `invoice_pdf` reference, never render a PDF here.
+- The Stripe API version is the one pinned by the installed SDK; never set another `apiVersion`. An
+  SDK major upgrade is reviewed as an API version change.
+- The public route that receives Stripe webhooks is not in the contracts yet: it starts in
+  cadenway-api-contracts.
+
 ## Notes
 
 Created when paid plans open. Open inconsistency in the mockup: the free plan is "10 members, 5 GB" on the website and "5 members, 2 GB" in the app; settle it before coding limits.

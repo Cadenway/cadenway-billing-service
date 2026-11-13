@@ -28,12 +28,32 @@ What the organization pays for and consumes.
 - Downgrading is refused above the target plan limits (5 members or 20 GB in the mockup).
 - Card data never reaches Cadenway: only the provider reference is stored.
 
+## Payment provider
+
+- The provider is Stripe, with Stripe-hosted pages for payment; the `stripe` SDK sits behind one
+  port.
+- A webhook is verified with `Stripe-Signature` over the **raw request body**, before any parsing.
+- An invoice PDF is the file Stripe hosts: keep its `invoice_pdf` reference, never render a PDF here.
+- The Stripe API version is the one pinned by the installed SDK; never set another `apiVersion`. An
+  SDK major upgrade is reviewed as an API version change.
+- The public route that receives Stripe webhooks is not in the contracts yet: it starts in
+  cadenway-api-contracts.
+
 ## Notes
 
 Created when paid plans open. Open inconsistency in the mockup: the free plan is "10 members, 5 GB" on the website and "5 members, 2 GB" in the app; settle it before coding limits.
 
 Everything above comes from the [repositories document](https://claude.ai/artifact/BPinmYxoF3mbK8w9BMB43N) and the
 [integration guide](https://claude.ai/artifact/CpJHVCiFfF9j3KbHQ2S1Et). If the mockup disagrees with this guide, update the guide and its source skill for both assistants.
+
+## Engineering standards
+
+These skills fix the engineering standards this service follows. They are target conventions, not proof of an implementation in this snapshot.
+
+| Skill                                                                                                                                                | What it fixes                                                                                                                                                                                                                           |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cw-database-conventions` ([Claude](../.claude/skills/cw-database-conventions/SKILL.md), [Codex](../.codex/skills/cw-database-conventions/SKILL.md)) | Plural snake_case tables, `id` from `uuidv7()`, `organization_id` first in tenant indexes, `version`, `timestamptz` dates, `text` with `CHECK` for enumerations, forced row-level security, a pool of 5 connections, timeouts per role. |
+| `cw-logging-and-tracing` ([Claude](../.claude/skills/cw-logging-and-tracing/SKILL.md), [Codex](../.codex/skills/cw-logging-and-tracing/SKILL.md))    | JSON logs with fixed fields and masking, W3C `traceparent` over HTTP and NATS, the ESM start-up flags, metrics per route and lag alerts, health and shutdown semantics.                                                                 |
 
 ## Contract and delivery sequence
 
