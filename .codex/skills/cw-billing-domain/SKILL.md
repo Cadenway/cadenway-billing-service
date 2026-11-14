@@ -40,7 +40,9 @@ What the organization pays for and consumes.
 
 ## Notes
 
-Created when paid plans open. Open inconsistency in the mockup: the free plan is "10 members, 5 GB" on the website and "5 members, 2 GB" in the app; settle it before coding limits.
+Open inconsistency in the mockup: the free plan is "10 members, 5 GB" on the website and "5 members, 2 GB" in the app; settle it before coding limits.
+
+Decided: built in this repository from the start, in two steps: plans, seats, counters and quotas first, payment later. The API-call meter is fed by an `api-usage.recorded` event that the API gateway emits periodically; the event is to be added in cadenway-api-contracts first.
 
 Everything above comes from the [repositories document](https://claude.ai/artifact/BPinmYxoF3mbK8w9BMB43N) and the
 [integration guide](https://claude.ai/artifact/CpJHVCiFfF9j3KbHQ2S1Et). When the mockup and this skill disagree, the mockup wins and
