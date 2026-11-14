@@ -9,7 +9,7 @@ cadenway-billing-service owns what the organization pays for and consumes. NestJ
 | Emits      | `subscription.changed`, `quota.threshold-reached (80 % then 90 %)`, `invoice.issued`                                                            |
 | Listens to | `member.joined`, `member.removed`, `file.uploaded`, `file.deleted`, `automation.executed (counters)`                                            |
 | External   | Payment provider (hosted payment page).                                                                                                         |
-| Phase      | Extracted later, when needed                                                                                                                    |
+| Phase      | After the first version                                                                                                                         |
 
 Created when paid plans open. Open inconsistency in the mockup: the free plan is "10 members, 5 GB" on the website and "5 members, 2 GB" in the app; settle it before coding limits.
 
