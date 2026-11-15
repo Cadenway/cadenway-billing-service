@@ -28,13 +28,14 @@ Requirements: Node.js LTS and pnpm (versions in `package.json`), and Docker.
 
 1. Clone this repository next to the other Cadenway repositories, flat, in one folder.
 2. To run it with the rest of Cadenway, start the stack from `cadenway-ops`; it builds the sibling
-   folders, this one included. Follow its `docs/development.md`:
+   folders; this one is in the `full` profile, not in the default `core`. Follow its
+   `docs/development.md`:
 
    ```bash
    cd ../cadenway-ops/compose
    cp .env.example .env                        # once
    docker compose run --rm internal-token-keys # once: the key pairs of the internal token
-   docker compose up -d
+   docker compose --profile full up -d
    ```
 
 3. To work on this repository alone, against its own PostgreSQL and NATS:
