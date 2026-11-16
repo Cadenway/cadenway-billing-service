@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/Cadenway/cadenway-billing-service/compare/v0.2.0...v0.3.0) (2026-11-16)
+
+
+### Features
+
+* wire messaging and the outbox onto nest-common 0.3.0 ([#20](https://github.com/Cadenway/cadenway-billing-service/issues/20)) ([5bd6c75](https://github.com/Cadenway/cadenway-billing-service/commit/5bd6c75f8b74de9e6ed468032d951066ab3f6bb5))
+
+
+### Bug Fixes
+
+* **deploy:** keep the migrator url out of the running service ([#22](https://github.com/Cadenway/cadenway-billing-service/issues/22)) ([527feb9](https://github.com/Cadenway/cadenway-billing-service/commit/527feb990de67a1e23bd8751c560e13bcb3fd813))
+
 ## [0.2.0](https://github.com/Cadenway/cadenway-billing-service/compare/v0.1.0...v0.2.0) (2026-11-15)
 
 
