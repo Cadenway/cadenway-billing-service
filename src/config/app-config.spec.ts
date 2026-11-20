@@ -26,6 +26,7 @@ describe('appConfigSchema', () => {
       LOG_LEVEL: 'info',
       LOG_PRETTY: false,
       DATABASE_URL: 'postgres://billing_app:billing_app@localhost:5432/billing',
+      DATABASE_TRANSACTION_MAX_ATTEMPTS: 3,
       NATS_URL: 'nats://localhost:4222',
       NATS_USER: 'billing',
       NATS_PASSWORD: 'billing',
