@@ -31,13 +31,14 @@ All responses use `Cache-Control: private, no-store`.
 
 ## Events emitted
 
-None. `QuotaThresholdReached` is an internal domain fact. Publishing it for email and notifications
-to organization owners and administrators requires a published Billing event contract.
+`evt.quota.threshold-reached.v1` records the metric, used amount, limit and quota version for
+Notification. Its outbox row is committed with the observation that crossed the threshold.
 
 ## Events consumed
 
-None. `RecordUsageObservation` applies membership and attachment versions. Its event adapters
-depend on the published source and threshold contracts and their configured durable consumers.
+The retained durables consume organization creation, member joins, role changes and removals,
+and file uploads and deletions. Organization creation enrolls the tenant. The other five consumers
+apply versioned observations to the current generations.
 
 ## Invariants
 
@@ -58,6 +59,12 @@ depend on the published source and threshold contracts and their configured dura
 Drizzle unit of work locks the organization before changing observations and totals in the current
 generations. Its quota writer receives the same scope and the advanced metric version. Candidate
 updates, unchanged observations and failed writes do not create a committed alert.
+
+The rebuild worker reads signed roster, membership and attachment pages outside transactions.
+An organization lock serializes each page, invalidation and promotion. The persisted generation
+and its version fence replay or concurrent updates. Promotion requires both scans to finish and
+JetStream to confirm continuity for all six consumers. An unavailable source or broker leaves
+the tenant eligible for a later retry.
 
 ## Decisions
 
