@@ -27,6 +27,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { AppModule } from '../src/app.module.js';
 import { appConfigSchema } from '../src/config/app-config.js';
+import { configureBillingSubscriptionCache } from '../src/infrastructure/http/billing-subscription-cache.js';
 import { RecordUsageObservation } from '../src/modules/usage/application/use-cases/commands/observations/record-usage-observation/record-usage-observation.use-case.js';
 import { DrizzleActiveUsageReader } from '../src/modules/usage/infrastructure/persistence/drizzle/repositories/usage/drizzle-active-usage.repository.js';
 import { DrizzleUsageObservationUnitOfWork } from '../src/modules/usage/infrastructure/persistence/drizzle/transactions/observations/drizzle-usage-observation.unit-of-work.js';
@@ -297,6 +298,7 @@ describe('billing-service wiring', () => {
       },
       logDestination: { write: (): void => undefined },
     });
+    configureBillingSubscriptionCache(app);
     await app.init();
     signer = await InternalTokenSigner.create({
       issuer: 'api-gateway',
@@ -667,6 +669,22 @@ describe('billing-service wiring', () => {
         guests: 0,
         storageBytes: 0,
       });
+      const token = await signer.sign('billing-service', {
+        actor: { type: 'user', id: camilleMartinId },
+        organizationId,
+      });
+      const subscription = await request(service().getHttpServer())
+        .get('/internal/v1/billing/subscription')
+        .set('Authorization', `Bearer ${token}`)
+        .set('If-None-Match', '*');
+      expect(subscription.status).toBe(200);
+      expect(subscription.headers['cache-control']).toBe('private, no-store');
+      expect(subscription.body).toEqual({
+        plan: 'free',
+        seats: { used: 5, limit: 5 },
+        guestCount: 0,
+        storage: { attachmentBytesUsed: 0, limitBytes: 2_000_000_000 },
+      });
 
       await tenant.run((tx) =>
         tx.client.query(
@@ -681,6 +699,51 @@ describe('billing-service wiring', () => {
         { seats: 6, notification_version: 1, organization_version: 2 },
       ]);
       expect(thresholds).toEqual([1]);
+    });
+  });
+
+  it('keeps subscription refusals private and requires the signed gateway user and tenant', async () => {
+    const api = request(service().getHttpServer());
+    const path = '/internal/v1/billing/subscription';
+    const user = { type: 'user', id: camilleMartinId } as const;
+    const authorized = await signer.sign('billing-service', {
+      actor: user,
+      organizationId: otherOrganizationId,
+    });
+    const system = await signer.sign('billing-service', {
+      actor: { type: 'system', id: 'api-gateway' },
+      organizationId: otherOrganizationId,
+    });
+    const noTenant = await signer.sign('billing-service', { actor: user, organizationId: null });
+    const results = await Promise.all([
+      api.get(path),
+      api.get(path).set('Authorization', `Bearer ${system}`),
+      api.get(path).set('Authorization', `Bearer ${noTenant}`),
+      api
+        .get(path)
+        .query({ organizationId: atelierNordId })
+        .set('Authorization', `Bearer ${authorized}`),
+      api.get(path).set('Authorization', `Bearer ${authorized}`),
+      api
+        .get(path)
+        .set('Authorization', `Bearer ${authorized}`)
+        .set('Content-Type', 'application/json')
+        .send('{"fixture":'),
+    ]);
+    expect(results.map(({ status }) => status)).toEqual([401, 403, 403, 400, 503, 400]);
+    expect(results.map(({ body }) => body as unknown)).toEqual([
+      expect.objectContaining({ code: 'auth.token-missing' }),
+      expect.objectContaining({ code: 'auth.actor-not-allowed' }),
+      expect.objectContaining({ code: 'auth.organization-required' }),
+      expect.objectContaining({ code: 'request.invalid' }),
+      expect.objectContaining({ code: 'billing.unavailable' }),
+      expect.objectContaining({ code: 'request.invalid' }),
+    ]);
+    for (const { headers } of results) {
+      expect(headers['cache-control']).toBe('private, no-store');
+    }
+    expect(results.at(-1)?.body).toMatchObject({
+      details: { issues: [expect.objectContaining({ in: 'body' })] },
     });
   });
 

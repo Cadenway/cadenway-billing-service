@@ -24,7 +24,10 @@ writes verify the current generation pointers under the organization lock before
 
 ## API
 
-None. Billing routes require a published contract.
+`GET /internal/v1/billing/subscription` accepts a gateway token with a user actor and a verified
+organization. The gateway proves that the user is an active owner. The endpoint reads the
+current ready projection and reports an unavailable baseline with `503 billing.unavailable`.
+All responses use `Cache-Control: private, no-store`.
 
 ## Events emitted
 

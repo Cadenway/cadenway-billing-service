@@ -7,7 +7,10 @@ Usage owns the measurement of quota consumption.
 
 ## Public entry points
 
-None.
+| Entry point                   | Consumers |
+| ----------------------------- | --------- |
+| `plans.module`                | `usage`   |
+| `public/limits/get-free-plan` | `usage`   |
 
 ## Owned tables
 
@@ -15,7 +18,7 @@ None.
 
 ## API
 
-None. Billing routes require a published contract.
+None. Usage exposes the subscription read.
 
 ## Events emitted
 
