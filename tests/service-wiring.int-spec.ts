@@ -79,6 +79,16 @@ const usageTables = [
   'usage_threshold_intents',
 ] as const;
 
+/** Tenant-scoped tables of the payments module. */
+const paymentsTables = [
+  'stripe_bindings',
+  'stripe_reconciliation_receipts',
+  'stripe_subscription_snapshots',
+] as const;
+
+/** Migrations applied on a clean or upgraded database. */
+const migrationCount = 4;
+
 /**
  * Runs `docker compose` on the throwaway project.
  *
@@ -331,12 +341,12 @@ describe('billing-service wiring', () => {
     );
 
     expect(tables.rows).toEqual(
-      [...platformTables, ...usageTables].map((tablename) => ({
+      [...platformTables, ...paymentsTables, ...usageTables].map((tablename) => ({
         tablename,
         tableowner: 'billing_migrator',
       })),
     );
-    expect(journal.rows).toEqual([{ applied: 3 }]);
+    expect(journal.rows).toEqual([{ applied: migrationCount }]);
   });
 
   it('applies nothing when the migrator runs again', async () => {
@@ -345,78 +355,87 @@ describe('billing-service wiring', () => {
     const journal = await migrator.query<{ applied: number }>(
       'select count(*)::int as applied from drizzle.__drizzle_migrations',
     );
-    expect(journal.rows).toEqual([{ applied: 3 }]);
+    expect(journal.rows).toEqual([{ applied: migrationCount }]);
   });
 
-  it('upgrades the previous platform schema without losing its rows or application privileges', async () => {
-    const port = hostPort('postgres', '5432');
-    const administrator = new pg.Pool({
-      connectionString: `postgres://postgres:postgres@127.0.0.1:${port}/billing`,
-    });
-    const previous = readMigrationFiles({ migrationsFolder })[0];
-    if (previous === undefined) throw new Error('The platform migration is missing.');
+  it.each([1, migrationCount - 1])(
+    'upgrades from %i applied migrations without losing rows or application privileges',
+    async (previousCount) => {
+      const port = hostPort('postgres', '5432');
+      const administrator = new pg.Pool({
+        connectionString: `postgres://postgres:postgres@127.0.0.1:${port}/billing`,
+      });
+      const previous = readMigrationFiles({ migrationsFolder }).slice(0, previousCount);
+      expect(previous).toHaveLength(previousCount);
+      const database = `billing_upgrade_${String(previousCount)}`;
 
-    await administrator.query('create database billing_upgrade owner billing_migrator');
-    const upgrade = new pg.Pool({
-      connectionString: `postgres://billing_migrator:billing_migrator@127.0.0.1:${port}/billing_upgrade`,
-      max: 1,
-    });
-    const application = new pg.Pool({
-      connectionString: `postgres://billing_app:billing_app@127.0.0.1:${port}/billing_upgrade`,
-      max: 1,
-    });
-    try {
-      await upgrade.query('revoke create on schema public from public');
-      await upgrade.query('grant usage on schema public to billing_app');
-      await upgrade.query(
-        'alter default privileges in schema public grant select, insert, update, delete on tables to billing_app',
-      );
-      await upgrade.query('begin');
-      await upgrade.query('create schema drizzle');
-      await upgrade.query(
-        'create table drizzle.__drizzle_migrations (id serial primary key, hash text not null, created_at bigint)',
-      );
-      for (const statement of previous.sql) await upgrade.query(statement);
-      await upgrade.query(
-        'insert into drizzle.__drizzle_migrations (hash, created_at) values ($1, $2)',
-        [previous.hash, previous.folderMillis],
-      );
-      await upgrade.query(
-        `insert into processed_events (consumer, event_id)
+      await administrator.query(`create database ${database} owner billing_migrator`);
+      const upgrade = new pg.Pool({
+        connectionString: `postgres://billing_migrator:billing_migrator@127.0.0.1:${port}/${database}`,
+        max: 1,
+      });
+      const application = new pg.Pool({
+        connectionString: `postgres://billing_app:billing_app@127.0.0.1:${port}/${database}`,
+        max: 1,
+      });
+      try {
+        await upgrade.query('revoke create on schema public from public');
+        await upgrade.query('grant usage on schema public to billing_app');
+        await upgrade.query(
+          'alter default privileges in schema public grant select, insert, update, delete on tables to billing_app',
+        );
+        await upgrade.query('begin');
+        await upgrade.query('create schema drizzle');
+        await upgrade.query(
+          'create table drizzle.__drizzle_migrations (id serial primary key, hash text not null, created_at bigint)',
+        );
+        for (const migration of previous) {
+          for (const statement of migration.sql) await upgrade.query(statement);
+          await upgrade.query(
+            'insert into drizzle.__drizzle_migrations (hash, created_at) values ($1, $2)',
+            [migration.hash, migration.folderMillis],
+          );
+        }
+        await upgrade.query(
+          `insert into processed_events (consumer, event_id)
          values ('billing-service__upgrade', $1)`,
-        [camilleMartinId],
-      );
-      await upgrade.query('commit');
+          [camilleMartinId],
+        );
+        await upgrade.query('commit');
 
-      await migrate(drizzle({ client: upgrade }), { migrationsFolder });
-      expect(
-        (await application.query('select consumer, event_id from processed_events')).rows,
-      ).toEqual([{ consumer: 'billing-service__upgrade', event_id: camilleMartinId }]);
-      expect(
-        (
-          await application.query(`
+        await migrate(drizzle({ client: upgrade }), { migrationsFolder });
+        expect(
+          (await application.query('select consumer, event_id from processed_events')).rows,
+        ).toEqual([{ consumer: 'billing-service__upgrade', event_id: camilleMartinId }]);
+        expect(
+          (
+            await application.query(
+              `
             select count(*)::int as allowed
-              from (values ('usage_organizations'), ('usage_generations'), ('usage_observations'), ('usage_threshold_intents')) as tables(name)
+              from unnest($1::text[]) as tables(name)
               cross join (values ('select'), ('insert'), ('update'), ('delete')) as privileges(name)
              where has_table_privilege(current_user, tables.name, privileges.name)
-          `)
-        ).rows,
-      ).toEqual([{ allowed: 16 }]);
-      await expect(
-        application.query('create table upgrade_probe (id integer)'),
-      ).rejects.toMatchObject({
-        code: '42501',
-      });
-      expect(
-        (await upgrade.query('select count(*)::int as applied from drizzle.__drizzle_migrations'))
-          .rows,
-      ).toEqual([{ applied: 3 }]);
-    } finally {
-      await application.end();
-      await upgrade.end();
-      await administrator.end();
-    }
-  });
+          `,
+              [[...usageTables, ...paymentsTables]],
+            )
+          ).rows,
+        ).toEqual([{ allowed: 28 }]);
+        await expect(
+          application.query('create table upgrade_probe (id integer)'),
+        ).rejects.toMatchObject({
+          code: '42501',
+        });
+        expect(
+          (await upgrade.query('select count(*)::int as applied from drizzle.__drizzle_migrations'))
+            .rows,
+        ).toEqual([{ applied: migrationCount }]);
+      } finally {
+        await application.end();
+        await upgrade.end();
+        await administrator.end();
+      }
+    },
+  );
 
   it('forces row-level security on the tables that carry an organization', async () => {
     const tables = await migrator.query<{
@@ -438,6 +457,11 @@ describe('billing-service wiring', () => {
       { relname: 'idempotency_keys', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'outbox_events', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'processed_events', relrowsecurity: false, relforcerowsecurity: false },
+      ...paymentsTables.map((relname) => ({
+        relname,
+        relrowsecurity: true,
+        relforcerowsecurity: true,
+      })),
       { relname: 'usage_generations', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'usage_observations', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'usage_organizations', relrowsecurity: true, relforcerowsecurity: true },
@@ -447,6 +471,10 @@ describe('billing-service wiring', () => {
       { tablename: 'event_versions', policyname: 'event_versions_organization_isolation' },
       { tablename: 'idempotency_keys', policyname: 'idempotency_keys_organization_isolation' },
       { tablename: 'outbox_events', policyname: 'outbox_events_organization_isolation' },
+      ...paymentsTables.map((tablename) => ({
+        tablename,
+        policyname: `${tablename}_tenant_isolation`,
+      })),
       { tablename: 'usage_generations', policyname: 'usage_generations_tenant_isolation' },
       { tablename: 'usage_observations', policyname: 'usage_observations_tenant_isolation' },
       { tablename: 'usage_organizations', policyname: 'usage_organizations_tenant_isolation' },
@@ -948,7 +976,7 @@ describe('billing-service wiring', () => {
     const journal = await migrator.query<{ applied: number }>(
       'select count(*)::int as applied from drizzle.__drizzle_migrations',
     );
-    expect(journal.rows).toEqual([{ applied: 3 }]);
+    expect(journal.rows).toEqual([{ applied: migrationCount }]);
   });
 
   it('publishes a pending event through the outbox relay', async () => {
