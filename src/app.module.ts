@@ -11,7 +11,9 @@ import { Module } from '@nestjs/common';
 
 import { appConfigSchema } from './config/app-config.js';
 import type { AppConfig } from './config/app-config.js';
+import { PlansModule } from './modules/plans/plans.module.js';
 import { PlatformModule } from './modules/platform/platform.module.js';
+import { UsageModule } from './modules/usage/usage.module.js';
 
 /**
  * Class AppModule
@@ -81,6 +83,8 @@ import { PlatformModule } from './modules/platform/platform.module.js';
       }),
     }),
     PlatformModule,
+    PlansModule,
+    UsageModule,
   ],
 })
 export class AppModule {}
