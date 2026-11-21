@@ -19,8 +19,12 @@ Authenticates Stripe payment deliveries. Stripe owns hosted checkout and card da
 - `stripe_subscription_snapshots` stores the last committed plan, limits, cancellation state and
   entitlement version for the organization.
 - `stripe_reconciliation_receipts` records settled provider events by organization and event ID.
+- `stripe_checkout_attempts` reserves one unresolved hosted Checkout per organization, with
+  a hashed key per actor. It stores a short lease, immutable Stripe request parameters and
+  the response needed for replay.
 
-Migration `0003_stripe_reconciliation.sql` creates these tables with forced tenant RLS.
+Migration `0003_stripe_reconciliation.sql` creates the binding, snapshot and receipt tables
+with forced tenant RLS.
 Migration `0004_stripe_binding_unique.sql` adds independent unique indexes for the provider
 identities before Stripe admission is activated. The indexes build transactionally on the
 previously dormant Stripe binding table. If the table has been populated ahead of activation,
@@ -29,6 +33,7 @@ Migration `0005_stripe_receipt_event_unique.sql` adds an account-wide event ID g
 dormant receipts table. Existing tenant scoping stays in place. A collision at settlement
 rolls back the entitlement and its receipt. The prior Billing release can run with these
 additive indexes in place.
+Migration `0006_stripe_checkout_attempts.sql` adds the Checkout table with forced tenant RLS.
 
 ## API
 
@@ -43,6 +48,10 @@ additive indexes in place.
   issuer. Replies are private and noncacheable. A successful read with no committed snapshot
   returns the Free limits at version zero. An unavailable or invalid snapshot returns 503.
   The read is available independently of Stripe, NATS and the Usage feature flag.
+- `GET /internal/v1/billing/invoices` reads the customer binding for the organization from a
+  verified Gateway user token. It returns an empty first page for an organization without a
+  binding. Linked reads use a bounded Stripe page and an encrypted cursor bound to the
+  organization, customer and configured mode. Replies are private and noncacheable.
 
 ## Events emitted
 
@@ -97,3 +106,9 @@ this settlement commits. The endpoint does not store raw provider deliveries.
   production readiness of both quota owners and configured Stripe credentials and Team prices.
   The local mode defaults to `test`. Two endpoint signing keys can coexist during rotation.
   Subscription deliveries never create bindings.
+- Linked invoice reads require an invoice cursor key and a Stripe API key for the same mode.
+  Billing rechecks the customer binding after reading Stripe. The cursor key is configured
+  independently of webhook verification and rekeying invalidates existing invoice cursors.
+- Checkout leases fence concurrent attempts and recoveries after an uncertain provider call.
+  Any Checkout with a saved provider request stays exclusive until a durable reconciliation
+  proves its outcome. The provider call and that reconciliation are separate from reservation.

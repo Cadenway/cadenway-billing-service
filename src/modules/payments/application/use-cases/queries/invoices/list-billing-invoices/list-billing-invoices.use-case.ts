@@ -11,8 +11,8 @@ export class ListBillingInvoices {
   /** Binds the tenant-scoped authority and the provider and cursor adapters. */
   public constructor(
     private readonly bindings: StripeBindingReader,
-    private readonly provider: StripeInvoiceProvider,
-    private readonly cursors: InvoiceCursor,
+    private readonly provider: StripeInvoiceProvider | null,
+    private readonly cursors: InvoiceCursor | null,
     private readonly liveMode: boolean,
   ) {}
   // #endregion
@@ -32,6 +32,9 @@ export class ListBillingInvoices {
         return input.cursor === undefined
           ? { status: 'ok', page: { items: [], nextCursor: null } }
           : { status: 'invalid-cursor' };
+      }
+      if (this.provider === null || this.cursors === null) {
+        return { status: 'unavailable' };
       }
       const customerId: string = snapshot.binding.customerId;
       const scope = { organizationId: input.organizationId, customerId, liveMode: this.liveMode };

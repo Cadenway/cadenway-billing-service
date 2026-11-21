@@ -1,0 +1,74 @@
+import { sql } from 'drizzle-orm';
+import {
+  bigint,
+  check,
+  pgPolicy,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+} from 'drizzle-orm/pg-core';
+
+/** Durable reservations and replay records for hosted Stripe Checkout. */
+export const stripeCheckoutAttempts = pgTable(
+  'stripe_checkout_attempts',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .default(sql`uuidv7()`),
+    organizationId: uuid('organization_id').notNull(),
+    actorId: uuid('actor_id').notNull(),
+    keyDigest: text('key_digest').notNull(),
+    plan: text('plan').notNull(),
+    providerKey: text('provider_key').notNull(),
+    priceId: text('price_id'),
+    quantity: bigint('quantity', { mode: 'number' }),
+    successUrl: text('success_url'),
+    cancelUrl: text('cancel_url'),
+    providerStartedAt: timestamp('provider_started_at', { withTimezone: true }),
+    responseUrl: text('response_url'),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+    resolvedAt: timestamp('resolved_at', { withTimezone: true }),
+    leaseToken: text('lease_token'),
+    leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    version: bigint('version', { mode: 'number' }).notNull().default(1),
+  },
+  (table) => [
+    uniqueIndex('stripe_checkout_attempts_actor_key_unique').on(
+      table.organizationId,
+      table.actorId,
+      table.keyDigest,
+    ),
+    uniqueIndex('stripe_checkout_attempts_active_organization_unique')
+      .on(table.organizationId)
+      .where(sql`${table.resolvedAt} is null`),
+    check('stripe_checkout_attempts_key_digest_check', sql`${table.keyDigest} ~ '^[a-f0-9]{64}$'`),
+    check('stripe_checkout_attempts_plan_check', sql`${table.plan} = 'team'`),
+    check(
+      'stripe_checkout_attempts_version_check',
+      sql`${table.version} between 1 and 9007199254740991`,
+    ),
+    check(
+      'stripe_checkout_attempts_lease_check',
+      sql`(${table.leaseToken} is null) = (${table.leaseExpiresAt} is null)`,
+    ),
+    check(
+      'stripe_checkout_attempts_request_check',
+      sql`(${table.providerStartedAt} is null and ${table.priceId} is null and ${table.quantity} is null and ${table.successUrl} is null and ${table.cancelUrl} is null)
+        or (${table.providerStartedAt} is not null and ${table.priceId} is not null and ${table.quantity} is not null and ${table.quantity} > 0 and ${table.successUrl} is not null and ${table.cancelUrl} is not null)`,
+    ),
+    check(
+      'stripe_checkout_attempts_response_check',
+      sql`(${table.responseUrl} is null and ${table.completedAt} is null)
+        or (${table.responseUrl} is not null and ${table.completedAt} is not null
+          and ${table.providerStartedAt} is not null and ${table.leaseToken} is null)`,
+    ),
+    pgPolicy('stripe_checkout_attempts_tenant_isolation', {
+      using: sql`organization_id = nullif(current_setting('app.organization_id', true), '')::uuid`,
+      withCheck: sql`organization_id = nullif(current_setting('app.organization_id', true), '')::uuid`,
+    }),
+  ],
+).enableRLS();

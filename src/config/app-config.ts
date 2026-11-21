@@ -39,6 +39,7 @@ import { z } from 'zod';
  *   delivery mode and active endpoint keys.
  * - `BILLING_STRIPE_SETTLEMENT_ENABLED`, `BILLING_STRIPE_API_KEY` and
  *   `BILLING_STRIPE_TEAM_PRICE_IDS` gate and configure canonical provider settlement.
+ * - `BILLING_STRIPE_INVOICE_CURSOR_KEY` enables linked invoice reads and seals their cursors.
  * - `ORGANIZATION_SERVICE_URL`, `STORAGE_SERVICE_URL` and `INTERNAL_TOKEN_PRIVATE_JWK`
  *   identify and authenticate the authority reads when the worker is enabled.
  *
@@ -55,6 +56,7 @@ export type AppConfig = BaseConfig &
     readonly BILLING_STRIPE_SETTLEMENT_ENABLED: boolean;
     readonly BILLING_STRIPE_API_KEY?: string | undefined;
     readonly BILLING_STRIPE_TEAM_PRICE_IDS?: readonly string[] | undefined;
+    readonly BILLING_STRIPE_INVOICE_CURSOR_KEY?: string | undefined;
     readonly ORGANIZATION_SERVICE_URL?: string | undefined;
     readonly STORAGE_SERVICE_URL?: string | undefined;
     readonly INTERNAL_TOKEN_PRIVATE_JWK?: InternalTokenSignerConfig['INTERNAL_TOKEN_PRIVATE_JWK'];
@@ -161,6 +163,13 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
       .regex(/^(?:sk|rk)_(?:test|live)_[A-Za-z0-9_]{1,255}$/u)
       .optional(),
     BILLING_STRIPE_TEAM_PRICE_IDS: stripeTeamPrices.optional(),
+    BILLING_STRIPE_INVOICE_CURSOR_KEY: z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{43}$/u)
+      .refine((value) => Buffer.from(value, 'base64url').toString('base64url') === value, {
+        message: 'Expected a canonical base64url-encoded 32-byte invoice cursor key.',
+      })
+      .optional(),
     BILLING_USAGE_ENABLED: z
       .enum(['true', 'false'])
       .default('false')
@@ -171,7 +180,7 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
       internalTokenSignerConfigShape.INTERNAL_TOKEN_PRIVATE_JWK.optional(),
   })
   .superRefine((config, context) => {
-    if (config.BILLING_STRIPE_SETTLEMENT_ENABLED) {
+    if (config.BILLING_STRIPE_SETTLEMENT_ENABLED || config.BILLING_STRIPE_INVOICE_CURSOR_KEY) {
       const key = config.BILLING_STRIPE_API_KEY;
       if (
         key === undefined ||
@@ -181,9 +190,11 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
         context.addIssue({
           code: 'custom',
           path: ['BILLING_STRIPE_API_KEY'],
-          message: 'Required in the configured Stripe mode when settlement is enabled.',
+          message: 'Required in the configured Stripe mode for settlement or linked invoice reads.',
         });
       }
+    }
+    if (config.BILLING_STRIPE_SETTLEMENT_ENABLED) {
       for (const field of [
         'BILLING_STRIPE_WEBHOOK_SECRETS',
         'BILLING_STRIPE_TEAM_PRICE_IDS',

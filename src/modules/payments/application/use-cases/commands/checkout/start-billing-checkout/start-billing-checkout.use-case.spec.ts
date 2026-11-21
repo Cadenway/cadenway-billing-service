@@ -110,7 +110,7 @@ describe('StartBillingCheckout', () => {
   });
 
   it('retries an uncertain call using precisely the previously stored provider parameters', async () => {
-    const { authority, provider, useCase } = fixture({
+    const { authority, provider, work, useCase } = fixture({
       status: 'claimed',
       token: 'lease-b',
       providerKey: request.providerKey,
@@ -118,7 +118,27 @@ describe('StartBillingCheckout', () => {
     });
     expect(await useCase.execute(input)).toMatchObject({ status: 'ready' });
     expect(authority.prepare).not.toHaveBeenCalled();
+    expect(work.saveRequest).toHaveBeenCalledExactlyOnceWith(
+      input.organizationId,
+      'lease-b',
+      request,
+    );
     expect(provider.create).toHaveBeenCalledExactlyOnceWith(request);
+  });
+
+  it('does not retry a stored request when the final authorization refuses dispatch', async () => {
+    const { work, authority, provider, useCase } = fixture({
+      status: 'claimed',
+      token: 'lease-b',
+      providerKey: request.providerKey,
+      request,
+    });
+    vi.mocked(work.saveRequest).mockResolvedValue(false);
+
+    expect(await useCase.execute(input)).toEqual({ status: 'unavailable' });
+    expect(work.release).toHaveBeenCalledExactlyOnceWith(input.organizationId, 'lease-b');
+    expect(authority.prepare).not.toHaveBeenCalled();
+    expect(provider.create).not.toHaveBeenCalled();
   });
 
   it('retains the reservation after a provider timeout for a retry using the same identity', async () => {

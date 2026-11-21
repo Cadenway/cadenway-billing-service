@@ -34,10 +34,8 @@ export class StartBillingCheckout {
         await this.work.release(input.organizationId, claim.token);
         return { status: 'unavailable' };
       }
-      if (
-        claim.request === null &&
-        !(await this.work.saveRequest(input.organizationId, claim.token, request))
-      ) {
+      if (!(await this.work.saveRequest(input.organizationId, claim.token, request))) {
+        await this.work.release(input.organizationId, claim.token);
         return { status: 'unavailable' };
       }
 

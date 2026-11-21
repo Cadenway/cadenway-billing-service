@@ -3,6 +3,7 @@ import { createHmac, generateKeyPairSync } from 'node:crypto';
 import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 
+import { ListBillingInvoicesInternalResponse } from '@cadenway/contracts/validators/internal/billing-service';
 import { InternalTokenSigner, loadConfig, runWithOrganizationContext } from '@cadenway/nest-common';
 import type {
   Ed25519PrivateJwk,
@@ -22,6 +23,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { AppModule, createBillingApplication } from '../src/app.module.js';
 import { appConfigSchema } from '../src/config/app-config.js';
+import type { StripeInvoiceProvider } from '../src/modules/payments/application/ports/outbound/providers/invoices/stripe-invoice-provider.port.js';
 import type { StripeSubscriptionProvider } from '../src/modules/payments/application/ports/outbound/providers/subscriptions/stripe-subscription-provider.port.js';
 import { GetBillingEntitlement } from '../src/modules/payments/public/subscriptions/get-billing-entitlement.js';
 import { RecordUsageObservation } from '../src/modules/usage/application/use-cases/commands/observations/record-usage-observation/record-usage-observation.use-case.js';
@@ -30,6 +32,13 @@ import { DrizzleUsageObservationUnitOfWork } from '../src/modules/usage/infrastr
 
 const retrieveStripeSubscription = vi.hoisted(() =>
   vi.fn<StripeSubscriptionProvider['retrieve']>(),
+);
+const listStripeInvoices = vi.hoisted(() => vi.fn<StripeInvoiceProvider['list']>());
+vi.mock(
+  '../src/modules/payments/infrastructure/adapters/stripe/stripe-invoice-provider.adapter.js',
+  () => ({
+    createStripeInvoiceProvider: (): StripeInvoiceProvider => ({ list: listStripeInvoices }),
+  }),
 );
 vi.mock(
   '../src/modules/payments/infrastructure/adapters/stripe/stripe-subscription-provider.adapter.js',
@@ -90,12 +99,13 @@ const usageTables = [
 /** Tenant-scoped tables of the payments module. */
 const paymentsTables = [
   'stripe_bindings',
+  'stripe_checkout_attempts',
   'stripe_reconciliation_receipts',
   'stripe_subscription_snapshots',
 ] as const;
 
 /** Migrations applied on a clean or upgraded database. */
-const migrationCount = 6;
+const migrationCount = 7;
 const stripeFixtureKey = 'whsec_fixture';
 
 /** Signs the isolated Stripe fixture bytes without calling any external system. */
@@ -274,6 +284,8 @@ describe('billing-service wiring', () => {
     compose(
       'up',
       '--detach',
+      '--pull',
+      'never',
       '--wait',
       '--wait-timeout',
       '120',
@@ -312,6 +324,7 @@ describe('billing-service wiring', () => {
     vi.stubEnv('BILLING_STRIPE_SETTLEMENT_ENABLED', 'true');
     vi.stubEnv('BILLING_STRIPE_API_KEY', 'rk_test_local_fixture');
     vi.stubEnv('BILLING_STRIPE_TEAM_PRICE_IDS', '["price_team_fixture"]');
+    vi.stubEnv('BILLING_STRIPE_INVOICE_CURSOR_KEY', Buffer.alloc(32, 9).toString('base64url'));
     vi.stubEnv(
       'ORGANIZATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS',
       JSON.stringify(organization.publicJwk),
@@ -379,7 +392,7 @@ describe('billing-service wiring', () => {
     expect(journal.rows).toEqual([{ applied: migrationCount }]);
   });
 
-  it.each([1, 3, 4])(
+  it.each([1, 3, 4, 6])(
     'upgrades from %i applied migrations without losing rows or application privileges',
     async (previousCount) => {
       const port = hostPort('postgres', '5432');
@@ -422,7 +435,7 @@ describe('billing-service wiring', () => {
          values ('billing-service__upgrade', $1)`,
           [camilleMartinId],
         );
-        if (previousCount === 4) {
+        if (previousCount >= 4) {
           await upgrade.query("set local app.system_access = 'on'");
           await upgrade.query(
             'insert into stripe_bindings (organization_id, customer_id, subscription_id) values ($1, $2, $3)',
@@ -435,7 +448,7 @@ describe('billing-service wiring', () => {
         expect(
           (await application.query('select consumer, event_id from processed_events')).rows,
         ).toEqual([{ consumer: 'billing-service__upgrade', event_id: camilleMartinId }]);
-        if (previousCount === 4) {
+        if (previousCount >= 4) {
           const system = new SystemTransactionRunner(application);
           const binding = await system.run(
             ({ client }) =>
@@ -461,7 +474,7 @@ describe('billing-service wiring', () => {
               [[...usageTables, ...paymentsTables]],
             )
           ).rows,
-        ).toEqual([{ allowed: 28 }]);
+        ).toEqual([{ allowed: 4 * (usageTables.length + paymentsTables.length) }]);
         await expect(
           application.query('create table upgrade_probe (id integer)'),
         ).rejects.toMatchObject({
@@ -848,6 +861,62 @@ describe('billing-service wiring', () => {
     expect(results.at(-1)?.body).toMatchObject({
       details: { issues: [expect.objectContaining({ in: 'body' })] },
     });
+  });
+
+  it('returns private invoices for the signed tenant and rejects a cursor from another tenant', async () => {
+    const organizationId = '01938f6e-0000-7000-8000-000000000098';
+    const customerId = 'cus_invoice_fixture';
+    const path = '/internal/v1/billing/invoices';
+    const api = request(service().getHttpServer());
+    const system = service().get(SystemTransactionRunner);
+    await system.run(({ client }) =>
+      client.query(
+        'insert into stripe_bindings (organization_id, customer_id, subscription_id) values ($1, $2, $3)',
+        [organizationId, customerId, 'sub_invoice_fixture'],
+      ),
+    );
+    const actor = { type: 'user', id: camilleMartinId } as const;
+    const scoped = await signer.sign('billing-service', { actor, organizationId });
+    const unlinked = await signer.sign('billing-service', {
+      actor,
+      organizationId: otherOrganizationId,
+    });
+    const invoice = {
+      number: 'FAC-001',
+      periodStart: '2026-11-01T00:00:00Z',
+      periodEnd: '2026-12-01T00:00:00Z',
+      currency: 'EUR',
+      totalMinorUnits: 1200,
+      status: 'paid' as const,
+      pdfUrl: null,
+    };
+    listStripeInvoices.mockReset().mockResolvedValue({
+      invoices: [{ customerId, liveMode: false, issued: true, invoice }],
+      next: 'in_invoice_fixture',
+    });
+    const missing = await api.get(path);
+    const first = await api.get(path).query({ limit: 1 }).set('Authorization', `Bearer ${scoped}`);
+    expect(first.status).toBe(200);
+    const page = ListBillingInvoicesInternalResponse.parse(first.body);
+    expect(page.items).toEqual([invoice]);
+    expect(page.nextCursor).toBeTruthy();
+    const empty = await api.get(path).set('Authorization', `Bearer ${unlinked}`);
+    const refused = await api
+      .get(path)
+      .query({ cursor: page.nextCursor })
+      .set('Authorization', `Bearer ${unlinked}`);
+    expect([missing.status, empty.status, refused.status]).toEqual([401, 200, 400]);
+    expect(empty.body).toEqual({ items: [], nextCursor: null });
+    expect(refused.body).toMatchObject({ code: 'billing.invalid-cursor' });
+    expect(listStripeInvoices).toHaveBeenCalledExactlyOnceWith({
+      customerId,
+      liveMode: false,
+      limit: 1,
+      after: null,
+    });
+    for (const result of [missing, first, empty, refused]) {
+      expect(result.headers['cache-control']).toBe('private, no-store');
+    }
   });
 
   it('authenticates Stripe bytes from the global gateway, and does not acknowledge a deferred event', async () => {

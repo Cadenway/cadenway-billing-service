@@ -106,6 +106,18 @@ describe('appConfigSchema', () => {
     );
   });
 
+  it('requires a mode-matched Stripe key to enable linked invoice reads', () => {
+    const cursorKey = Buffer.alloc(32, 7).toString('base64url');
+    const linkedInvoices = { ...complete, BILLING_STRIPE_INVOICE_CURSOR_KEY: cursorKey };
+    expect(() => loadConfig(appConfigSchema, linkedInvoices)).toThrow(/BILLING_STRIPE_API_KEY/u);
+    expect(() =>
+      loadConfig(appConfigSchema, { ...linkedInvoices, BILLING_STRIPE_API_KEY: 'rk_live_fixture' }),
+    ).toThrow(/BILLING_STRIPE_API_KEY/u);
+    expect(
+      loadConfig(appConfigSchema, { ...linkedInvoices, BILLING_STRIPE_API_KEY: 'rk_test_fixture' }),
+    ).toMatchObject({ BILLING_STRIPE_INVOICE_CURSOR_KEY: cursorKey });
+  });
+
   it('refuses credentials and paths in the internal source origins without echoing them', () => {
     const config = {
       ...complete,

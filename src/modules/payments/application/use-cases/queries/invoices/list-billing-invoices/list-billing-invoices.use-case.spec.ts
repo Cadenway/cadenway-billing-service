@@ -46,6 +46,18 @@ function setup(): {
 }
 
 describe('ListBillingInvoices', () => {
+  it('reads bindings without starting the configured provider', async () => {
+    const read = vi.fn<StripeBindingReader['read']>().mockResolvedValue(null);
+    const useCase = new ListBillingInvoices({ read }, null, null, false);
+    await expect(useCase.execute({ organizationId: 'org-a', limit: 50 })).resolves.toEqual({
+      status: 'ok',
+      page: { items: [], nextCursor: null },
+    });
+    read.mockResolvedValue(binding);
+    await expect(useCase.execute({ organizationId: 'org-a', limit: 50 })).resolves.toEqual({
+      status: 'unavailable',
+    });
+  });
   it('returns an empty first page for an organization without a binding', async () => {
     const { bindings, provider, useCase } = setup();
     vi.mocked(bindings.read).mockResolvedValue(null);

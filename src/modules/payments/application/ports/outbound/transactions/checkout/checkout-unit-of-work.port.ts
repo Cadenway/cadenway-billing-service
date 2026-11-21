@@ -14,8 +14,9 @@ export interface CheckoutUnitOfWork {
   readonly claim: (input: StartBillingCheckoutInput) => Promise<CheckoutClaim>;
 
   /**
-   * Persists all immutable provider parameters for this lease before external I/O.
-   * A stale token returns false and must never overwrite another attempt.
+   * Authorizes external I/O under the active lease, after rechecking the committed
+   * subscription and the provider idempotency window. Persists the first request
+   * or verifies that all immutable parameters match the existing request.
    */
   readonly saveRequest: (
     organizationId: string,
