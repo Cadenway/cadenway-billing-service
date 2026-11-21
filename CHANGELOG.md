@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/Cadenway/cadenway-billing-service/compare/v0.3.0...v0.4.0) (2026-11-21)
+
+
+### Features
+
+* **usage:** rebuild billing projections and publish quota thresholds ([#28](https://github.com/Cadenway/cadenway-billing-service/issues/28)) ([368c5f8](https://github.com/Cadenway/cadenway-billing-service/commit/368c5f86c764f7a3dc524433768d3cb2c426d468))
+
 ## [0.3.0](https://github.com/Cadenway/cadenway-billing-service/compare/v0.2.0...v0.3.0) (2026-11-16)
 
 
