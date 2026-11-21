@@ -11,7 +11,9 @@ import { Module } from '@nestjs/common';
 
 import { appConfigSchema } from './config/app-config.js';
 import type { AppConfig } from './config/app-config.js';
+import { PlansModule } from './modules/plans/plans.module.js';
 import { PlatformModule } from './modules/platform/platform.module.js';
+import { UsageModule } from './modules/usage/usage.module.js';
 
 /**
  * Class AppModule
@@ -31,8 +33,8 @@ import { PlatformModule } from './modules/platform/platform.module.js';
  * - `MessagingModule`: the NATS connection of the `billing` user, with the inbox prefix
  *   `_INBOX.billing` the broker requires. The creation waits for the first connection, then checks
  *   that the `EVENTS` stream exists: cadenway-ops creates the streams (`manageStreams: false`), and
- *   only notification-service runs the dead-letter worker. The service publishes and consumes
- *   nothing yet, since `@cadenway/contracts` defines no event of its own.
+ *   only notification-service runs the dead-letter worker. The Usage module attaches its retained
+ *   consumers when the projection worker is enabled.
  * - `OutboxModule`: the outbox writer, the PostgreSQL deduplicator and the relay, which polls
  *   `outbox_events` every second in a system transaction and publishes the pending rows. It runs in
  *   every replica; `for update skip locked` keeps two of them from publishing the same row.
@@ -81,6 +83,8 @@ import { PlatformModule } from './modules/platform/platform.module.js';
       }),
     }),
     PlatformModule,
+    PlansModule,
+    UsageModule,
   ],
 })
 export class AppModule {}

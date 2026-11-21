@@ -30,6 +30,7 @@ describe('appConfigSchema', () => {
       NATS_URL: 'nats://localhost:4222',
       NATS_USER: 'billing',
       NATS_PASSWORD: 'billing',
+      BILLING_USAGE_ENABLED: false,
       INTERNAL_TOKEN_AUDIENCE: 'billing-service',
       INTERNAL_TOKEN_TRUSTED_ISSUERS: {
         'api-gateway': [
@@ -51,6 +52,29 @@ describe('appConfigSchema', () => {
 
     expect(() => loadConfig(appConfigSchema, example)).not.toThrow();
     expect(() => loadConfig(migrationConfigSchema, example)).not.toThrow();
+  });
+
+  it('requires both source origins and the signing key when usage is enabled', () => {
+    const enabled = { ...complete, BILLING_USAGE_ENABLED: 'true' };
+
+    expect(() => loadConfig(appConfigSchema, enabled)).toThrow(
+      /ORGANIZATION_SERVICE_URL[\s\S]*STORAGE_SERVICE_URL[\s\S]*INTERNAL_TOKEN_PRIVATE_JWK/u,
+    );
+  });
+
+  it('refuses credentials and paths in the internal source origins without echoing them', () => {
+    const config = {
+      ...complete,
+      ORGANIZATION_SERVICE_URL: 'https://billing:example-credential@organization.local',
+      STORAGE_SERVICE_URL: 'https://storage.local/example-path',
+    };
+
+    expect(() => loadConfig(appConfigSchema, config)).toThrow(
+      /ORGANIZATION_SERVICE_URL[\s\S]*STORAGE_SERVICE_URL/u,
+    );
+    expect(() => loadConfig(appConfigSchema, config)).not.toThrow(
+      /example-credential|example-path/u,
+    );
   });
 
   it('refuses to start without the database, the broker, the audience or the trusted issuers', () => {

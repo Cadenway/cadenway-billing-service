@@ -1,5 +1,13 @@
-import { baseConfigShape, internalTokenVerifierConfigShape } from '@cadenway/nest-common';
-import type { BaseConfig, InternalTokenVerifierConfig } from '@cadenway/nest-common';
+import {
+  baseConfigShape,
+  internalTokenSignerConfigShape,
+  internalTokenVerifierConfigShape,
+} from '@cadenway/nest-common';
+import type {
+  BaseConfig,
+  InternalTokenSignerConfig,
+  InternalTokenVerifierConfig,
+} from '@cadenway/nest-common';
 import { databaseConfigShape } from '@cadenway/nest-common/database';
 import type { DatabaseConfig } from '@cadenway/nest-common/database';
 import { messagingConfigShape } from '@cadenway/nest-messaging';
@@ -26,12 +34,36 @@ import { z } from 'zod';
  *   them.
  * - `INTERNAL_TOKEN_AUDIENCE` and `INTERNAL_TOKEN_TRUSTED_ISSUERS`: the `aud` this service accepts
  *   and the public keys of the backends allowed to call it.
+ * - `BILLING_USAGE_ENABLED` enables the projection worker and retained event consumers.
+ * - `ORGANIZATION_SERVICE_URL`, `STORAGE_SERVICE_URL` and `INTERNAL_TOKEN_PRIVATE_JWK`
+ *   identify and authenticate the authority reads when the worker is enabled.
  *
  * `OTEL_EXPORTER_OTLP_ENDPOINT` is read by `telemetry.ts`, before the application exists.
  *
- * @type {BaseConfig & DatabaseConfig & MessagingConfig & InternalTokenVerifierConfig}
  */
-export type AppConfig = BaseConfig & DatabaseConfig & MessagingConfig & InternalTokenVerifierConfig;
+export type AppConfig = BaseConfig &
+  DatabaseConfig &
+  MessagingConfig &
+  InternalTokenVerifierConfig & {
+    readonly BILLING_USAGE_ENABLED: boolean;
+    readonly ORGANIZATION_SERVICE_URL?: string | undefined;
+    readonly STORAGE_SERVICE_URL?: string | undefined;
+    readonly INTERNAL_TOKEN_PRIVATE_JWK?: InternalTokenSignerConfig['INTERNAL_TOKEN_PRIVATE_JWK'];
+  };
+
+/** Parses a source origin without accepting credentials or a service-specific path. */
+function sourceOrigin(service: 'Organization' | 'Storage'): z.ZodType<string> {
+  return z
+    .url({ protocol: /^https?$/u, error: `Expected the http:// or https:// origin of ${service}.` })
+    .transform((value, context) => {
+      const url = new URL(value);
+      if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
+        context.addIssue({ code: 'custom', message: `Expected the origin of ${service}.` });
+        return z.NEVER;
+      }
+      return url.origin;
+    });
+}
 
 /**
  * Constant appConfigSchema
@@ -44,12 +76,37 @@ export type AppConfig = BaseConfig & DatabaseConfig & MessagingConfig & Internal
  *
  * @type {z.ZodType<AppConfig>}
  */
-export const appConfigSchema: z.ZodType<AppConfig> = z.object({
-  ...baseConfigShape,
-  ...databaseConfigShape,
-  ...messagingConfigShape,
-  ...internalTokenVerifierConfigShape,
-});
+export const appConfigSchema: z.ZodType<AppConfig> = z
+  .object({
+    ...baseConfigShape,
+    ...databaseConfigShape,
+    ...messagingConfigShape,
+    ...internalTokenVerifierConfigShape,
+    BILLING_USAGE_ENABLED: z
+      .enum(['true', 'false'])
+      .default('false')
+      .transform((value) => value === 'true'),
+    ORGANIZATION_SERVICE_URL: sourceOrigin('Organization').optional(),
+    STORAGE_SERVICE_URL: sourceOrigin('Storage').optional(),
+    INTERNAL_TOKEN_PRIVATE_JWK:
+      internalTokenSignerConfigShape.INTERNAL_TOKEN_PRIVATE_JWK.optional(),
+  })
+  .superRefine((config, context) => {
+    if (!config.BILLING_USAGE_ENABLED) return;
+    for (const key of [
+      'ORGANIZATION_SERVICE_URL',
+      'STORAGE_SERVICE_URL',
+      'INTERNAL_TOKEN_PRIVATE_JWK',
+    ] as const) {
+      if (config[key] === undefined) {
+        context.addIssue({
+          code: 'custom',
+          path: [key],
+          message: 'Required when Billing usage is enabled.',
+        });
+      }
+    }
+  });
 
 /**
  * Interface MigrationConfig

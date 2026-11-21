@@ -20,7 +20,7 @@
 #
 # The streams: `nats-streams` runs compose/nats/ensure-streams.sh of cadenway-ops, copied below, as
 # `admin`, the way the `nats-streams` container of cadenway-ops does. It creates EVENTS,
-# EVENTS_RESTRICTED and EVENTS_DLQ (or aligns them) once NATS is healthy, then checks every minute
+# EVENTS_RESTRICTED, EVENTS_DLQ and the Billing delivery latch once NATS is healthy, then checks every minute
 # that they exist, and is healthy while they do, so `up --wait` returns once the streams are in
 # place. A one-shot container would make `up --wait` fail when it exits. The service never creates
 # a stream itself (`manageStreams: false`): it refuses to start without EVENTS.
@@ -74,6 +74,8 @@ services:
     configs:
       - source: ensure-streams
         target: /etc/nats/ensure-streams.sh
+    volumes:
+      - nats-stream-state:/home/nats
     depends_on:
       nats:
         condition: service_healthy
@@ -131,9 +133,31 @@ configs:
                   "evt.subscription.>", "evt.quota.>", "evt.invoice.>",
                   "rebuild.*.subscription", "rebuild.*.quota", "rebuild.*.invoice",
                   "$$JS.API.INFO", "$$JS.API.STREAM.NAMES", "$$JS.API.STREAM.INFO.EVENTS",
-                  "$$JS.API.CONSUMER.CREATE.EVENTS.>", "$$JS.API.CONSUMER.DURABLE.CREATE.EVENTS.*",
-                  "$$JS.API.CONSUMER.INFO.EVENTS.*", "$$JS.API.CONSUMER.MSG.NEXT.EVENTS.*",
-                  "$$JS.ACK.EVENTS.>"
+                  "$$JS.API.STREAM.INFO.BILLING_REBUILD_ADVISORIES",
+                  "$$JS.API.CONSUMER.CREATE.EVENTS.billing-service__register-organization.evt.organization.created.v1",
+                  "$$JS.API.CONSUMER.INFO.EVENTS.billing-service__register-organization",
+                  "$$JS.API.CONSUMER.MSG.NEXT.EVENTS.billing-service__register-organization",
+                  "$$JS.ACK.EVENTS.billing-service__register-organization.>",
+                  "$$JS.API.CONSUMER.CREATE.EVENTS.billing-service__record-member-joined.evt.member.joined.v1",
+                  "$$JS.API.CONSUMER.INFO.EVENTS.billing-service__record-member-joined",
+                  "$$JS.API.CONSUMER.MSG.NEXT.EVENTS.billing-service__record-member-joined",
+                  "$$JS.ACK.EVENTS.billing-service__record-member-joined.>",
+                  "$$JS.API.CONSUMER.CREATE.EVENTS.billing-service__record-member-role-changed.evt.member.role-changed.v1",
+                  "$$JS.API.CONSUMER.INFO.EVENTS.billing-service__record-member-role-changed",
+                  "$$JS.API.CONSUMER.MSG.NEXT.EVENTS.billing-service__record-member-role-changed",
+                  "$$JS.ACK.EVENTS.billing-service__record-member-role-changed.>",
+                  "$$JS.API.CONSUMER.CREATE.EVENTS.billing-service__record-member-removed.evt.member.removed.v1",
+                  "$$JS.API.CONSUMER.INFO.EVENTS.billing-service__record-member-removed",
+                  "$$JS.API.CONSUMER.MSG.NEXT.EVENTS.billing-service__record-member-removed",
+                  "$$JS.ACK.EVENTS.billing-service__record-member-removed.>",
+                  "$$JS.API.CONSUMER.CREATE.EVENTS.billing-service__record-file-uploaded.evt.file.uploaded.v1",
+                  "$$JS.API.CONSUMER.INFO.EVENTS.billing-service__record-file-uploaded",
+                  "$$JS.API.CONSUMER.MSG.NEXT.EVENTS.billing-service__record-file-uploaded",
+                  "$$JS.ACK.EVENTS.billing-service__record-file-uploaded.>",
+                  "$$JS.API.CONSUMER.CREATE.EVENTS.billing-service__record-file-deleted.evt.file.deleted.v1",
+                  "$$JS.API.CONSUMER.INFO.EVENTS.billing-service__record-file-deleted",
+                  "$$JS.API.CONSUMER.MSG.NEXT.EVENTS.billing-service__record-file-deleted",
+                  "$$JS.ACK.EVENTS.billing-service__record-file-deleted.>"
                 ]
               }
               subscribe: { allow: ["_INBOX.billing.>", "rebuild.billing.>"] }
@@ -150,6 +174,44 @@ configs:
       readonly READY=/tmp/streams-ready
       readonly CHECK_INTERVAL=60
       readonly RETRY_INTERVAL=5
+      readonly BILLING_LATCH_IDENTITY=/home/nats/billing-rebuild-advisories.created
+      readonly BILLING_HANDLERS='register-organization record-member-joined record-member-role-changed record-member-removed record-file-uploaded record-file-deleted'
+
+      billing_latch_created() {
+        nats stream info BILLING_REBUILD_ADVISORIES --json |
+          jq -er '.created | select(type == "string" and length > 0)'
+      }
+
+      billing_latch_matches() {
+        [ -s "$$BILLING_LATCH_IDENTITY" ] &&
+          observed=$$(billing_latch_created) &&
+          [ "$$observed" = "$$(cat "$$BILLING_LATCH_IDENTITY")" ]
+      }
+
+      ensure_billing_latch() {
+        if [ -e "$$BILLING_LATCH_IDENTITY" ]; then
+          billing_latch_matches
+          return $$?
+        fi
+        subjects=''
+        for handler in $$BILLING_HANDLERS; do
+          for advisory in MAX_DELIVERIES MSG_TERMINATED; do
+            subject="\$$JS.EVENT.ADVISORY.CONSUMER.$$advisory.EVENTS.billing-service__$$handler"
+            subjects="$${subjects:+$$subjects,}$$subject"
+          done
+        done
+        if ! nats stream info BILLING_REBUILD_ADVISORIES >/dev/null 2>&1; then
+          nats stream add BILLING_REBUILD_ADVISORIES --defaults --subjects "$$subjects" \
+            --description 'Persistent latch for failed Billing usage deliveries.' \
+            --storage file --retention limits --discard old --replicas 1 \
+            --max-age 0s --max-bytes=-1 --max-msgs=1 --max-msgs-per-subject=-1 \
+            --max-msg-size=-1 >/dev/null || return 1
+        fi
+        created=$$(billing_latch_created) || return 1
+        printf '%s\n' "$$created" >"$$BILLING_LATCH_IDENTITY.tmp" &&
+          mv "$$BILLING_LATCH_IDENTITY.tmp" "$$BILLING_LATCH_IDENTITY" &&
+          billing_latch_matches
+      }
 
       # Creates a stream, or updates it when it exists.
       # Arguments: name, subjects, maximum age, maximum size in bytes, description.
@@ -179,13 +241,15 @@ configs:
           ensure_stream EVENTS_RESTRICTED 'restricted.>' 7d 64MiB \
             'Identity events carrying a single-use code or link; read by notification-service only.' &&
           ensure_stream EVENTS_DLQ 'dlq.>' 30d 256MiB \
-            'Messages a consumer gave up on, copied by the dead-letter worker.'
+          'Messages a consumer gave up on, copied by the dead-letter worker.' &&
+          ensure_billing_latch
       }
 
       streams_exist() {
         nats stream info EVENTS >/dev/null 2>&1 &&
           nats stream info EVENTS_RESTRICTED >/dev/null 2>&1 &&
-          nats stream info EVENTS_DLQ >/dev/null 2>&1
+          nats stream info EVENTS_DLQ >/dev/null 2>&1 &&
+          billing_latch_matches
       }
 
       # `sleep` runs in the background so the shell, as process 1, answers the stop signal at once.
@@ -211,5 +275,6 @@ configs:
       done
 
 volumes:
+  nats-stream-state:
   postgres-data:
   nats-data:
