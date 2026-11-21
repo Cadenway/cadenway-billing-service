@@ -7,10 +7,10 @@ Usage owns the measurement of quota consumption.
 
 ## Public entry points
 
-| Entry point                   | Consumers |
-| ----------------------------- | --------- |
-| `plans.module`                | `usage`   |
-| `public/limits/get-free-plan` | `usage`   |
+| Entry point                   | Consumers           |
+| ----------------------------- | ------------------- |
+| `plans.module`                | `payments`, `usage` |
+| `public/limits/get-free-plan` | `payments`, `usage` |
 
 ## Owned tables
 

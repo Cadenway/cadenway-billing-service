@@ -9,6 +9,7 @@ import {
   stripeReconciliationReceipts,
   stripeSubscriptionSnapshots,
 } from '../../schemas/subscriptions/stripe-subscriptions.schema.js';
+import { lockBillingEntitlement } from './lock-billing-entitlement.transaction.js';
 import type { StripeEntitlementFence } from './stripe-entitlement-fence.transaction.js';
 
 type Entitlement = Extract<StripeSubscriptionDecision, { readonly kind: 'apply' }>;
@@ -39,6 +40,7 @@ export class DrizzleStripeReconciliationUnitOfWork implements StripeReconciliati
       };
       return await work({
         lockBinding: async () => {
+          await lockBillingEntitlement(scope, organizationId, 'exclusive');
           const [row] = await scope.db
             .select()
             .from(stripeBindings)
@@ -97,10 +99,16 @@ export class DrizzleStripeReconciliationUnitOfWork implements StripeReconciliati
           if (
             row?.plan === decision.plan &&
             row.seats === decision.limits.seats &&
-            row.storageBytes === decision.limits.storageBytes &&
-            row.scheduledCancellation === scheduledCancellation
-          )
+            row.storageBytes === decision.limits.storageBytes
+          ) {
+            if (row.scheduledCancellation !== scheduledCancellation) {
+              await scope.db
+                .update(stripeSubscriptionSnapshots)
+                .set({ scheduledCancellation, updatedAt: sql`now()` })
+                .where(eq(stripeSubscriptionSnapshots.organizationId, organizationId));
+            }
             return 'unchanged';
+          }
           const nextVersion = (row?.version ?? 0) + 1;
           if (!Number.isSafeInteger(nextVersion))
             throw new Error('Stripe entitlement version exhausted.');

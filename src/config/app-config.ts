@@ -37,6 +37,8 @@ import { z } from 'zod';
  * - `BILLING_USAGE_ENABLED` enables the projection worker and retained event consumers.
  * - `BILLING_STRIPE_WEBHOOK_MODE` and `BILLING_STRIPE_WEBHOOK_SECRETS` select the verified
  *   delivery mode and active endpoint keys.
+ * - `BILLING_STRIPE_SETTLEMENT_ENABLED`, `BILLING_STRIPE_API_KEY` and
+ *   `BILLING_STRIPE_TEAM_PRICE_IDS` gate and configure canonical provider settlement.
  * - `ORGANIZATION_SERVICE_URL`, `STORAGE_SERVICE_URL` and `INTERNAL_TOKEN_PRIVATE_JWK`
  *   identify and authenticate the authority reads when the worker is enabled.
  *
@@ -50,6 +52,9 @@ export type AppConfig = BaseConfig &
     readonly BILLING_USAGE_ENABLED: boolean;
     readonly BILLING_STRIPE_WEBHOOK_MODE: 'test' | 'live';
     readonly BILLING_STRIPE_WEBHOOK_SECRETS?: readonly string[] | undefined;
+    readonly BILLING_STRIPE_SETTLEMENT_ENABLED: boolean;
+    readonly BILLING_STRIPE_API_KEY?: string | undefined;
+    readonly BILLING_STRIPE_TEAM_PRICE_IDS?: readonly string[] | undefined;
     readonly ORGANIZATION_SERVICE_URL?: string | undefined;
     readonly STORAGE_SERVICE_URL?: string | undefined;
     readonly INTERNAL_TOKEN_PRIVATE_JWK?: InternalTokenSignerConfig['INTERNAL_TOKEN_PRIVATE_JWK'];
@@ -69,26 +74,62 @@ function sourceOrigin(service: 'Organization' | 'Storage'): z.ZodType<string> {
     });
 }
 
-const stripeEndpointSecrets = z
-  .string()
-  .max(2_048)
-  .transform((value, context) => {
-    const schema = z
-      .array(z.string().regex(/^whsec_[A-Za-z0-9_]{1,255}$/u))
-      .min(1)
-      .max(2);
-    try {
-      const parsed = schema.safeParse(JSON.parse(value));
-      if (parsed.success) return parsed.data;
-    } catch {
-      // Report only the configuration name and expected shape, without the signing keys.
-    }
-    context.addIssue({
-      code: 'custom',
-      message: 'Expected one or two Stripe endpoint keys as JSON.',
+/** Parses a JSON list without exposing configured values in errors. */
+function stripeList(schema: z.ZodType<string[]>, message: string): z.ZodType<string[]> {
+  return z
+    .string()
+    .max(2_048)
+    .transform((value, context) => {
+      try {
+        const parsed = schema.safeParse(JSON.parse(value));
+        if (parsed.success) return parsed.data;
+      } catch {
+        // Report only the configuration name and expected shape, without the signing keys.
+      }
+      context.addIssue({ code: 'custom', message });
+      return z.NEVER;
     });
-    return z.NEVER;
-  });
+}
+
+const stripeEndpointSecrets = stripeList(
+  z
+    .array(z.string().regex(/^whsec_[A-Za-z0-9_]{1,255}$/u))
+    .min(1)
+    .max(2),
+  'Expected one or two Stripe endpoint keys as JSON.',
+);
+const stripeTeamPrices = stripeList(
+  z
+    .array(z.string().regex(/^price_[A-Za-z0-9_]{1,249}$/u))
+    .min(1)
+    .max(8),
+  'Expected one to eight Stripe Team price IDs as JSON.',
+);
+
+/** Loads optional public verification keys for one quota owner using the kit's validation. */
+function optionalQuotaIssuer(issuer: 'organization-service' | 'storage-service') {
+  return z
+    .string()
+    .trim()
+    .optional()
+    .transform((input, context): InternalTokenVerifierConfig['INTERNAL_TOKEN_TRUSTED_ISSUERS'] => {
+      if (input === undefined || input === '' || input === 'null') return {};
+      try {
+        const keys: unknown = JSON.parse(`[${input}]`);
+        const parsed = internalTokenVerifierConfigShape.INTERNAL_TOKEN_TRUSTED_ISSUERS.safeParse(
+          JSON.stringify({ [issuer]: keys }),
+        );
+        if (parsed.success) return parsed.data;
+      } catch {
+        // Report the name and shape of the variable only.
+      }
+      context.addIssue({
+        code: 'custom',
+        message: 'Expected comma-separated public Ed25519 JWKs.',
+      });
+      return z.NEVER;
+    });
+}
 
 /**
  * Constant appConfigSchema
@@ -107,8 +148,19 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
     ...databaseConfigShape,
     ...messagingConfigShape,
     ...internalTokenVerifierConfigShape,
+    ORGANIZATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: optionalQuotaIssuer('organization-service'),
+    STORAGE_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: optionalQuotaIssuer('storage-service'),
     BILLING_STRIPE_WEBHOOK_MODE: z.enum(['test', 'live']).default('test'),
     BILLING_STRIPE_WEBHOOK_SECRETS: stripeEndpointSecrets.optional(),
+    BILLING_STRIPE_SETTLEMENT_ENABLED: z
+      .enum(['true', 'false'])
+      .default('false')
+      .transform((value) => value === 'true'),
+    BILLING_STRIPE_API_KEY: z
+      .string()
+      .regex(/^(?:sk|rk)_(?:test|live)_[A-Za-z0-9_]{1,255}$/u)
+      .optional(),
+    BILLING_STRIPE_TEAM_PRICE_IDS: stripeTeamPrices.optional(),
     BILLING_USAGE_ENABLED: z
       .enum(['true', 'false'])
       .default('false')
@@ -119,6 +171,32 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
       internalTokenSignerConfigShape.INTERNAL_TOKEN_PRIVATE_JWK.optional(),
   })
   .superRefine((config, context) => {
+    if (config.BILLING_STRIPE_SETTLEMENT_ENABLED) {
+      const key = config.BILLING_STRIPE_API_KEY;
+      if (
+        key === undefined ||
+        (!key.startsWith(`sk_${config.BILLING_STRIPE_WEBHOOK_MODE}_`) &&
+          !key.startsWith(`rk_${config.BILLING_STRIPE_WEBHOOK_MODE}_`))
+      ) {
+        context.addIssue({
+          code: 'custom',
+          path: ['BILLING_STRIPE_API_KEY'],
+          message: 'Required in the configured Stripe mode when settlement is enabled.',
+        });
+      }
+      for (const field of [
+        'BILLING_STRIPE_WEBHOOK_SECRETS',
+        'BILLING_STRIPE_TEAM_PRICE_IDS',
+      ] as const) {
+        if (config[field] === undefined) {
+          context.addIssue({
+            code: 'custom',
+            path: [field],
+            message: 'Required when Stripe settlement is enabled.',
+          });
+        }
+      }
+    }
     if (!config.BILLING_USAGE_ENABLED) return;
     for (const key of [
       'ORGANIZATION_SERVICE_URL',
@@ -133,7 +211,21 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
         });
       }
     }
-  });
+  })
+  .transform(
+    ({
+      ORGANIZATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS,
+      STORAGE_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS,
+      ...config
+    }): AppConfig => ({
+      ...config,
+      INTERNAL_TOKEN_TRUSTED_ISSUERS: {
+        ...ORGANIZATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS,
+        ...STORAGE_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS,
+        ...config.INTERNAL_TOKEN_TRUSTED_ISSUERS,
+      },
+    }),
+  );
 
 /**
  * Interface MigrationConfig

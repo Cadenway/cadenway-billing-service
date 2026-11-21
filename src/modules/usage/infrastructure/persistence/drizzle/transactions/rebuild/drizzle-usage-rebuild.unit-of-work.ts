@@ -7,6 +7,7 @@ import { and, eq, sql } from 'drizzle-orm';
 
 import type { UsageRebuildBrokerProgress } from '../../../../../application/models/rebuild/usage-rebuild-broker-progress.model.js';
 import type { UsageRebuildCandidate } from '../../../../../application/models/rebuild/usage-rebuild-candidate.model.js';
+import type { ReadUsagePlan } from '../../../../../application/ports/outbound/persistence/usage/read-usage-plan.port.js';
 import type { UsageRebuildTransaction } from '../../../../../application/ports/outbound/transactions/rebuild/usage-rebuild-transaction.port.js';
 import type { UsageRebuildUnitOfWork } from '../../../../../application/ports/outbound/transactions/rebuild/usage-rebuild-unit-of-work.port.js';
 import type { QuotaThresholdReached } from '../../../../../domain/events/quotas/quota-threshold-reached.event.js';
@@ -22,15 +23,18 @@ import {
 /** Persists one organization's usage rebuild in its tenant transaction. */
 export class DrizzleUsageRebuildUnitOfWork implements UsageRebuildUnitOfWork {
   // #region Constructor
-  /** Binds rebuild writes and an optional transaction-bound threshold outbox writer. */
+  /** Binds rebuild writes and the dependencies needed to publish verified quota crossings. */
   public constructor(
     private readonly runner: TenantTransactionRunner<DatabaseSchema>,
-    private readonly appendQuota?: (
-      scope: TransactionScope<DatabaseSchema>,
-      organizationId: string,
-      version: number,
-      fact: QuotaThresholdReached,
-    ) => Promise<void>,
+    private readonly thresholds?: {
+      readonly append: (
+        scope: TransactionScope<DatabaseSchema>,
+        organizationId: string,
+        version: number,
+        fact: QuotaThresholdReached,
+      ) => Promise<void>;
+      readonly readPlan: ReadUsagePlan['read'];
+    },
   ) {}
   // #endregion
 
@@ -362,20 +366,25 @@ export class DrizzleUsageRebuildUnitOfWork implements UsageRebuildUnitOfWork {
             .where(eq(usageThresholdIntents.organizationId, organizationId))
             .orderBy(usageThresholdIntents.metric)
             .limit(2);
+          const thresholds = this.thresholds;
+          const plan = intents.some((intent) => intent.generationId === generationId)
+            ? await thresholds?.readPlan(organizationId)
+            : undefined;
           for (const intent of intents) {
             if (intent.generationId === generationId) {
               if (intent.metric !== 'seats' && intent.metric !== 'storage') {
                 throw new Error('Stored quota intent has an invalid metric.');
               }
+              if (thresholds === undefined || plan === undefined) {
+                throw new Error('Quota threshold publication is unavailable.');
+              }
               const used = intent.metric === 'seats' ? generation.seats : generation.storageBytes;
-              if (BigInt(used) * 100n >= BigInt(intent.quotaLimit) * 80n) {
-                if (this.appendQuota === undefined) {
-                  throw new Error('Quota outbox writer is unavailable.');
-                }
-                await this.appendQuota(scope, organizationId, intent.eventVersion, {
+              const limit = intent.metric === 'seats' ? plan.seatLimit : plan.storageByteLimit;
+              if (intent.quotaLimit === limit && BigInt(used) * 100n >= BigInt(limit) * 80n) {
+                await thresholds.append(scope, organizationId, intent.eventVersion, {
                   metric: intent.metric,
                   used,
-                  limit: intent.quotaLimit,
+                  limit,
                   thresholdPercent: 80,
                 });
               }

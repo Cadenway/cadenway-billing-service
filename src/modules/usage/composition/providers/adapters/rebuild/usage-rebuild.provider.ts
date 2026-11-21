@@ -7,6 +7,7 @@ import type { FactoryProvider } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
 
 import type { AppConfig } from '../../../../../../config/app-config.js';
+import { GetBillingEntitlement } from '../../../../../payments/public/subscriptions/get-billing-entitlement.js';
 import { AdvanceUsageRebuild } from '../../../../application/services/rebuild/advance-usage-rebuild.service.js';
 import { ApplyUsageRebuildPage } from '../../../../application/use-cases/commands/rebuild/apply-usage-rebuild-page/apply-usage-rebuild-page.use-case.js';
 import { InvalidateActiveUsage } from '../../../../application/use-cases/commands/rebuild/invalidate-active-usage/invalidate-active-usage.use-case.js';
@@ -32,6 +33,7 @@ export const usageRebuildProvider: FactoryProvider<UsageRebuildScheduler | null>
     MessagingConnection,
     EventConsumers,
     OutboxWriter,
+    GetBillingEntitlement,
     HttpAdapterHost,
     PinoLogger,
   ],
@@ -42,6 +44,7 @@ export const usageRebuildProvider: FactoryProvider<UsageRebuildScheduler | null>
     connection: MessagingConnection,
     consumers: EventConsumers,
     outbox: OutboxWriter,
+    entitlement: GetBillingEntitlement,
     host: HttpAdapterHost,
     logger: PinoLogger,
   ): Promise<UsageRebuildScheduler | null> => {
@@ -62,10 +65,11 @@ export const usageRebuildProvider: FactoryProvider<UsageRebuildScheduler | null>
     );
     const proof = new BillingUsageBrokerProof(usageObservationHandlerNames);
     const writer = new QuotaThresholdOutbox(outbox);
-    const rebuild = new DrizzleUsageRebuildUnitOfWork(
-      tenant,
-      (scope, organizationId, version, fact) => writer.append(scope, organizationId, version, fact),
-    );
+    const rebuild = new DrizzleUsageRebuildUnitOfWork(tenant, {
+      append: (scope, organizationId, version, fact) =>
+        writer.append(scope, organizationId, version, fact),
+      readPlan: (organizationId) => entitlement.execute({ organizationId }),
+    });
     const advance = new AdvanceUsageRebuild(
       new DrizzleUsageRebuildStateReader(tenant),
       new JetStreamUsageBrokerProgressAdapter(connection, consumers, usageObservationHandlerNames),

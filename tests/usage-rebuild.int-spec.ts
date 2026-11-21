@@ -8,15 +8,17 @@ import type { DatabaseSchema } from '@cadenway/nest-common/database';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import pg from 'pg';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import type { UsageRebuildBrokerProgress } from '../src/modules/usage/application/models/rebuild/usage-rebuild-broker-progress.model.js';
 import type { UsageBrokerProof } from '../src/modules/usage/application/ports/outbound/messaging/rebuild/usage-broker-proof.port.js';
+import type { ReadUsagePlan } from '../src/modules/usage/application/ports/outbound/persistence/usage/read-usage-plan.port.js';
 import { RecordUsageObservation } from '../src/modules/usage/application/use-cases/commands/observations/record-usage-observation/record-usage-observation.use-case.js';
 import { ApplyUsageRebuildPage } from '../src/modules/usage/application/use-cases/commands/rebuild/apply-usage-rebuild-page/apply-usage-rebuild-page.use-case.js';
 import { InvalidateActiveUsage } from '../src/modules/usage/application/use-cases/commands/rebuild/invalidate-active-usage/invalidate-active-usage.use-case.js';
 import { PromoteUsageRebuild } from '../src/modules/usage/application/use-cases/commands/rebuild/promote-usage-rebuild/promote-usage-rebuild.use-case.js';
 import { StartUsageRebuild } from '../src/modules/usage/application/use-cases/commands/rebuild/start-usage-rebuild/start-usage-rebuild.use-case.js';
+import type { UsageObservation } from '../src/modules/usage/domain/value-objects/observations/usage-observation.value-object.js';
 import { DrizzleUsageRebuildRegistryReader } from '../src/modules/usage/infrastructure/persistence/drizzle/repositories/rebuild/drizzle-usage-rebuild-registry.repository.js';
 import { DrizzleUsageRebuildStateReader } from '../src/modules/usage/infrastructure/persistence/drizzle/repositories/rebuild/drizzle-usage-rebuild-state.repository.js';
 import { DrizzleUsageObservationUnitOfWork } from '../src/modules/usage/infrastructure/persistence/drizzle/transactions/observations/drizzle-usage-observation.unit-of-work.js';
@@ -69,6 +71,7 @@ const progress: UsageRebuildBrokerProgress = {
   ],
 };
 const proof: UsageBrokerProof = { validStart: () => true, assess: () => 'covered' };
+const freePlan = { plan: 'free', seatLimit: 5, storageByteLimit: 2_000_000_000 } as const;
 
 describe('usage rebuild PostgreSQL transactions', () => {
   let migrator: pg.Pool | undefined;
@@ -176,7 +179,7 @@ describe('usage rebuild PostgreSQL transactions', () => {
     ).rejects.toThrow();
 
     const record = new RecordUsageObservation(
-      new DrizzleUsageObservationUnitOfWork(runner, { seats: 5, storageBytes: 2_000_000_000 }),
+      new DrizzleUsageObservationUnitOfWork(runner, () => Promise.resolve(freePlan)),
     );
     const roleChange = () =>
       record.execute({
@@ -299,6 +302,103 @@ describe('usage rebuild PostgreSQL transactions', () => {
     await expect(
       runWithOrganizationContext(context(otherId), () => state.read(organizationId)),
     ).rejects.toThrow();
+  });
+
+  it('discards a pending Free quota crossing after settling Team and emits a new Team crossing', async () => {
+    const inTenant = <T>(work: () => Promise<T>): Promise<T> =>
+      runWithOrganizationContext(context(otherId), work);
+    const generationId = '01938f6e-8a42-7d5b-b2c9-5e1f3a6d9c26';
+    const replacementMemberId = '01938f6e-8a42-7d5b-b2c9-5e1f3a6d9c27';
+    const teamSeatLimit = 18;
+    const crossingSeats = 15;
+    await inTenant(() =>
+      runner.run(async ({ client }) => {
+        await client.query('insert into usage_organizations (organization_id) values ($1)', [
+          otherId,
+        ]);
+        await client.query(
+          `insert into usage_generations (
+            organization_id, id, status, membership_scan_complete,
+            attachment_scan_complete, stream_checkpoint
+          ) values ($1, $2, 'ready', true, true, $3)`,
+          [
+            otherId,
+            generationId,
+            { version: 1, start: progress, promotion: progress, verified: progress },
+          ],
+        );
+        await client.query(
+          'update usage_organizations set active_generation_id = $2 where organization_id = $1',
+          [otherId, generationId],
+        );
+      }),
+    );
+
+    const readPlan = vi.fn<ReadUsagePlan['read']>().mockResolvedValue(freePlan);
+    const append = vi.fn().mockResolvedValue(undefined);
+    const rebuild = new DrizzleUsageRebuildUnitOfWork(runner, { append, readPlan });
+    const record = new RecordUsageObservation(
+      new DrizzleUsageObservationUnitOfWork(runner, readPlan),
+    );
+    const recordMembership = (sourceId: string, observation: UsageObservation<'member'>) =>
+      inTenant(() =>
+        record.execute({
+          organizationId: otherId,
+          observation: { source: 'membership', sourceId, observation },
+        }),
+      );
+    const intents = () =>
+      inTenant(() =>
+        runner.run(({ client }) =>
+          client.query(
+            'select metric, quota_limit from usage_threshold_intents where organization_id = $1',
+            [otherId],
+          ),
+        ),
+      );
+    const flush = () =>
+      inTenant(async () => {
+        const { active } = await state.read(otherId);
+        if (active === null) throw new Error('Ready generation missing.');
+        return rebuild.run(otherId, async (tx) => {
+          await tx.lockOrganization();
+          return tx.flushThresholdIntents(generationId, active.version);
+        });
+      });
+
+    const joined = { state: 'present', version: 1, value: 'member' } as const;
+    for (let index = 1; index < crossingSeats; index += 1) {
+      const sourceId = `00000000-0000-7000-8000-${String(index).padStart(12, '0')}`;
+      await expect(recordMembership(sourceId, joined)).resolves.toBe('recorded');
+    }
+    await expect(recordMembership(memberId, joined)).resolves.toBe('recorded');
+    expect((await intents()).rows).toEqual([
+      { metric: 'seats', quota_limit: String(freePlan.seatLimit) },
+    ]);
+    readPlan.mockResolvedValue({
+      plan: 'team',
+      seatLimit: teamSeatLimit,
+      storageByteLimit: 100_000_000_000,
+    });
+    await expect(flush()).resolves.toBe(true);
+    expect(append).not.toHaveBeenCalled();
+    expect((await intents()).rows).toEqual([]);
+
+    await expect(recordMembership(memberId, { state: 'absent', version: 2 })).resolves.toBe(
+      'recorded',
+    );
+    await expect(recordMembership(replacementMemberId, joined)).resolves.toBe('recorded');
+    expect((await intents()).rows).toEqual([
+      { metric: 'seats', quota_limit: String(teamSeatLimit) },
+    ]);
+    await expect(flush()).resolves.toBe(true);
+    expect(append).toHaveBeenCalledExactlyOnceWith(expect.anything(), otherId, 2, {
+      metric: 'seats',
+      used: crossingSeats,
+      limit: teamSeatLimit,
+      thresholdPercent: 80,
+    });
+    expect((await intents()).rows).toEqual([]);
   });
 
   it('pages the system registry in UUID order with a bounded lookahead', async () => {

@@ -6,7 +6,10 @@ Authenticates Stripe payment deliveries. Stripe owns hosted checkout and card da
 
 ## Public entry points
 
-None.
+| Entry point                                    | Consumers |
+| ---------------------------------------------- | --------- |
+| `payments.module`                              | `usage`   |
+| `public/subscriptions/get-billing-entitlement` | `usage`   |
 
 ## Owned tables
 
@@ -35,15 +38,17 @@ additive indexes in place.
   The account-wide receipt is checked before looking up the binding, so a replay can stop
   even if its original customer or subscription has since been replaced.
   Missing bindings, deferred settlement and settlement errors return `503 billing.unavailable`.
-- The composed endpoint has no production settlement until Billing can coordinate quota
-  changes with Organization and Storage and write the published outbox fact. Keep
-  `BILLING_STRIPE_WEBHOOK_SECRETS` unset and the provider's webhook subscription disabled
-  until this is available. The local mode defaults to `test`. Up to two signing keys can
-  coexist during rotation.
+- `GET /internal/v1/billing/entitlement` reads the committed plan, limits and version for the
+  tenant in a verified Organization or Storage system token whose actor ID matches its
+  issuer. Replies are private and noncacheable. A successful read with no committed snapshot
+  returns the Free limits at version zero. An unavailable or invalid snapshot returns 503.
+  The read is available independently of Stripe, NATS and the Usage feature flag.
 
 ## Events emitted
 
-None.
+- `subscription.changed.v1` carries the complete plan, limits and version after an authorized
+  change, using the Billing system actor and the same tenant transaction as the snapshot
+  and receipt. Delivery is at least once and can arrive out of order.
 
 ## Events consumed
 
@@ -63,14 +68,20 @@ None.
   exact customer and subscription pair through the system transaction runner. Missing or
   conflicting pairs and events carrying a connected account or separate authentication
   context have no match. Ordinary billing reads continue to use the tenant transaction runner.
-- An entitlement change requires authorization from the quota fence. Deferred changes leave the
-  snapshot and receipt available for reconciliation when the missing proof arrives.
+- The initial quota fence permits only transitions that preserve or increase each committed
+  limit, using the Free baseline when no snapshot exists. A decrease needs a coordinated
+  preparation protocol with Organization and Storage. A deferred event has no committed receipt
+  and can be retried. A scheduled cancellation update alone preserves the entitlement version
+  and produces no quota event.
 
 ## Transactions
 
 Provider reads happen outside the tenant transaction. Settlement locks and rechecks the binding.
 The entitlement snapshot and event receipt commit together with the writes required by the fence.
 An unsuccessful settlement rolls back those changes together.
+Settlement takes the organization entitlement lock before the binding row. Entitlement
+readers take the shared lock so Usage can confirm threshold events under the same limits
+until its transaction commits, including before the first snapshot exists.
 
 The webhook admission adapter verifies the Stripe signature and the configured mode before
 global resolution. The lookup returns the provider pair and its revision with the organization
@@ -82,5 +93,7 @@ this settlement commits. The endpoint does not store raw provider deliveries.
 
 - The Stripe SDK verifies signatures locally. The webhook adapter receives the active endpoint
   secrets and uses the SDK's five-minute tolerance with the server clock.
-- Initial Checkout ownership and Stripe webhook subscription configuration are coordinated with
-  the quota and outbox fence before activation. Subscription deliveries never create bindings.
+- Stripe settlement defaults to disabled. Activation needs trusted Checkout binding creation,
+  production readiness of both quota owners and configured Stripe credentials and Team prices.
+  The local mode defaults to `test`. Two endpoint signing keys can coexist during rotation.
+  Subscription deliveries never create bindings.

@@ -24,7 +24,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { AppModule } from '../src/app.module.js';
 import { appConfigSchema } from '../src/config/app-config.js';
-import { configureBillingSubscriptionCache } from '../src/infrastructure/http/billing-subscription-cache.js';
+import { configureBillingReadCache } from '../src/infrastructure/http/billing-read-cache.js';
 
 const composeFile = fileURLToPath(new URL('../compose.dev.yaml', import.meta.url));
 const migrationsFolder = fileURLToPath(new URL('../migrations', import.meta.url));
@@ -223,7 +223,7 @@ describe('enabled Billing projection', () => {
       },
       logDestination: { write: (): void => undefined },
     });
-    configureBillingSubscriptionCache(app);
+    configureBillingReadCache(app);
     await app.listen(0, '127.0.0.1');
   });
 

@@ -11,11 +11,11 @@ import { DrizzleStripeWebhookBindingReader } from '../../../../infrastructure/pe
 /** Starts with settlement gated on a real quota fence and subscription outbox. */
 export const admitStripeWebhookProvider: FactoryProvider<AdmitStripeWebhook> = {
   provide: AdmitStripeWebhook,
-  inject: [CONFIG, SystemTransactionRunner, { token: ReconcileStripeSubscription, optional: true }],
+  inject: [CONFIG, SystemTransactionRunner, ReconcileStripeSubscription],
   useFactory: (
     config: AppConfig,
     runner: SystemTransactionRunner<DatabaseSchema>,
-    reconciliation?: ReconcileStripeSubscription,
+    reconciliation: ReconcileStripeSubscription | null,
   ) => {
     const secrets = config.BILLING_STRIPE_WEBHOOK_SECRETS;
     return new AdmitStripeWebhook(
@@ -23,7 +23,7 @@ export const admitStripeWebhookProvider: FactoryProvider<AdmitStripeWebhook> = {
         ? () => ({ kind: 'unavailable' })
         : createStripeWebhookAuthenticator(config.BILLING_STRIPE_WEBHOOK_MODE === 'live', secrets),
       new DrizzleStripeWebhookBindingReader(runner),
-      reconciliation === undefined
+      reconciliation === null
         ? null
         : (delivery) =>
             runWithOrganizationContext(

@@ -109,6 +109,16 @@ describe('ReconcileStripeSubscription', () => {
     expect(transaction.settle).not.toHaveBeenCalled();
   });
 
+  it('acknowledges a concurrent delivery that committed before the binding read', async () => {
+    const { useCase, bindings, provider, transaction } = setup();
+    vi.mocked(transaction.isSettled).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    vi.mocked(bindings.read).mockResolvedValue({ ...binding, revision: 4 });
+
+    await expect(useCase.execute(input)).resolves.toEqual({ status: 'duplicate' });
+    expect(transaction.isSettled).toHaveBeenCalledTimes(2);
+    expect(provider.retrieve).not.toHaveBeenCalled();
+  });
+
   it('retries provider access when the receipt is absent after an earlier failed settlement', async () => {
     const { useCase, provider, transaction } = setup();
     vi.mocked(transaction.apply).mockRejectedValueOnce(new Error('settlement rolled back'));

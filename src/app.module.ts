@@ -22,7 +22,7 @@ import type { NextFunction, Request, Response } from 'express';
 
 import { appConfigSchema } from './config/app-config.js';
 import type { AppConfig } from './config/app-config.js';
-import { configureBillingSubscriptionCache } from './infrastructure/http/billing-subscription-cache.js';
+import { configureBillingReadCache } from './infrastructure/http/billing-read-cache.js';
 import { PaymentsModule } from './modules/payments/payments.module.js';
 import { PlansModule } from './modules/plans/plans.module.js';
 import { PlatformModule } from './modules/platform/platform.module.js';
@@ -124,7 +124,7 @@ export async function createBillingApplication(
       },
     },
   });
-  configureBillingSubscriptionCache(app);
+  configureBillingReadCache(app);
   app.use(stripeWebhookRoute, (_request: Request, response: Response, next: NextFunction): void => {
     response.setHeader('Cache-Control', 'private, no-store');
     next();

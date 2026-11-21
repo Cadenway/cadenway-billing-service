@@ -32,6 +32,7 @@ describe('appConfigSchema', () => {
       NATS_PASSWORD: 'billing',
       BILLING_USAGE_ENABLED: false,
       BILLING_STRIPE_WEBHOOK_MODE: 'test',
+      BILLING_STRIPE_SETTLEMENT_ENABLED: false,
       INTERNAL_TOKEN_AUDIENCE: 'billing-service',
       INTERNAL_TOKEN_TRUSTED_ISSUERS: {
         'api-gateway': [
@@ -75,6 +76,26 @@ describe('appConfigSchema', () => {
     };
     expect(() => loadConfig(appConfigSchema, malformed)).toThrow(/BILLING_STRIPE_WEBHOOK_SECRETS/u);
     expect(() => loadConfig(appConfigSchema, malformed)).not.toThrow(/whsec_placeholder/u);
+  });
+
+  it('requires a mode-matched API key, endpoint keys and prices before enabling settlement', () => {
+    const config = {
+      ...complete,
+      BILLING_STRIPE_SETTLEMENT_ENABLED: 'true',
+      BILLING_STRIPE_API_KEY: 'rk_live_fixture',
+    };
+    expect(() => loadConfig(appConfigSchema, config)).toThrow(
+      /BILLING_STRIPE_API_KEY[\s\S]*BILLING_STRIPE_WEBHOOK_SECRETS[\s\S]*BILLING_STRIPE_TEAM_PRICE_IDS/u,
+    );
+    expect(() => loadConfig(appConfigSchema, config)).not.toThrow(/rk_live_fixture/u);
+    expect(
+      loadConfig(appConfigSchema, {
+        ...config,
+        BILLING_STRIPE_API_KEY: 'rk_test_fixture',
+        BILLING_STRIPE_WEBHOOK_SECRETS: '["whsec_fixture"]',
+        BILLING_STRIPE_TEAM_PRICE_IDS: '["price_fixture"]',
+      }),
+    ).toMatchObject({ BILLING_STRIPE_SETTLEMENT_ENABLED: true });
   });
 
   it('requires both source origins and the signing key when usage is enabled', () => {

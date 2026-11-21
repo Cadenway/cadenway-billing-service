@@ -5,7 +5,7 @@ import { EventConsumers, MessagingConnection } from '@cadenway/nest-messaging';
 import type { FactoryProvider } from '@nestjs/common';
 
 import type { AppConfig } from '../../../../../../config/app-config.js';
-import { GetFreePlan } from '../../../../../plans/public/limits/get-free-plan.js';
+import { GetBillingEntitlement } from '../../../../../payments/public/subscriptions/get-billing-entitlement.js';
 import { GetBillingSubscription } from '../../../../application/use-cases/queries/subscription/get-billing-subscription/get-billing-subscription.use-case.js';
 import { BillingUsageBrokerProof } from '../../../../infrastructure/adapters/jetstream/billing-usage-broker-proof.adapter.js';
 import { JetStreamUsageBrokerProgressAdapter } from '../../../../infrastructure/adapters/jetstream/jetstream-usage-broker-progress.adapter.js';
@@ -14,13 +14,19 @@ import { usageObservationHandlerNames } from '../../../../presentation/messaging
 
 const advisoryReadTimeoutMs = 1_000;
 
-/** Binds the subscription query to the Free plan and verifies live delivery before serving usage. */
+/** Binds the committed entitlement and verifies live delivery before serving usage. */
 export const getBillingSubscriptionProvider: FactoryProvider<GetBillingSubscription> = {
   provide: GetBillingSubscription,
-  inject: [TenantTransactionRunner, GetFreePlan, MessagingConnection, EventConsumers, CONFIG],
+  inject: [
+    TenantTransactionRunner,
+    GetBillingEntitlement,
+    MessagingConnection,
+    EventConsumers,
+    CONFIG,
+  ],
   useFactory: (
     runner: TenantTransactionRunner<DatabaseSchema>,
-    plans: GetFreePlan,
+    entitlement: GetBillingEntitlement,
     broker: MessagingConnection,
     consumers: EventConsumers,
     config: AppConfig,
@@ -44,7 +50,9 @@ export const getBillingSubscriptionProvider: FactoryProvider<GetBillingSubscript
           );
         },
       },
-      config.BILLING_USAGE_ENABLED ? plans.execute() : null,
+      config.BILLING_USAGE_ENABLED
+        ? (organizationId) => entitlement.execute({ organizationId })
+        : null,
     );
   },
 };

@@ -7,8 +7,8 @@
 # below in docs/service-environment.md. A variable added here must exist on the host before the
 # release that reads it: the GitOps agent refuses a commit that leaves one unset.
 #
-# INTERNAL_TOKEN_TRUSTED_ISSUERS lists who may call this service: the API gateway only. The folded
-# scalar gives the service one line of JSON.
+# The API gateway has its existing issuer binding. Public keys for the two quota owners are
+# optional and allow only the signed entitlement reader after they have been provisioned.
 #
 # MIGRATION_DATABASE_URL is deliberately absent: the GitOps agent of cadenway-ops hands the
 # migrator's URL to the one-off migration container only (docs/database.md there), so the running
@@ -28,6 +28,8 @@ services:
       STORAGE_SERVICE_URL: ${BILLING_STORAGE_SERVICE_URL:-}
       INTERNAL_TOKEN_PRIVATE_JWK: ${BILLING_SERVICE_INTERNAL_TOKEN_PRIVATE_JWK:-}
       INTERNAL_TOKEN_AUDIENCE: billing-service
+      ORGANIZATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: ${ORGANIZATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS:-}
+      STORAGE_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: ${STORAGE_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS:-}
       INTERNAL_TOKEN_TRUSTED_ISSUERS: >-
         {"api-gateway": [${API_GATEWAY_INTERNAL_TOKEN_PUBLIC_JWKS}]}
     networks:

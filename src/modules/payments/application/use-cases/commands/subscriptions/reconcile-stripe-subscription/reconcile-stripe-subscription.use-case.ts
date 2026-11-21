@@ -42,7 +42,12 @@ export class ReconcileStripeSubscription {
     if (settled) return { status: 'duplicate' };
 
     const snapshot = await this.bindings.read(input.organizationId);
-    if (!isSameBinding(snapshot, input.acceptedBinding)) return { status: 'retry' };
+    if (!isSameBinding(snapshot, input.acceptedBinding)) {
+      const committed = await this.work.run(input.organizationId, (transaction) =>
+        transaction.isSettled(input.eventId),
+      );
+      return { status: committed ? 'duplicate' : 'retry' };
+    }
     const subscription = await this.provider.retrieve(snapshot.binding.subscriptionId);
 
     return this.work.run(input.organizationId, async (transaction) => {

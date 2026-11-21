@@ -1,8 +1,8 @@
 import type { DatabaseSchema, TenantTransactionRunner } from '@cadenway/nest-common/database';
 import { and, eq, sql } from 'drizzle-orm';
 
-import type { LockedUsageOrganization } from '../../../../../application/models/observations/locked-usage-organization.model.js';
 import type { UsageObservationGeneration } from '../../../../../application/models/observations/usage-observation-generation.model.js';
+import type { ReadUsagePlan } from '../../../../../application/ports/outbound/persistence/usage/read-usage-plan.port.js';
 import type { UsageObservationTransaction } from '../../../../../application/ports/outbound/transactions/observations/usage-observation-transaction.port.js';
 import type { UsageObservationUnitOfWork } from '../../../../../application/ports/outbound/transactions/observations/usage-observation-unit-of-work.port.js';
 import type { RecordedUsageObservation } from '../../../../../domain/value-objects/observations/recorded-usage-observation.value-object.js';
@@ -20,7 +20,7 @@ export class DrizzleUsageObservationUnitOfWork implements UsageObservationUnitOf
   /** Binds the tenant transaction and the current quota limits. */
   public constructor(
     private readonly runner: TenantTransactionRunner<DatabaseSchema>,
-    private readonly limits: LockedUsageOrganization['limits'],
+    private readonly readPlan: ReadUsagePlan['read'],
   ) {}
   // #endregion
 
@@ -99,7 +99,12 @@ export class DrizzleUsageObservationUnitOfWork implements UsageObservationUnitOf
             [active?.id, candidate?.id].filter((id): id is string => id !== undefined),
           );
           locked = true;
-          return { active, candidate, limits: this.limits };
+          const plan = await this.readPlan(organizationId);
+          return {
+            active,
+            candidate,
+            limits: { seats: plan.seatLimit, storageBytes: plan.storageByteLimit },
+          };
         },
         loadObservation: async (generationId, source, sourceId) => {
           requireGeneration(generationId);

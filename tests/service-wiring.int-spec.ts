@@ -22,9 +22,23 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { AppModule, createBillingApplication } from '../src/app.module.js';
 import { appConfigSchema } from '../src/config/app-config.js';
+import type { StripeSubscriptionProvider } from '../src/modules/payments/application/ports/outbound/providers/subscriptions/stripe-subscription-provider.port.js';
+import { GetBillingEntitlement } from '../src/modules/payments/public/subscriptions/get-billing-entitlement.js';
 import { RecordUsageObservation } from '../src/modules/usage/application/use-cases/commands/observations/record-usage-observation/record-usage-observation.use-case.js';
 import { DrizzleActiveUsageReader } from '../src/modules/usage/infrastructure/persistence/drizzle/repositories/usage/drizzle-active-usage.repository.js';
 import { DrizzleUsageObservationUnitOfWork } from '../src/modules/usage/infrastructure/persistence/drizzle/transactions/observations/drizzle-usage-observation.unit-of-work.js';
+
+const retrieveStripeSubscription = vi.hoisted(() =>
+  vi.fn<StripeSubscriptionProvider['retrieve']>(),
+);
+vi.mock(
+  '../src/modules/payments/infrastructure/adapters/stripe/stripe-subscription-provider.adapter.js',
+  () => ({
+    createStripeSubscriptionProvider: (): StripeSubscriptionProvider => ({
+      retrieve: retrieveStripeSubscription,
+    }),
+  }),
+);
 
 // The service as main.ts assembles it, on a disposable PostgreSQL and NATS. `@cadenway/nest-testing`
 // does not export its container fixtures yet and a service never depends on `testcontainers` itself,
@@ -83,6 +97,15 @@ const paymentsTables = [
 /** Migrations applied on a clean or upgraded database. */
 const migrationCount = 6;
 const stripeFixtureKey = 'whsec_fixture';
+
+/** Signs the isolated Stripe fixture bytes without calling any external system. */
+function signStripeFixture(payload: string): string {
+  const timestamp = String(Math.floor(Date.now() / 1_000));
+  const digest = createHmac('sha256', stripeFixtureKey)
+    .update(`${timestamp}.${payload}`)
+    .digest('hex');
+  return `t=${timestamp},v1=${digest}`;
+}
 
 /**
  * Runs `docker compose` on the throwaway project.
@@ -228,6 +251,8 @@ class WiringProbeController {
 
 describe('billing-service wiring', () => {
   const gateway = keyPair();
+  const organization = keyPair();
+  const storage = keyPair();
   let app: NestExpressApplication | undefined;
   let signer: InternalTokenSigner;
   let migrator: pg.Pool;
@@ -284,6 +309,14 @@ describe('billing-service wiring', () => {
     vi.stubEnv('NATS_PASSWORD', 'billing');
     vi.stubEnv('BILLING_STRIPE_WEBHOOK_MODE', 'test');
     vi.stubEnv('BILLING_STRIPE_WEBHOOK_SECRETS', JSON.stringify([stripeFixtureKey]));
+    vi.stubEnv('BILLING_STRIPE_SETTLEMENT_ENABLED', 'true');
+    vi.stubEnv('BILLING_STRIPE_API_KEY', 'rk_test_local_fixture');
+    vi.stubEnv('BILLING_STRIPE_TEAM_PRICE_IDS', '["price_team_fixture"]');
+    vi.stubEnv(
+      'ORGANIZATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS',
+      JSON.stringify(organization.publicJwk),
+    );
+    vi.stubEnv('STORAGE_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS', JSON.stringify(storage.publicJwk));
     vi.stubEnv('INTERNAL_TOKEN_AUDIENCE', 'billing-service');
     vi.stubEnv(
       'INTERNAL_TOKEN_TRUSTED_ISSUERS',
@@ -630,10 +663,9 @@ describe('billing-service wiring', () => {
     const failure = new Error('threshold intent was not recorded');
     let rejectThreshold = true;
     const readUsage = new DrizzleActiveUsageReader(tenant);
-    const unitOfWork = new DrizzleUsageObservationUnitOfWork(tenant, {
-      seats: 5,
-      storageBytes: 2_000_000_000,
-    });
+    const unitOfWork = new DrizzleUsageObservationUnitOfWork(tenant, () =>
+      Promise.resolve({ plan: 'free', seatLimit: 5, storageByteLimit: 2_000_000_000 }),
+    );
     const projection = new RecordUsageObservation({
       run: (selectedOrganization, work) =>
         unitOfWork.run(selectedOrganization, (transaction) =>
@@ -837,13 +869,7 @@ describe('billing-service wiring', () => {
       livemode: false,
       data: { object: { object: 'subscription', id: 'sub_atelier', customer: 'cus_atelier' } },
     });
-    const signature = (payload: string): string => {
-      const timestamp = String(Math.floor(Date.now() / 1_000));
-      const digest = createHmac('sha256', stripeFixtureKey)
-        .update(`${timestamp}.${payload}`)
-        .digest('hex');
-      return `t=${timestamp},v1=${digest}`;
-    };
+    const signature = signStripeFixture;
     const post = (token: string) =>
       api
         .post(path)
@@ -899,6 +925,248 @@ describe('billing-service wiring', () => {
     expect(replay.status).toBe(204);
     expect(replay.text).toBe('');
     expect(replay.headers['cache-control']).toBe('private, no-store');
+  });
+
+  it('allows only the signed quota owners to read the entitlement for their token tenant', async () => {
+    const api = request(service().getHttpServer());
+    const path = '/internal/v1/billing/entitlement';
+    const issuer = await InternalTokenSigner.create({
+      issuer: 'organization-service',
+      privateJwk: organization.privateJwk,
+    });
+    const [token, anotherActor, anotherIssuer, noOrganization] = await Promise.all([
+      issuer.sign('billing-service', {
+        actor: { type: 'system', id: 'organization-service' },
+        organizationId: otherOrganizationId,
+      }),
+      issuer.sign('billing-service', {
+        actor: { type: 'system', id: 'storage-service' },
+        organizationId: otherOrganizationId,
+      }),
+      signer.sign('billing-service', {
+        actor: { type: 'system', id: 'api-gateway' },
+        organizationId: otherOrganizationId,
+      }),
+      issuer.sign('billing-service', {
+        actor: { type: 'system', id: 'organization-service' },
+        organizationId: null,
+      }),
+    ]);
+    const [missing, wrongActor, wrongIssuer, missingOrganization, query, success] =
+      await Promise.all([
+        api.get(path),
+        api.get(path).set('Authorization', `Bearer ${anotherActor}`),
+        api.get(path).set('Authorization', `Bearer ${anotherIssuer}`),
+        api.get(path).set('Authorization', `Bearer ${noOrganization}`),
+        api
+          .get(path)
+          .query({ organizationId: atelierNordId })
+          .set('Authorization', `Bearer ${token}`),
+        api.get(path).set('Authorization', `Bearer ${token}`),
+      ]);
+    expect([
+      missing.status,
+      wrongActor.status,
+      wrongIssuer.status,
+      missingOrganization.status,
+      query.status,
+    ]).toEqual([401, 403, 403, 403, 400]);
+    expect(query.body).toMatchObject({ code: 'request.invalid' });
+    expect(success.status).toBe(200);
+    expect(success.body).toEqual({
+      plan: 'free',
+      seatLimit: 5,
+      storageByteLimit: 2_000_000_000,
+      version: 0,
+    });
+    for (const result of [missing, wrongActor, wrongIssuer, missingOrganization, query, success]) {
+      expect(result.headers['cache-control']).toBe('private, no-store');
+    }
+  });
+
+  it('commits signed Stripe increases once and leaves reductions retryable', async () => {
+    const organizationId = '01938f6e-0000-7000-8000-000000000099';
+    const customerId = 'cus_paid_fixture';
+    const subscriptionId = 'sub_paid_fixture';
+    const api = request(service().getHttpServer());
+    const tenant = service().get(TenantTransactionRunner);
+    const system = service().get(SystemTransactionRunner);
+    await system.run(({ client }) =>
+      client.query(
+        'insert into stripe_bindings (organization_id, customer_id, subscription_id) values ($1, $2, $3)',
+        [organizationId, customerId, subscriptionId],
+      ),
+    );
+
+    const callers = await Promise.all([
+      InternalTokenSigner.create({
+        issuer: 'organization-service',
+        privateJwk: organization.privateJwk,
+      }),
+      InternalTokenSigner.create({ issuer: 'storage-service', privateJwk: storage.privateJwk }),
+    ]);
+    const quotaTokens = await Promise.all(
+      callers.map((caller, index) =>
+        caller.sign('billing-service', {
+          actor: { type: 'system', id: index === 0 ? 'organization-service' : 'storage-service' },
+          organizationId,
+        }),
+      ),
+    );
+    const gatewayToken = await signer.sign('billing-service', {
+      actor: { type: 'system', id: 'api-gateway' },
+      organizationId: null,
+    });
+    const submit = (eventId: string) => {
+      const payload = JSON.stringify({
+        id: eventId,
+        object: 'event',
+        type: 'customer.subscription.updated',
+        livemode: false,
+        data: { object: { object: 'subscription', id: subscriptionId, customer: customerId } },
+      });
+      return api
+        .post('/internal/v1/billing/webhooks/stripe')
+        .set('Authorization', `Bearer ${gatewayToken}`)
+        .set('Content-Type', 'application/json')
+        .set('Stripe-Signature', signStripeFixture(payload))
+        .send(payload);
+    };
+    const entitlement = (token: string) =>
+      api.get('/internal/v1/billing/entitlement').set('Authorization', `Bearer ${token}`);
+    const providerState = (quantity: number, scheduledCancellation = false) =>
+      retrieveStripeSubscription.mockResolvedValue({
+        customerId,
+        subscriptionId,
+        liveMode: false,
+        status: 'active',
+        scheduledCancellation,
+        collectionPaused: false,
+        hasMoreItems: false,
+        items: [{ priceId: 'price_team_fixture', quantity }],
+      });
+    const persisted = () =>
+      runWithOrganizationContext(memberOf(organizationId), () =>
+        tenant.run(async ({ client }) => {
+          const events = await client.query(
+            `select payload from outbox_events
+             where organization_id = $1 and event_name = 'subscription.changed.v1'
+             order by (payload->>'version')::bigint`,
+            [organizationId],
+          );
+          const receipts = await client.query(
+            'select event_id from stripe_reconciliation_receipts where organization_id = $1 order by event_id',
+            [organizationId],
+          );
+          const snapshot = await client.query(
+            'select scheduled_cancellation from stripe_subscription_snapshots where organization_id = $1',
+            [organizationId],
+          );
+          return {
+            events: (events.rows as readonly { payload: unknown }[]).map(({ payload }) => payload),
+            receipts: (receipts.rows as readonly { event_id: string }[]).map(
+              ({ event_id }) => event_id,
+            ),
+            scheduledCancellation: (
+              snapshot.rows[0] as { scheduled_cancellation: boolean } | undefined
+            )?.scheduled_cancellation,
+          };
+        }),
+      );
+    const team = { plan: 'team', seatLimit: 18, storageByteLimit: 100_000_000_000, version: 1 };
+    const event = { actor: { type: 'system', id: 'billing-service' }, organizationId, ...team };
+
+    providerState(18);
+    // Simulate a Usage transaction holding the version-zero read until its writes commit.
+    const reader = service().get(GetBillingEntitlement);
+    let releaseReader: () => void = () => undefined;
+    const release = new Promise<void>((resolve) => {
+      releaseReader = resolve;
+    });
+    let reportSnapshot: (snapshot: unknown) => void = () => undefined;
+    const read = new Promise<unknown>((resolve) => {
+      reportSnapshot = resolve;
+    });
+    let readerPid = 0;
+    const holding = runWithOrganizationContext(memberOf(organizationId), () =>
+      tenant.run(async ({ client }) => {
+        const backend = await client.query('select pg_backend_pid() as pid');
+        readerPid = (backend.rows[0] as { pid: number }).pid;
+        reportSnapshot(await reader.execute({ organizationId }));
+        await release;
+      }),
+    );
+    const initialSettlement = read.then(() =>
+      Promise.all([submit('evt_team_start'), submit('evt_team_start')]),
+    );
+    try {
+      await expect(Promise.race([read, holding])).resolves.toEqual({
+        plan: 'free',
+        seatLimit: 5,
+        storageByteLimit: 2_000_000_000,
+        version: 0,
+      });
+      await vi.waitFor(async () => {
+        const waiting = await migrator.query<{ count: number }>(
+          `select count(*)::int as count from pg_locks
+           where locktype = 'advisory' and not granted
+           and $1 = any(pg_blocking_pids(pid))`,
+          [readerPid],
+        );
+        expect(waiting.rows[0]?.count).toBeGreaterThan(0);
+      });
+    } finally {
+      releaseReader();
+      await holding;
+    }
+    const initial = await initialSettlement;
+    expect(initial.map(({ status }) => status)).toEqual([204, 204]);
+    for (const token of quotaTokens) {
+      const result = await entitlement(token);
+      expect(result.status).toBe(200);
+      expect(result.body).toEqual(team);
+    }
+
+    providerState(18, true);
+    expect((await submit('evt_team_schedule')).status).toBe(204);
+    providerState(17);
+    const deferred = await submit('evt_team_resize');
+    expect(deferred.status).toBe(503);
+    expect(deferred.body).toMatchObject({ code: 'billing.unavailable' });
+    expect(await persisted()).toEqual({
+      events: [expect.objectContaining(event)],
+      receipts: ['evt_team_schedule', 'evt_team_start'],
+      scheduledCancellation: true,
+    });
+
+    // Settlement writes the receipt last. Force that write to fail after the snapshot and outbox.
+    await migrator.query(`
+      alter table stripe_reconciliation_receipts add constraint fixture_reject_resize
+      check (event_id <> 'evt_team_resize') not valid
+    `);
+    try {
+      providerState(21);
+      expect((await submit('evt_team_resize')).status).toBe(503);
+      expect(await persisted()).toEqual({
+        events: [expect.objectContaining(event)],
+        receipts: ['evt_team_schedule', 'evt_team_start'],
+        scheduledCancellation: true,
+      });
+    } finally {
+      await migrator.query(
+        'alter table stripe_reconciliation_receipts drop constraint fixture_reject_resize',
+      );
+    }
+
+    expect((await submit('evt_team_resize')).status).toBe(204);
+    expect(await persisted()).toEqual({
+      events: [
+        expect.objectContaining(event),
+        expect.objectContaining({ ...event, seatLimit: 21, version: 2 }),
+      ],
+      receipts: ['evt_team_resize', 'evt_team_schedule', 'evt_team_start'],
+      scheduledCancellation: false,
+    });
   });
 
   it('answers the liveness probe without a token', async () => {
@@ -1164,6 +1432,20 @@ describe('billing-service wiring', () => {
       status: 'error',
       error: { postgres: { status: 'down' } },
     });
+    const issuer = await InternalTokenSigner.create({
+      issuer: 'storage-service',
+      privateJwk: storage.privateJwk,
+    });
+    const token = await issuer.sign('billing-service', {
+      actor: { type: 'system', id: 'storage-service' },
+      organizationId: otherOrganizationId,
+    });
+    const entitlement = await request(service().getHttpServer())
+      .get('/internal/v1/billing/entitlement')
+      .set('Authorization', `Bearer ${token}`);
+    expect(entitlement.status).toBe(503);
+    expect(entitlement.body).toMatchObject({ code: 'billing.unavailable' });
+    expect(entitlement.headers['cache-control']).toBe('private, no-store');
   });
 
   it('answers 503 on readiness and 200 on liveness as soon as it shuts down', async () => {
