@@ -69,10 +69,10 @@ function setup() {
 }
 
 describe('ReconcileStripeSubscription', () => {
-  it('fetches Stripe before the tenant transaction and settles the current Team entitlement', async () => {
+  it('fetches Stripe outside settlement and applies the current Team entitlement', async () => {
     const { useCase, calls, provider, work, transaction } = setup();
     await expect(useCase.execute(input)).resolves.toEqual({ status: 'applied' });
-    expect(calls).toEqual(['binding', 'provider', 'transaction']);
+    expect(calls).toEqual(['transaction', 'binding', 'provider', 'transaction']);
     expect(provider.retrieve).toHaveBeenCalledWith('sub_a');
     expect(work.run).toHaveBeenCalledWith(input.organizationId, expect.any(Function));
     expect(transaction.apply).toHaveBeenCalledWith({
@@ -84,12 +84,38 @@ describe('ReconcileStripeSubscription', () => {
     expect(transaction.settle).toHaveBeenCalledWith(input.eventId);
   });
 
-  it('does not change a previously settled event', async () => {
-    const { useCase, transaction } = setup();
+  it('returns a settled event without calling the provider or locking the binding', async () => {
+    const { useCase, bindings, provider, transaction, work } = setup();
     vi.mocked(transaction.isSettled).mockResolvedValue(true);
     await expect(useCase.execute(input)).resolves.toEqual({ status: 'duplicate' });
+    expect(work.run).toHaveBeenCalledOnce();
+    expect(transaction.isSettled).toHaveBeenCalledWith(input.eventId);
+    expect(bindings.read).not.toHaveBeenCalled();
+    expect(provider.retrieve).not.toHaveBeenCalled();
+    expect(transaction.lockBinding).not.toHaveBeenCalled();
     expect(transaction.apply).not.toHaveBeenCalled();
     expect(transaction.settle).not.toHaveBeenCalled();
+  });
+
+  it('checks again under the binding lock when another delivery settles after the first read', async () => {
+    const { useCase, provider, transaction, calls } = setup();
+    vi.mocked(transaction.isSettled).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    await expect(useCase.execute(input)).resolves.toEqual({ status: 'duplicate' });
+    expect(calls).toEqual(['transaction', 'binding', 'provider', 'transaction']);
+    expect(provider.retrieve).toHaveBeenCalledOnce();
+    expect(transaction.lockBinding).toHaveBeenCalledOnce();
+    expect(transaction.isSettled).toHaveBeenCalledTimes(2);
+    expect(transaction.apply).not.toHaveBeenCalled();
+    expect(transaction.settle).not.toHaveBeenCalled();
+  });
+
+  it('retries provider access when the receipt is absent after an earlier failed settlement', async () => {
+    const { useCase, provider, transaction } = setup();
+    vi.mocked(transaction.apply).mockRejectedValueOnce(new Error('settlement rolled back'));
+    await expect(useCase.execute(input)).rejects.toThrow('settlement rolled back');
+    await expect(useCase.execute(input)).resolves.toEqual({ status: 'applied' });
+    expect(provider.retrieve).toHaveBeenCalledTimes(2);
+    expect(transaction.settle).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -146,7 +172,7 @@ describe('ReconcileStripeSubscription', () => {
     const { useCase, provider, work } = setup();
     vi.mocked(provider.retrieve).mockRejectedValue(new Error('unavailable'));
     await expect(useCase.execute(input)).rejects.toThrow('unavailable');
-    expect(work.run).not.toHaveBeenCalled();
+    expect(work.run).toHaveBeenCalledOnce();
   });
 
   it('leaves a missing binding retryable without calling Stripe', async () => {

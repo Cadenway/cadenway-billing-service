@@ -19,10 +19,15 @@ export class ReconcileStripeSubscription {
   // #endregion
 
   // #region Methods
-  /** Fetches provider state outside the transaction and fences it at settlement. */
+  /** Checks the receipt, fetches provider state and fences it at settlement. */
   public async execute(
     input: ReconcileStripeSubscriptionInput,
   ): Promise<ReconcileStripeSubscriptionOutput> {
+    const settled = await this.work.run(input.organizationId, (transaction) =>
+      transaction.isSettled(input.eventId),
+    );
+    if (settled) return { status: 'duplicate' };
+
     const snapshot = await this.bindings.read(input.organizationId);
     if (snapshot === null) return { status: 'retry' };
     const subscription = await this.provider.retrieve(snapshot.binding.subscriptionId);
