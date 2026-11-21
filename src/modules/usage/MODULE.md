@@ -12,7 +12,15 @@ None.
 
 ## Owned tables
 
-None. Persisted usage projections require the source contracts and reconciliation path.
+- `usage_organizations` serializes projection writes per organization and records generation pointers
+  and quota notification versions.
+- `usage_generations` holds the measured totals, source cursors and durable catch-up checkpoint for
+  each generation.
+- `usage_observations` records the latest contribution or terminal version of each membership or
+  attachment per generation. Its foreign key scopes the row to the same organization.
+
+The additive migration enables and forces row-level security for all three tables. Observation
+writes verify the current generation pointers under the organization lock before using them.
 
 ## API
 
@@ -25,7 +33,8 @@ to organization owners and administrators requires a published Billing event con
 
 ## Events consumed
 
-None. The domain measures membership and attachment state supplied by its caller.
+None. `RecordUsageObservation` applies membership and attachment versions. Its event adapters
+depend on the published source and threshold contracts and their configured durable consumers.
 
 ## Invariants
 
@@ -40,8 +49,10 @@ None. The domain measures membership and attachment state supplied by its caller
 
 ## Transactions
 
-None. The rules operate on supplied values. A future projection update and its outbox write belong
-in the same organization-scoped application transaction.
+`RecordUsageObservation` joins the event receipt transaction when called by a kit consumer. The
+Drizzle unit of work locks the organization before changing observations and totals in the current
+generations. Its quota writer receives the same scope and the advanced metric version. Candidate
+updates, unchanged observations and failed writes do not create a committed alert.
 
 ## Decisions
 

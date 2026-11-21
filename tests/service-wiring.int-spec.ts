@@ -18,12 +18,17 @@ import { SystemTransactionRunner, TenantTransactionRunner } from '@cadenway/nest
 import { Controller, Get, Injectable, Module } from '@nestjs/common';
 import type { BeforeApplicationShutdown } from '@nestjs/common';
 import type { NestExpressApplication } from '@nestjs/platform-express';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { migrate } from 'drizzle-orm/node-postgres/migrator';
+import { readMigrationFiles } from 'drizzle-orm/migrator';
 import pg from 'pg';
 import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { AppModule } from '../src/app.module.js';
 import { appConfigSchema } from '../src/config/app-config.js';
+import { RecordUsageObservation } from '../src/modules/usage/application/use-cases/commands/observations/record-usage-observation/record-usage-observation.use-case.js';
+import { DrizzleUsageObservationUnitOfWork } from '../src/modules/usage/infrastructure/persistence/drizzle/transactions/observations/drizzle-usage-observation.unit-of-work.js';
 
 // The service as main.ts assembles it, on a disposable PostgreSQL and NATS. `@cadenway/nest-testing`
 // does not export its container fixtures yet and a service never depends on `testcontainers` itself,
@@ -33,6 +38,9 @@ import { appConfigSchema } from '../src/config/app-config.js';
 
 /** Compose file of the development dependencies. */
 const composeFile: string = fileURLToPath(new URL('../compose.dev.yaml', import.meta.url));
+
+/** Service-owned migration files, also used by the deployment migrator. */
+const migrationsFolder: string = fileURLToPath(new URL('../migrations', import.meta.url));
 
 /** Throwaway project name: it never touches the data of the developer's own dev stack. */
 const project = `cadenway-billing-service-test-${String(process.pid)}`;
@@ -60,6 +68,9 @@ const platformTables = [
   'outbox_events',
   'processed_events',
 ] as const;
+
+/** Tenant-scoped tables of the usage module. */
+const usageTables = ['usage_generations', 'usage_observations', 'usage_organizations'] as const;
 
 /**
  * Runs `docker compose` on the throwaway project.
@@ -303,7 +314,7 @@ describe('billing-service wiring', () => {
     }
   });
 
-  it('applies its migration as the migrator role, which owns the platform tables', async () => {
+  it('applies the migrations as the migrator role, which owns the service tables', async () => {
     const tables = await migrator.query<{ tablename: string; tableowner: string }>(
       `select tablename, tableowner from pg_tables where schemaname = 'public' order by tablename`,
     );
@@ -312,9 +323,12 @@ describe('billing-service wiring', () => {
     );
 
     expect(tables.rows).toEqual(
-      platformTables.map((tablename) => ({ tablename, tableowner: 'billing_migrator' })),
+      [...platformTables, ...usageTables].map((tablename) => ({
+        tablename,
+        tableowner: 'billing_migrator',
+      })),
     );
-    expect(journal.rows).toEqual([{ applied: 1 }]);
+    expect(journal.rows).toEqual([{ applied: 2 }]);
   });
 
   it('applies nothing when the migrator runs again', async () => {
@@ -323,7 +337,77 @@ describe('billing-service wiring', () => {
     const journal = await migrator.query<{ applied: number }>(
       'select count(*)::int as applied from drizzle.__drizzle_migrations',
     );
-    expect(journal.rows).toEqual([{ applied: 1 }]);
+    expect(journal.rows).toEqual([{ applied: 2 }]);
+  });
+
+  it('upgrades the previous platform schema without losing its rows or application privileges', async () => {
+    const port = hostPort('postgres', '5432');
+    const administrator = new pg.Pool({
+      connectionString: `postgres://postgres:postgres@127.0.0.1:${port}/billing`,
+    });
+    const previous = readMigrationFiles({ migrationsFolder })[0];
+    if (previous === undefined) throw new Error('The platform migration is missing.');
+
+    await administrator.query('create database billing_upgrade owner billing_migrator');
+    const upgrade = new pg.Pool({
+      connectionString: `postgres://billing_migrator:billing_migrator@127.0.0.1:${port}/billing_upgrade`,
+      max: 1,
+    });
+    const application = new pg.Pool({
+      connectionString: `postgres://billing_app:billing_app@127.0.0.1:${port}/billing_upgrade`,
+      max: 1,
+    });
+    try {
+      await upgrade.query('revoke create on schema public from public');
+      await upgrade.query('grant usage on schema public to billing_app');
+      await upgrade.query(
+        'alter default privileges in schema public grant select, insert, update, delete on tables to billing_app',
+      );
+      await upgrade.query('begin');
+      await upgrade.query('create schema drizzle');
+      await upgrade.query(
+        'create table drizzle.__drizzle_migrations (id serial primary key, hash text not null, created_at bigint)',
+      );
+      for (const statement of previous.sql) await upgrade.query(statement);
+      await upgrade.query(
+        'insert into drizzle.__drizzle_migrations (hash, created_at) values ($1, $2)',
+        [previous.hash, previous.folderMillis],
+      );
+      await upgrade.query(
+        `insert into processed_events (consumer, event_id)
+         values ('billing-service__upgrade', $1)`,
+        [camilleMartinId],
+      );
+      await upgrade.query('commit');
+
+      await migrate(drizzle({ client: upgrade }), { migrationsFolder });
+      expect(
+        (await application.query('select consumer, event_id from processed_events')).rows,
+      ).toEqual([{ consumer: 'billing-service__upgrade', event_id: camilleMartinId }]);
+      expect(
+        (
+          await application.query(`
+            select count(*)::int as allowed
+              from (values ('usage_organizations'), ('usage_generations'), ('usage_observations')) as tables(name)
+              cross join (values ('select'), ('insert'), ('update'), ('delete')) as privileges(name)
+             where has_table_privilege(current_user, tables.name, privileges.name)
+          `)
+        ).rows,
+      ).toEqual([{ allowed: 12 }]);
+      await expect(
+        application.query('create table upgrade_probe (id integer)'),
+      ).rejects.toMatchObject({
+        code: '42501',
+      });
+      expect(
+        (await upgrade.query('select count(*)::int as applied from drizzle.__drizzle_migrations'))
+          .rows,
+      ).toEqual([{ applied: 2 }]);
+    } finally {
+      await application.end();
+      await upgrade.end();
+      await administrator.end();
+    }
   });
 
   it('forces row-level security on the tables that carry an organization', async () => {
@@ -346,12 +430,235 @@ describe('billing-service wiring', () => {
       { relname: 'idempotency_keys', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'outbox_events', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'processed_events', relrowsecurity: false, relforcerowsecurity: false },
+      { relname: 'usage_generations', relrowsecurity: true, relforcerowsecurity: true },
+      { relname: 'usage_observations', relrowsecurity: true, relforcerowsecurity: true },
+      { relname: 'usage_organizations', relrowsecurity: true, relforcerowsecurity: true },
     ]);
     expect(policies.rows).toEqual([
       { tablename: 'event_versions', policyname: 'event_versions_organization_isolation' },
       { tablename: 'idempotency_keys', policyname: 'idempotency_keys_organization_isolation' },
       { tablename: 'outbox_events', policyname: 'outbox_events_organization_isolation' },
+      { tablename: 'usage_generations', policyname: 'usage_generations_tenant_isolation' },
+      { tablename: 'usage_observations', policyname: 'usage_observations_tenant_isolation' },
+      { tablename: 'usage_organizations', policyname: 'usage_organizations_tenant_isolation' },
     ]);
+  });
+
+  it('isolates usage generations and observations between organizations', async () => {
+    const tenant = service().get(TenantTransactionRunner);
+    const system = service().get(SystemTransactionRunner);
+    const generationId = '01938f6e-0000-7000-8000-000000000031';
+
+    await runWithOrganizationContext(memberOf(atelierNordId), () =>
+      tenant.run(async (tx) => {
+        await tx.client.query('insert into usage_organizations (organization_id) values ($1)', [
+          atelierNordId,
+        ]);
+        await tx.client.query(
+          'insert into usage_generations (organization_id, id) values ($1, $2)',
+          [atelierNordId, generationId],
+        );
+        await tx.client.query(
+          `insert into usage_observations
+             (organization_id, generation_id, source, source_id, source_version, state, membership_role)
+           values ($1, $2, 'membership', $3, 1, 'present', 'member')`,
+          [atelierNordId, generationId, camilleMartinId],
+        );
+        await tx.client.query(
+          `insert into usage_observations
+             (organization_id, generation_id, source, source_id, source_version, state)
+           values ($1, $2, 'attachment', $3, 2, 'absent')`,
+          [atelierNordId, generationId, camilleMartinId],
+        );
+      }),
+    );
+
+    const counts = (organizationId: string): Promise<number[]> =>
+      runWithOrganizationContext(memberOf(organizationId), () =>
+        tenant.run(async (tx) => {
+          const result: number[] = [];
+          for (const table of usageTables) {
+            const count = await tx.client.query(`select count(*)::int as count from ${table}`);
+            result.push((count.rows as { count: number }[])[0]?.count ?? -1);
+          }
+          return result;
+        }),
+      );
+    expect(await counts(atelierNordId)).toEqual([1, 2, 1]);
+    expect(await counts(otherOrganizationId)).toEqual([0, 0, 0]);
+    expect(
+      (await system.run((tx) => tx.client.query('select organization_id from usage_organizations')))
+        .rows,
+    ).toEqual([{ organization_id: atelierNordId }]);
+    expect((await migrator.query('select organization_id from usage_organizations')).rows).toEqual(
+      [],
+    );
+
+    await expect(
+      runWithOrganizationContext(memberOf(otherOrganizationId), () =>
+        tenant.run((tx) =>
+          tx.client.query('insert into usage_organizations (organization_id) values ($1)', [
+            atelierNordId,
+          ]),
+        ),
+      ),
+    ).rejects.toMatchObject({ code: '42501' });
+
+    await runWithOrganizationContext(memberOf(atelierNordId), () =>
+      tenant.run(async (tx) => {
+        await tx.client.query('delete from usage_observations');
+        await tx.client.query('delete from usage_generations');
+        await tx.client.query('delete from usage_organizations');
+      }),
+    );
+  });
+
+  it('rejects invalid usage counters, unfinished generations and malformed tombstones', async () => {
+    const tenant = service().get(TenantTransactionRunner);
+    const generationId = '01938f6e-0000-7000-8000-000000000032';
+
+    await runWithOrganizationContext(memberOf(atelierNordId), () =>
+      tenant.run(async (tx) => {
+        await tx.client.query('insert into usage_organizations (organization_id) values ($1)', [
+          atelierNordId,
+        ]);
+        await tx.client.query(
+          'insert into usage_generations (organization_id, id) values ($1, $2)',
+          [atelierNordId, generationId],
+        );
+      }),
+    );
+    const invalidStatements = [
+      `update usage_generations set seats = -1`,
+      `update usage_generations set storage_bytes = 9007199254740992`,
+      `update usage_generations set status = 'ready'`,
+      `insert into usage_observations (organization_id, generation_id, source, source_id, source_version, state, membership_role)
+       values ($1, $2, 'membership', $3, 2, 'absent', 'member')`,
+      `insert into usage_observations (organization_id, generation_id, source, source_id, source_version, state, attachment_bytes)
+       values ($1, $2, 'attachment', $3, 1, 'present', 0)`,
+      `insert into usage_observations (organization_id, generation_id, source, source_id, source_version, state)
+       values ($1, $2, 'membership', $3, 0, 'absent')`,
+    ];
+    for (const statement of invalidStatements) {
+      const parameters = statement.startsWith('insert')
+        ? [atelierNordId, generationId, camilleMartinId]
+        : [];
+      await expect(
+        runWithOrganizationContext(memberOf(atelierNordId), () =>
+          tenant.run((tx) => tx.client.query(statement, parameters)),
+        ),
+      ).rejects.toMatchObject({ code: '23514' });
+    }
+    await runWithOrganizationContext(memberOf(atelierNordId), () =>
+      tenant.run(async (tx) => {
+        await tx.client.query('delete from usage_generations');
+        await tx.client.query('delete from usage_organizations');
+      }),
+    );
+  });
+
+  it('serializes seat observations and rolls back the receipt and counters on a threshold error', async () => {
+    const tenant = service().get(TenantTransactionRunner);
+    const organizationId = '01938f6e-0000-7000-8000-000000000040';
+    const activeId = '01938f6e-0000-7000-8000-000000000041';
+    const candidateId = '01938f6e-0000-7000-8000-000000000042';
+    const members = [
+      '01938f6e-0000-7000-8000-000000000043',
+      '01938f6e-0000-7000-8000-000000000044',
+      '01938f6e-0000-7000-8000-000000000045',
+    ];
+    const thresholdMember = '01938f6e-0000-7000-8000-000000000046';
+    const otherMember = '01938f6e-0000-7000-8000-000000000047';
+    const failure = new Error('threshold event was not recorded');
+    let rejectThreshold = true;
+    const thresholds: number[] = [];
+    const projection = new RecordUsageObservation(
+      new DrizzleUsageObservationUnitOfWork(
+        tenant,
+        { seats: 5, storageBytes: 2_000_000_000 },
+        (tx, selectedOrganization, version, fact) => {
+          expect(tx.organizationId).toBe(organizationId);
+          expect(selectedOrganization).toBe(organizationId);
+          expect(fact).toMatchObject({ metric: 'seats', used: 4, thresholdPercent: 80 });
+          expect(version).toBe(1);
+          if (rejectThreshold) return Promise.reject(failure);
+          thresholds.push(version);
+          return Promise.resolve();
+        },
+      ),
+    );
+    const record = (sourceId: string): Promise<'recorded' | 'unchanged'> =>
+      projection.execute({
+        organizationId,
+        observation: {
+          source: 'membership',
+          sourceId,
+          observation: { state: 'present', version: 1, value: 'member' },
+        },
+      });
+
+    await runWithOrganizationContext(memberOf(organizationId), async () => {
+      await tenant.run(async (tx) => {
+        await tx.client.query('insert into usage_organizations (organization_id) values ($1)', [
+          organizationId,
+        ]);
+        await tx.client.query(
+          `insert into usage_generations (organization_id, id, status, membership_scan_complete,
+              attachment_scan_complete, stream_checkpoint)
+           values ($1, $2, 'ready', true, true, '{}'::jsonb), ($1, $3, 'building', false, false, null)`,
+          [organizationId, activeId, candidateId],
+        );
+        await tx.client.query(
+          'update usage_organizations set active_generation_id = $2, candidate_generation_id = $3 where organization_id = $1',
+          [organizationId, activeId, candidateId],
+        );
+      });
+      for (const member of members) expect(await record(member)).toBe('recorded');
+
+      await expect(
+        tenant.run(async (tx) => {
+          await tx.client.query(
+            `insert into processed_events (consumer, event_id) values ('billing-service__usage-test', $1)`,
+            [thresholdMember],
+          );
+          await record(thresholdMember);
+        }),
+      ).rejects.toBe(failure);
+
+      const totals = (): Promise<readonly unknown[]> =>
+        tenant.run(async (tx) => {
+          const result = await tx.client.query(
+            `select g.seats::int as seats, o.seats_event_version::int as notification_version,
+                    o.version::int as organization_version
+               from usage_generations g join usage_organizations o using (organization_id)
+              where g.organization_id = $1 order by g.id`,
+            [organizationId],
+          );
+          return result.rows;
+        });
+      expect(await totals()).toEqual([
+        { seats: 3, notification_version: 0, organization_version: 1 },
+        { seats: 3, notification_version: 0, organization_version: 1 },
+      ]);
+      const receipt = await tenant.run((tx) =>
+        tx.client.query('select event_id from processed_events where event_id = $1', [
+          thresholdMember,
+        ]),
+      );
+      expect(receipt.rows).toEqual([]);
+
+      rejectThreshold = false;
+      expect(await Promise.all([record(thresholdMember), record(otherMember)])).toEqual([
+        'recorded',
+        'recorded',
+      ]);
+      expect(await record(thresholdMember)).toBe('unchanged');
+      expect(await totals()).toEqual([
+        { seats: 5, notification_version: 1, organization_version: 2 },
+        { seats: 5, notification_version: 1, organization_version: 2 },
+      ]);
+      expect(thresholds).toEqual([1]);
+    });
   });
 
   it('answers the liveness probe without a token', async () => {
@@ -521,7 +828,7 @@ describe('billing-service wiring', () => {
     const journal = await migrator.query<{ applied: number }>(
       'select count(*)::int as applied from drizzle.__drizzle_migrations',
     );
-    expect(journal.rows).toEqual([{ applied: 1 }]);
+    expect(journal.rows).toEqual([{ applied: 2 }]);
   });
 
   it('publishes a pending event through the outbox relay', async () => {

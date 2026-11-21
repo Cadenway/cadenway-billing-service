@@ -8,6 +8,13 @@
       "when": 1794753200470,
       "tag": "0000_platform_tables",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1795248681352,
+      "tag": "0001_usage_projection",
+      "breakpoints": true
     }
   ]
 }
