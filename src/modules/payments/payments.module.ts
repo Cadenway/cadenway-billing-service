@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 
 import { PlansModule } from '../plans/plans.module.js';
 import { GetBillingEntitlement } from './application/use-cases/queries/subscriptions/get-billing-entitlement/get-billing-entitlement.use-case.js';
+import { stripeWebhookInboxWorkerProvider } from './composition/providers/adapters/webhooks/stripe-webhook-inbox-worker.provider.js';
 import { reconcileStripeCheckoutProvider } from './composition/providers/use-cases/checkout/reconcile-stripe-checkout.provider.js';
 import { startBillingCheckoutProvider } from './composition/providers/use-cases/checkout/start-billing-checkout.provider.js';
 import { listBillingInvoicesProvider } from './composition/providers/use-cases/invoices/list-billing-invoices.provider.js';
@@ -29,6 +30,7 @@ import { StripeWebhookController } from './presentation/http/webhooks/stripe/str
     startBillingCheckoutProvider,
     reconcileStripeCheckoutProvider,
     reconcileStripeSubscriptionProvider,
+    stripeWebhookInboxWorkerProvider,
   ],
   exports: [GetBillingEntitlement],
 })

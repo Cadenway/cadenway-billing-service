@@ -13,6 +13,7 @@ export type StripeWebhookAuthenticator = (
       readonly kind: 'checkout';
       readonly eventId: string;
       readonly sessionId: string;
+      readonly providerKey?: string;
     }
   | {
       readonly kind:

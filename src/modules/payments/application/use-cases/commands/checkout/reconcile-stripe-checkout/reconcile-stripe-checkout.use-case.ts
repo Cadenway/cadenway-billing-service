@@ -34,6 +34,12 @@ export class ReconcileStripeCheckout {
     if (attempt === null) {
       return { status: (await this.attempts.hasSettlement(input.eventId)) ? 'duplicate' : 'retry' };
     }
+    if (
+      input.expectedOrganizationId !== undefined &&
+      attempt.organizationId !== input.expectedOrganizationId
+    ) {
+      return { status: 'retry' };
+    }
 
     return this.settle(attempt.organizationId, input.eventId, session);
   }

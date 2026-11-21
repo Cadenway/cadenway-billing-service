@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { StripeWebhookAuthenticator } from '../../../../models/subscriptions/stripe-webhook-authenticator.model.js';
+import type { StripeCheckoutAttemptReader } from '../../../../ports/outbound/persistence/checkout/stripe-checkout-attempt-reader.port.js';
+import type { StripeWebhookInbox } from '../../../../ports/outbound/persistence/webhooks/stripe-webhook-inbox.port.js';
 import type { ReconcileStripeSubscription } from '../reconcile-stripe-subscription/reconcile-stripe-subscription.use-case.js';
 import type { ReconcileStripeCheckout } from '../../checkout/reconcile-stripe-checkout/reconcile-stripe-checkout.use-case.js';
 import { AdmitStripeWebhook } from './admit-stripe-webhook.use-case.js';
@@ -147,5 +149,68 @@ describe('AdmitStripeWebhook', () => {
     const { settle, useCase } = setup();
     settle.mockResolvedValue({ status: 'retry' });
     await expect(useCase.execute(input)).resolves.toBe('unavailable');
+  });
+
+  it('acknowledges only once the inbox records the resolved subscription delivery', async () => {
+    const { authenticate, hasSettlement, resolve, settle } = setup();
+    const enqueue = vi
+      .fn<StripeWebhookInbox['enqueue']>()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValue(true);
+    const checkoutAttempts: StripeCheckoutAttemptReader = {
+      hasSettlement: vi.fn().mockResolvedValue(false),
+      resolve: vi.fn().mockResolvedValue(null),
+    };
+    const useCase = new AdmitStripeWebhook(authenticate, { hasSettlement, resolve }, settle, null, {
+      checkoutAttempts,
+      enqueue,
+    });
+    await expect(useCase.execute(input)).resolves.toBe('unavailable');
+    await expect(useCase.execute(input)).resolves.toBe('accepted');
+    expect(enqueue).toHaveBeenCalledWith({
+      ...subscription,
+      organizationId: binding.organizationId,
+    });
+    expect(settle).not.toHaveBeenCalled();
+  });
+
+  it('requires an exact Checkout reservation and falls back for incomplete signed snapshots', async () => {
+    const { authenticate, hasSettlement, resolve, settle } = setup();
+    const delivery = { kind: 'checkout', eventId: 'evt_checkout', sessionId: 'cs_test' } as const;
+    const checkout = vi
+      .fn<ReconcileStripeCheckout['execute']>()
+      .mockResolvedValue({ status: 'duplicate' });
+    const lookup = vi
+      .fn<StripeCheckoutAttemptReader['resolve']>()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValue({ organizationId: binding.organizationId });
+    const enqueue = vi.fn<StripeWebhookInbox['enqueue']>().mockResolvedValue(true);
+    const useCase = new AdmitStripeWebhook(
+      authenticate,
+      { hasSettlement, resolve },
+      settle,
+      checkout,
+      {
+        checkoutAttempts: { hasSettlement: vi.fn().mockResolvedValue(false), resolve: lookup },
+        enqueue,
+      },
+    );
+    authenticate.mockReturnValue({ ...delivery, providerKey: 'checkout_known' });
+    await expect(useCase.execute(input)).resolves.toBe('unavailable');
+    await expect(useCase.execute(input)).resolves.toBe('accepted');
+    expect(lookup).toHaveBeenCalledWith('checkout_known');
+    expect(enqueue).toHaveBeenCalledExactlyOnceWith({
+      ...delivery,
+      organizationId: binding.organizationId,
+    });
+    expect(checkout).not.toHaveBeenCalled();
+
+    authenticate.mockReturnValue(delivery);
+    await expect(useCase.execute(input)).resolves.toBe('accepted');
+    expect(checkout).toHaveBeenCalledExactlyOnceWith({
+      eventId: delivery.eventId,
+      sessionId: delivery.sessionId,
+    });
+    expect(enqueue).toHaveBeenCalledTimes(1);
   });
 });

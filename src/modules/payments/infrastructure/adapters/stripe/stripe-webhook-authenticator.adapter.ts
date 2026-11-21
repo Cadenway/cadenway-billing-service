@@ -52,6 +52,15 @@ const checkout = z.object({
     .string()
     .max(255)
     .regex(/^cs_[A-Za-z0-9_]+$/u),
+  client_reference_id: z.unknown().optional(),
+  metadata: z.unknown().optional(),
+});
+const checkoutReferences = z.object({
+  client_reference_id: z
+    .string()
+    .max(255)
+    .regex(/^checkout_[A-Za-z0-9_-]+$/u),
+  metadata: z.object({ cadenway_checkout_key: z.string() }),
 });
 
 /** Authenticates original bytes before narrowing the single-account Stripe event envelope. */
@@ -69,9 +78,19 @@ export function createStripeWebhookAuthenticator(
     }
     if (checkoutEvents.has(envelope.data.type)) {
       const target = checkout.safeParse(envelope.data.data.object);
-      return target.success
-        ? { kind: 'checkout', eventId: envelope.data.id, sessionId: target.data.id }
-        : { kind: 'invalid-event' };
+      if (!target.success) return { kind: 'invalid-event' };
+      const references = checkoutReferences.safeParse(target.data);
+      const providerKey =
+        references.success &&
+        references.data.client_reference_id === references.data.metadata.cadenway_checkout_key
+          ? references.data.client_reference_id
+          : undefined;
+      return {
+        kind: 'checkout',
+        eventId: envelope.data.id,
+        sessionId: target.data.id,
+        ...(providerKey === undefined ? {} : { providerKey }),
+      };
     }
     if (!subscriptionEvents.has(envelope.data.type)) return { kind: 'ignored' };
 

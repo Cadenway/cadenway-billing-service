@@ -33,6 +33,7 @@ describe('appConfigSchema', () => {
       BILLING_USAGE_ENABLED: false,
       BILLING_STRIPE_WEBHOOK_MODE: 'test',
       BILLING_STRIPE_SETTLEMENT_ENABLED: false,
+      BILLING_STRIPE_WEBHOOK_INBOX_ENABLED: false,
       INTERNAL_TOKEN_AUDIENCE: 'billing-service',
       INTERNAL_TOKEN_TRUSTED_ISSUERS: {
         'api-gateway': [
@@ -96,6 +97,22 @@ describe('appConfigSchema', () => {
         BILLING_STRIPE_TEAM_PRICE_IDS: '["price_fixture"]',
       }),
     ).toMatchObject({ BILLING_STRIPE_SETTLEMENT_ENABLED: true });
+  });
+
+  it('requires settlement before admitting Stripe deliveries into the inbox', () => {
+    const enabled = { ...complete, BILLING_STRIPE_WEBHOOK_INBOX_ENABLED: 'true' };
+    expect(() => loadConfig(appConfigSchema, enabled)).toThrow(
+      /BILLING_STRIPE_WEBHOOK_INBOX_ENABLED/u,
+    );
+    expect(
+      loadConfig(appConfigSchema, {
+        ...enabled,
+        BILLING_STRIPE_SETTLEMENT_ENABLED: 'true',
+        BILLING_STRIPE_API_KEY: 'rk_test_fixture',
+        BILLING_STRIPE_WEBHOOK_SECRETS: '["whsec_fixture"]',
+        BILLING_STRIPE_TEAM_PRICE_IDS: '["price_fixture"]',
+      }),
+    ).toMatchObject({ BILLING_STRIPE_WEBHOOK_INBOX_ENABLED: true });
   });
 
   it('requires both source origins and the signing key when usage is enabled', () => {

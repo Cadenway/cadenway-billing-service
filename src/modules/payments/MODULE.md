@@ -24,6 +24,8 @@ Authenticates Stripe payment deliveries. Stripe owns hosted checkout and card da
   the response needed for replay.
 - `stripe_checkout_receipts` deduplicates authenticated terminal Checkout deliveries. An expired
   session can have a receipt before any subscription binding exists.
+- `stripe_webhook_inbox` admits verified event and provider identities with the locally resolved
+  tenant. It holds lease and retry state, without storing request bodies or Stripe credentials.
 
 Migration `0003_stripe_reconciliation.sql` creates the binding, snapshot and receipt tables
 with forced tenant RLS.
@@ -42,6 +44,8 @@ key or event ID selected in the system transaction.
 Migration `0008_stripe_checkout_recovery.sql` adds the provider's session ID, immutable
 expiration deadline and a digest of the dispatch credential. These fields are nullable
 for attempts submitted by the earlier binary.
+Migration `0009_stripe_webhook_inbox.sql` adds the inbox with forced RLS and a due-delivery
+index. A worker-only system scope can claim pending rows. Other writes use the resolved tenant.
 
 ## API
 
@@ -50,11 +54,12 @@ for attempts submitted by the earlier binary.
   The service replays the original URL for the same actor and key for 24 hours.
 - `POST /internal/v1/billing/webhooks/stripe` verifies the exact raw bytes after the signed
   global Gateway identity is established. Replies are private and noncacheable. Unsupported
-  verified event types receive an empty 204. A supported event receives 204 after durable
-  settlement or a confirmed duplicate.
+  verified event types receive an empty 204. A supported event receives 204 after committed
+  inbox admission, durable synchronous settlement or a confirmed duplicate.
   The account-wide receipt is checked before looking up the binding, so a replay can stop
   even if its original customer or subscription has since been replaced.
-  Missing bindings, deferred settlement and settlement errors return `503 billing.unavailable`.
+  Missing bindings and failed admissions return `503 billing.unavailable`. For events settled
+  synchronously, deferred settlement and settlement errors also return 503.
 - `GET /internal/v1/billing/entitlement` reads the committed plan, limits and version for the
   tenant in a verified Organization or Storage system token whose actor ID matches its
   issuer. Replies are private and noncacheable. A successful read with no committed snapshot
@@ -105,10 +110,16 @@ readers take the shared lock so Usage can confirm threshold events under the sam
 until its transaction commits, including before the first snapshot exists.
 
 The webhook admission adapter verifies the Stripe signature and the configured mode before
-global resolution. The lookup returns the provider pair and its revision with the organization
-ID. Reconciliation compares the token before reading Stripe, then rechecks under the tenant
-binding lock before applying an entitlement update. Supported events remain retryable until
-this settlement commits. The endpoint does not store raw provider deliveries.
+global resolution. With inbox admission enabled, an exact active Stripe subscription binding
+or a Checkout reservation with matching signed references establishes the tenant. A durable
+insert commits before 204. Checkout deliveries without matching references still use the
+canonical synchronous path. A worker claims one due event at a time, with a 60-second lease,
+and releases the database transaction before Stripe reads. At each attempt, it re-resolves
+the binding or reservation and reconciles only within the admitted tenant. The existing
+settlement receipt makes a replay safe after a crash between settlement and inbox completion.
+A tenant-scoped lease check guards status changes. Pending work survives failures and retries
+at bounded intervals up to 15 minutes without discarding work. Warnings report failed stages,
+attempt counts, age and a digest for correlation. The endpoint never stores raw provider deliveries.
 
 ## Decisions
 
@@ -118,6 +129,11 @@ this settlement commits. The endpoint does not store raw provider deliveries.
   production readiness of both quota owners and configured Stripe credentials and Team prices.
   The local mode defaults to `test`. Two endpoint signing keys can coexist during rotation.
   Subscription deliveries never create bindings.
+- `BILLING_STRIPE_WEBHOOK_INBOX_ENABLED` defaults to false. Apply the additive migration and use
+  a worker-capable binary before enabling admission. To return to synchronous admission,
+  disable the inbox flag and keep settlement enabled so the worker drains acknowledged work.
+  Empty the pending inbox before returning to a binary without the worker or switching Stripe
+  account or mode. Rows with a null `finished_at` are still pending.
 - Linked invoice reads require an invoice cursor key and a Stripe API key for the same mode.
   Billing rechecks the customer binding after reading Stripe. The cursor key is configured
   independently of webhook verification and rekeying invalidates existing invoice cursors.

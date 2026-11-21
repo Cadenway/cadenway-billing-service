@@ -6,5 +6,8 @@ export interface ReconcileStripeCheckoutInput {
 
   /** The Checkout session to retrieve with Billing's Stripe credentials. */
   readonly sessionId: string;
+
+  /** An inbox delivery remains bound to the tenant established at admission. */
+  readonly expectedOrganizationId?: string;
   // #endregion
 }

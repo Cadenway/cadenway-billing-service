@@ -89,6 +89,29 @@ describe('Stripe webhook authentication and envelope', () => {
     expect(authenticate(rawBody, signature)).toEqual({ kind: 'invalid-event' });
   });
 
+  it('allows inbox routing only for matching signed Checkout references', () => {
+    const target = {
+      object: 'checkout.session',
+      id: 'cs_test_fixture',
+      client_reference_id: 'checkout_known',
+    };
+    const checkoutEvent = { ...event, type: 'checkout.session.completed' };
+    const valid = signed({
+      ...checkoutEvent,
+      data: { object: { ...target, metadata: { cadenway_checkout_key: 'checkout_known' } } },
+    });
+    const mismatch = signed({
+      ...checkoutEvent,
+      data: { object: { ...target, metadata: { cadenway_checkout_key: 'checkout_different' } } },
+    });
+    const expected = { kind: 'checkout', eventId: event.id, sessionId: target.id };
+    expect(authenticate(valid.rawBody, valid.signature)).toEqual({
+      ...expected,
+      providerKey: 'checkout_known',
+    });
+    expect(authenticate(mismatch.rawBody, mismatch.signature)).toEqual(expected);
+  });
+
   it('intentionally ignores correctly signed events outside the supported allowlists', () => {
     const { rawBody, signature } = signed({
       ...event,

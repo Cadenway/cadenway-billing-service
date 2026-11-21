@@ -41,7 +41,7 @@ export class StripeWebhookController {
   // #endregion
 
   // #region Methods
-  /** Acknowledges only settled deliveries or verified unsupported event types. */
+  /** Acknowledges durably admitted or settled deliveries, and verified unsupported types. */
   @Post('stripe')
   @HttpCode(204)
   @Header('Cache-Control', 'private, no-store')

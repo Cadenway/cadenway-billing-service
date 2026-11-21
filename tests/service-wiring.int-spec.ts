@@ -134,10 +134,11 @@ const paymentsTables = [
   'stripe_checkout_receipts',
   'stripe_reconciliation_receipts',
   'stripe_subscription_snapshots',
+  'stripe_webhook_inbox',
 ] as const;
 
 /** Migrations applied on a clean or upgraded database. */
-const migrationCount = 9;
+const migrationCount = 10;
 const stripeFixtureKey = 'whsec_fixture';
 const stripeTeamPrice = 'price_team_fixture';
 
@@ -726,7 +727,7 @@ describe('billing-service wiring', () => {
     expect(journal.rows).toEqual([{ applied: migrationCount }]);
   });
 
-  it.each([1, 3, 4, 6, 7, 8])(
+  it.each([1, 3, 4, 6, 7, 8, 9])(
     'upgrades from %i applied migrations without losing rows or application privileges',
     async (previousCount) => {
       const port = hostPort('postgres', '5432');
@@ -907,6 +908,14 @@ describe('billing-service wiring', () => {
       {
         tablename: 'stripe_checkout_receipts',
         policyname: 'stripe_checkout_receipts_exact_system_lookup',
+      },
+      {
+        tablename: 'stripe_webhook_inbox',
+        policyname: 'stripe_webhook_inbox_worker_select',
+      },
+      {
+        tablename: 'stripe_webhook_inbox',
+        policyname: 'stripe_webhook_inbox_worker_update',
       },
       { tablename: 'usage_generations', policyname: 'usage_generations_tenant_isolation' },
       { tablename: 'usage_observations', policyname: 'usage_observations_tenant_isolation' },
