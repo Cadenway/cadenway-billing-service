@@ -36,6 +36,13 @@
       "when": 1795274408342,
       "tag": "0004_stripe_binding_unique",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1795276317551,
+      "tag": "0005_stripe_receipt_event_unique",
+      "breakpoints": true
     }
   ]
 }

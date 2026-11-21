@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "stripe_reconciliation_receipts_event_id_unique" ON "stripe_reconciliation_receipts" USING btree ("event_id");

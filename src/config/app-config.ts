@@ -35,6 +35,8 @@ import { z } from 'zod';
  * - `INTERNAL_TOKEN_AUDIENCE` and `INTERNAL_TOKEN_TRUSTED_ISSUERS`: the `aud` this service accepts
  *   and the public keys of the backends allowed to call it.
  * - `BILLING_USAGE_ENABLED` enables the projection worker and retained event consumers.
+ * - `BILLING_STRIPE_WEBHOOK_MODE` and `BILLING_STRIPE_WEBHOOK_SECRETS` select the verified
+ *   delivery mode and active endpoint keys.
  * - `ORGANIZATION_SERVICE_URL`, `STORAGE_SERVICE_URL` and `INTERNAL_TOKEN_PRIVATE_JWK`
  *   identify and authenticate the authority reads when the worker is enabled.
  *
@@ -46,6 +48,8 @@ export type AppConfig = BaseConfig &
   MessagingConfig &
   InternalTokenVerifierConfig & {
     readonly BILLING_USAGE_ENABLED: boolean;
+    readonly BILLING_STRIPE_WEBHOOK_MODE: 'test' | 'live';
+    readonly BILLING_STRIPE_WEBHOOK_SECRETS?: readonly string[] | undefined;
     readonly ORGANIZATION_SERVICE_URL?: string | undefined;
     readonly STORAGE_SERVICE_URL?: string | undefined;
     readonly INTERNAL_TOKEN_PRIVATE_JWK?: InternalTokenSignerConfig['INTERNAL_TOKEN_PRIVATE_JWK'];
@@ -65,6 +69,27 @@ function sourceOrigin(service: 'Organization' | 'Storage'): z.ZodType<string> {
     });
 }
 
+const stripeEndpointSecrets = z
+  .string()
+  .max(2_048)
+  .transform((value, context) => {
+    const schema = z
+      .array(z.string().regex(/^whsec_[A-Za-z0-9_]{1,255}$/u))
+      .min(1)
+      .max(2);
+    try {
+      const parsed = schema.safeParse(JSON.parse(value));
+      if (parsed.success) return parsed.data;
+    } catch {
+      // Report only the configuration name and expected shape, without the signing keys.
+    }
+    context.addIssue({
+      code: 'custom',
+      message: 'Expected one or two Stripe endpoint keys as JSON.',
+    });
+    return z.NEVER;
+  });
+
 /**
  * Constant appConfigSchema
  *
@@ -82,6 +107,8 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
     ...databaseConfigShape,
     ...messagingConfigShape,
     ...internalTokenVerifierConfigShape,
+    BILLING_STRIPE_WEBHOOK_MODE: z.enum(['test', 'live']).default('test'),
+    BILLING_STRIPE_WEBHOOK_SECRETS: stripeEndpointSecrets.optional(),
     BILLING_USAGE_ENABLED: z
       .enum(['true', 'false'])
       .default('false')

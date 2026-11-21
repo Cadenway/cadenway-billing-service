@@ -80,7 +80,7 @@ export const stripeSubscriptionSnapshots = pgTable(
   ],
 ).enableRLS();
 
-/** Provider events settled once within their Billing tenant. */
+/** Stripe event IDs are settled once across the configured account and isolated by tenant. */
 export const stripeReconciliationReceipts = pgTable(
   'stripe_reconciliation_receipts',
   {
@@ -90,6 +90,7 @@ export const stripeReconciliationReceipts = pgTable(
   },
   (table) => [
     primaryKey({ columns: [table.organizationId, table.eventId] }),
+    uniqueIndex('stripe_reconciliation_receipts_event_id_unique').on(table.eventId),
     foreignKey({
       columns: [table.organizationId],
       foreignColumns: [stripeBindings.organizationId],

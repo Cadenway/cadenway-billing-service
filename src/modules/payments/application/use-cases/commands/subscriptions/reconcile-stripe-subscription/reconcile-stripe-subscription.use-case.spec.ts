@@ -7,11 +7,11 @@ import type { StripeReconciliationTransaction } from '../../../../ports/outbound
 import type { StripeReconciliationUnitOfWork } from '../../../../ports/outbound/transactions/subscriptions/stripe-reconciliation-unit-of-work.port.js';
 import { ReconcileStripeSubscription } from './reconcile-stripe-subscription.use-case.js';
 
-const input = { organizationId: 'organization-a', eventId: 'evt_123' };
 const binding: StripeBindingSnapshot = {
   revision: 3,
   binding: { customerId: 'cus_a', subscriptionId: 'sub_a' },
 };
+const input = { organizationId: 'organization-a', eventId: 'evt_123', acceptedBinding: binding };
 const subscription = {
   ...binding.binding,
   liveMode: false,
@@ -180,5 +180,16 @@ describe('ReconcileStripeSubscription', () => {
     vi.mocked(bindings.read).mockResolvedValue(null);
     await expect(useCase.execute(input)).resolves.toEqual({ status: 'retry' });
     expect(provider.retrieve).not.toHaveBeenCalled();
+  });
+
+  it('does not fetch a replacement Stripe binding for an older admitted delivery', async () => {
+    const { useCase, bindings, provider, transaction } = setup();
+    vi.mocked(bindings.read).mockResolvedValue({
+      revision: binding.revision + 1,
+      binding: { customerId: 'cus_new', subscriptionId: 'sub_new' },
+    });
+    await expect(useCase.execute(input)).resolves.toEqual({ status: 'retry' });
+    expect(provider.retrieve).not.toHaveBeenCalled();
+    expect(transaction.settle).not.toHaveBeenCalled();
   });
 });

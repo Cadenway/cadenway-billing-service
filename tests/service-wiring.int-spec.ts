@@ -1,14 +1,9 @@
 import { execFileSync } from 'node:child_process';
-import { generateKeyPairSync } from 'node:crypto';
+import { createHmac, generateKeyPairSync } from 'node:crypto';
 import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 
-import {
-  createApplication,
-  InternalTokenSigner,
-  loadConfig,
-  runWithOrganizationContext,
-} from '@cadenway/nest-common';
+import { InternalTokenSigner, loadConfig, runWithOrganizationContext } from '@cadenway/nest-common';
 import type {
   Ed25519PrivateJwk,
   Ed25519PublicJwk,
@@ -25,9 +20,8 @@ import pg from 'pg';
 import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { AppModule } from '../src/app.module.js';
+import { AppModule, createBillingApplication } from '../src/app.module.js';
 import { appConfigSchema } from '../src/config/app-config.js';
-import { configureBillingSubscriptionCache } from '../src/infrastructure/http/billing-subscription-cache.js';
 import { RecordUsageObservation } from '../src/modules/usage/application/use-cases/commands/observations/record-usage-observation/record-usage-observation.use-case.js';
 import { DrizzleActiveUsageReader } from '../src/modules/usage/infrastructure/persistence/drizzle/repositories/usage/drizzle-active-usage.repository.js';
 import { DrizzleUsageObservationUnitOfWork } from '../src/modules/usage/infrastructure/persistence/drizzle/transactions/observations/drizzle-usage-observation.unit-of-work.js';
@@ -87,7 +81,8 @@ const paymentsTables = [
 ] as const;
 
 /** Migrations applied on a clean or upgraded database. */
-const migrationCount = 5;
+const migrationCount = 6;
+const stripeFixtureKey = 'whsec_fixture';
 
 /**
  * Runs `docker compose` on the throwaway project.
@@ -287,6 +282,8 @@ describe('billing-service wiring', () => {
     vi.stubEnv('NATS_URL', `nats://127.0.0.1:${natsHostPort}`);
     vi.stubEnv('NATS_USER', 'billing');
     vi.stubEnv('NATS_PASSWORD', 'billing');
+    vi.stubEnv('BILLING_STRIPE_WEBHOOK_MODE', 'test');
+    vi.stubEnv('BILLING_STRIPE_WEBHOOK_SECRETS', JSON.stringify([stripeFixtureKey]));
     vi.stubEnv('INTERNAL_TOKEN_AUDIENCE', 'billing-service');
     vi.stubEnv(
       'INTERNAL_TOKEN_TRUSTED_ISSUERS',
@@ -302,18 +299,9 @@ describe('billing-service wiring', () => {
 
     // As main.ts: the configuration is read inside the start-up, never when a module is imported.
     const config = loadConfig(appConfigSchema);
-    app = await createApplication(ProbedApplicationModule, {
-      service: 'billing-service',
-      config,
-      internalToken: {
-        verifier: {
-          audience: config.INTERNAL_TOKEN_AUDIENCE,
-          trustedIssuers: config.INTERNAL_TOKEN_TRUSTED_ISSUERS,
-        },
-      },
-      logDestination: { write: (): void => undefined },
+    app = await createBillingApplication(config, ProbedApplicationModule, {
+      write: (): void => undefined,
     });
-    configureBillingSubscriptionCache(app);
     await app.init();
     signer = await InternalTokenSigner.create({
       issuer: 'api-gateway',
@@ -828,6 +816,89 @@ describe('billing-service wiring', () => {
     expect(results.at(-1)?.body).toMatchObject({
       details: { issues: [expect.objectContaining({ in: 'body' })] },
     });
+  });
+
+  it('authenticates Stripe bytes from the global gateway, and does not acknowledge a deferred event', async () => {
+    const api = request(service().getHttpServer());
+    const path = '/internal/v1/billing/webhooks/stripe';
+    const actor = { type: 'system', id: 'api-gateway' } as const;
+    const caller = await signer.sign('billing-service', { actor, organizationId: null });
+    const wrongIdentity = await signer.sign('billing-service', {
+      actor: { type: 'system', id: 'other' },
+      organizationId: null,
+    });
+    const scoped = await signer.sign('billing-service', { actor, organizationId: atelierNordId });
+    const ignored =
+      '{ "id": "evt_invoice", "object": "event", "type": "invoice.created", "livemode": false, "data": { "object": {} } }';
+    const supported = JSON.stringify({
+      id: 'evt_subscription',
+      object: 'event',
+      type: 'customer.subscription.updated',
+      livemode: false,
+      data: { object: { object: 'subscription', id: 'sub_atelier', customer: 'cus_atelier' } },
+    });
+    const signature = (payload: string): string => {
+      const timestamp = String(Math.floor(Date.now() / 1_000));
+      const digest = createHmac('sha256', stripeFixtureKey)
+        .update(`${timestamp}.${payload}`)
+        .digest('hex');
+      return `t=${timestamp},v1=${digest}`;
+    };
+    const post = (token: string) =>
+      api
+        .post(path)
+        .set('Authorization', `Bearer ${token}`)
+        .set('Content-Type', 'application/json');
+    const denied = [
+      [await api.post(path), 401, 'auth.token-missing'],
+      [await post(wrongIdentity).send(ignored), 403, 'auth.actor-not-allowed'],
+      [await post(scoped).send(ignored), 403, 'auth.organization-not-allowed'],
+      [await post(caller).send(ignored), 400, 'billing.invalid-webhook-signature'],
+      [
+        await post(caller).set('Stripe-Signature', signature(ignored)).send(`${ignored} `),
+        400,
+        'billing.invalid-webhook-signature',
+      ],
+      [
+        await post(caller).set('Stripe-Signature', signature(supported)).send(supported),
+        503,
+        'billing.unavailable',
+      ],
+      [
+        await post(caller).set('Stripe-Signature', signature('{secret')).send('{secret'),
+        400,
+        'billing.invalid-webhook',
+      ],
+      [await post(caller).send('a'.repeat(1_048_577)), 400, 'request.body-too-large'],
+    ] as const;
+    for (const [response, status, code] of denied) {
+      expect(response.status).toBe(status);
+      expect(response.headers['cache-control']).toBe('private, no-store');
+      expect(response.body).toMatchObject({ code });
+      expect(response.text).not.toContain('{secret');
+    }
+    const acknowledged = await post(caller)
+      .set('Stripe-Signature', signature(ignored))
+      .send(ignored);
+    expect(acknowledged.status).toBe(204);
+    expect(acknowledged.text).toBe('');
+    expect(acknowledged.headers['cache-control']).toBe('private, no-store');
+
+    const system = service().get(SystemTransactionRunner);
+    await system.run(async ({ client }) => {
+      await client.query(
+        'insert into stripe_bindings (organization_id, customer_id, subscription_id) values ($1, $2, $3)',
+        [atelierNordId, 'cus_replacement', 'sub_replacement'],
+      );
+      await client.query(
+        'insert into stripe_reconciliation_receipts (organization_id, event_id) values ($1, $2)',
+        [atelierNordId, 'evt_subscription'],
+      );
+    });
+    const replay = await post(caller).set('Stripe-Signature', signature(supported)).send(supported);
+    expect(replay.status).toBe(204);
+    expect(replay.text).toBe('');
+    expect(replay.headers['cache-control']).toBe('private, no-store');
   });
 
   it('answers the liveness probe without a token', async () => {

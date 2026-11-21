@@ -154,12 +154,29 @@ describe('Stripe reconciliation PostgreSQL transactions', () => {
       freePlanLimits: { seats: 5, storageBytes: 2_000_000_000 },
     });
     await expect(
-      inTenant(organizationId, () => reconcile.execute({ organizationId, eventId: 'evt_one' })),
+      inTenant(organizationId, () =>
+        reconcile.execute({
+          organizationId,
+          eventId: 'evt_one',
+          acceptedBinding: {
+            revision: 1,
+            binding: { customerId: 'cus_local', subscriptionId: 'sub_local' },
+          },
+        }),
+      ),
     ).resolves.toEqual({ status: 'duplicate' });
     expect(retrieve).not.toHaveBeenCalled();
     await expect(
       inTenant(otherId, () => unit.run(otherId, (transaction) => transaction.isSettled('evt_one'))),
     ).resolves.toBe(false);
+    await expect(
+      runWithOrganizationContext(verifiedWebhookCaller, () =>
+        webhookBindings.hasSettlement('evt_one'),
+      ),
+    ).resolves.toBe(true);
+    await expect(inTenant(otherId, () => webhookBindings.hasSettlement('evt_one'))).rejects.toThrow(
+      'global system actor',
+    );
   });
 
   it('does not settle a change without the admission fence', async () => {
@@ -224,5 +241,36 @@ describe('Stripe reconciliation PostgreSQL transactions', () => {
     expect(
       await inTenant(otherId, () => new DrizzleStripeBindingReader(runner).read(otherId)),
     ).toBeNull();
+  });
+
+  it('rolls back a receipt collision across tenants even if their bindings are distinct', async () => {
+    const unit = new DrizzleStripeReconciliationUnitOfWork(runner, {
+      confirmedUsage: () => Promise.resolve(null),
+      authorizeChange: () => Promise.resolve(true),
+    });
+    await expect(
+      inTenant(secondBoundId, () =>
+        unit.run(secondBoundId, async (tx) => {
+          expect(await tx.lockBinding()).not.toBeNull();
+          expect(await tx.isSettled('evt_one')).toBe(false);
+          expect(await tx.apply(team)).toBe('applied');
+          await tx.settle('evt_one');
+        }),
+      ),
+    ).rejects.toThrow();
+    expect(
+      await inTenant(secondBoundId, () =>
+        new DrizzleStripeBindingReader(runner).read(secondBoundId),
+      ),
+    ).toMatchObject({ revision: 1 });
+    const snapshots = await inTenant(secondBoundId, () =>
+      runner.run(({ client }) =>
+        client.query(
+          'select organization_id from stripe_subscription_snapshots where organization_id = $1',
+          [secondBoundId],
+        ),
+      ),
+    );
+    expect(snapshots.rows).toEqual([]);
   });
 });

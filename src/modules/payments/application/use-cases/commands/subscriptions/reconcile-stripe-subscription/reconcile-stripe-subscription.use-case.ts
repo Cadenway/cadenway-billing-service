@@ -1,10 +1,23 @@
 import { resolveStripeSubscription } from '../../../../../domain/policies/subscriptions/stripe-subscription.policy.js';
 import type { StripeSubscriptionReconciliation } from '../../../../../domain/value-objects/subscriptions/stripe-subscription-reconciliation.value-object.js';
+import type { StripeBindingSnapshot } from '../../../../models/subscriptions/stripe-binding-snapshot.model.js';
 import type { StripeBindingReader } from '../../../../ports/outbound/persistence/subscriptions/stripe-binding-reader.port.js';
 import type { StripeSubscriptionProvider } from '../../../../ports/outbound/providers/subscriptions/stripe-subscription-provider.port.js';
 import type { StripeReconciliationUnitOfWork } from '../../../../ports/outbound/transactions/subscriptions/stripe-reconciliation-unit-of-work.port.js';
 import type { ReconcileStripeSubscriptionInput } from './reconcile-stripe-subscription.input.js';
 import type { ReconcileStripeSubscriptionOutput } from './reconcile-stripe-subscription.output.js';
+
+/** Compares the admitted provider pair and revision before relying on a binding. */
+function isSameBinding(
+  snapshot: StripeBindingSnapshot | null,
+  expected: StripeBindingSnapshot,
+): snapshot is StripeBindingSnapshot {
+  return (
+    snapshot?.revision === expected.revision &&
+    snapshot.binding.customerId === expected.binding.customerId &&
+    snapshot.binding.subscriptionId === expected.binding.subscriptionId
+  );
+}
 
 /** Reconciles an admitted Stripe event against current provider and local authority. */
 export class ReconcileStripeSubscription {
@@ -29,17 +42,13 @@ export class ReconcileStripeSubscription {
     if (settled) return { status: 'duplicate' };
 
     const snapshot = await this.bindings.read(input.organizationId);
-    if (snapshot === null) return { status: 'retry' };
+    if (!isSameBinding(snapshot, input.acceptedBinding)) return { status: 'retry' };
     const subscription = await this.provider.retrieve(snapshot.binding.subscriptionId);
 
     return this.work.run(input.organizationId, async (transaction) => {
       const current = await transaction.lockBinding();
       if (await transaction.isSettled(input.eventId)) return { status: 'duplicate' };
-      if (
-        current?.revision !== snapshot.revision ||
-        current.binding.customerId !== snapshot.binding.customerId ||
-        current.binding.subscriptionId !== snapshot.binding.subscriptionId
-      ) {
+      if (!isSameBinding(current, snapshot)) {
         return { status: 'retry' };
       }
 

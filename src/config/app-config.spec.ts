@@ -31,6 +31,7 @@ describe('appConfigSchema', () => {
       NATS_USER: 'billing',
       NATS_PASSWORD: 'billing',
       BILLING_USAGE_ENABLED: false,
+      BILLING_STRIPE_WEBHOOK_MODE: 'test',
       INTERNAL_TOKEN_AUDIENCE: 'billing-service',
       INTERNAL_TOKEN_TRUSTED_ISSUERS: {
         'api-gateway': [
@@ -52,6 +53,28 @@ describe('appConfigSchema', () => {
 
     expect(() => loadConfig(appConfigSchema, example)).not.toThrow();
     expect(() => loadConfig(migrationConfigSchema, example)).not.toThrow();
+  });
+
+  it('loads a mode and two overlapping webhook keys for rotation', () => {
+    expect(
+      loadConfig(appConfigSchema, {
+        ...complete,
+        BILLING_STRIPE_WEBHOOK_MODE: 'live',
+        BILLING_STRIPE_WEBHOOK_SECRETS: JSON.stringify(['whsec_current', 'whsec_previous']),
+      }),
+    ).toMatchObject({
+      BILLING_STRIPE_WEBHOOK_MODE: 'live',
+      BILLING_STRIPE_WEBHOOK_SECRETS: ['whsec_current', 'whsec_previous'],
+    });
+  });
+
+  it('reports malformed webhook key configuration without printing the keys', () => {
+    const malformed = {
+      ...complete,
+      BILLING_STRIPE_WEBHOOK_SECRETS: '["whsec_placeholder", broken]',
+    };
+    expect(() => loadConfig(appConfigSchema, malformed)).toThrow(/BILLING_STRIPE_WEBHOOK_SECRETS/u);
+    expect(() => loadConfig(appConfigSchema, malformed)).not.toThrow(/whsec_placeholder/u);
   });
 
   it('requires both source origins and the signing key when usage is enabled', () => {

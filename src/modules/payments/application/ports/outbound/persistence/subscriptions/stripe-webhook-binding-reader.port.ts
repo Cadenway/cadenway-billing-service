@@ -1,8 +1,11 @@
 import type { StripeBindingSnapshot } from '../../../../models/subscriptions/stripe-binding-snapshot.model.js';
 
-/** Resolves a verified webhook to a current Billing-owned Stripe binding. */
+/** Looks up the account-wide receipt and current binding of a verified Stripe event. */
 export interface StripeWebhookBindingReader {
   // #region Properties
+  /** Checks the durable receipt without returning the organization that settled the event. */
+  readonly hasSettlement: (eventId: string) => Promise<boolean>;
+
   /** Matches both provider IDs within the service's configured Stripe account. */
   readonly resolve: (identity: {
     readonly account: string | null;

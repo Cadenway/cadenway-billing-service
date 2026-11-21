@@ -22,10 +22,24 @@ Migration `0004_stripe_binding_unique.sql` adds independent unique indexes for t
 identities before Stripe admission is activated. The indexes build transactionally on the
 previously dormant Stripe binding table. If the table has been populated ahead of activation,
 check for duplicate provider identities and allow time for the build's write lock before rollout.
+Migration `0005_stripe_receipt_event_unique.sql` adds an account-wide event ID guard to the
+dormant receipts table. Existing tenant scoping stays in place. A collision at settlement
+rolls back the entitlement and its receipt. The prior Billing release can run with these
+additive indexes in place.
 
 ## API
 
-None. The app will register the incoming webhook after its contract is published.
+- `POST /internal/v1/billing/webhooks/stripe` verifies the exact raw bytes after the signed
+  global Gateway identity is established. Replies are private and noncacheable. Verified
+  types outside subscription creation, update, deletion, pause and resume receive an empty 204. A supported event receives 204 after durable settlement or a confirmed duplicate.
+  The account-wide receipt is checked before looking up the binding, so a replay can stop
+  even if its original customer or subscription has since been replaced.
+  Missing bindings, deferred settlement and settlement errors return `503 billing.unavailable`.
+- The composed endpoint has no production settlement until Billing can coordinate quota
+  changes with Organization and Storage and write the published outbox fact. Keep
+  `BILLING_STRIPE_WEBHOOK_SECRETS` unset and the provider's webhook subscription disabled
+  until this is available. The local mode defaults to `test`. Up to two signing keys can
+  coexist during rotation.
 
 ## Events emitted
 
@@ -58,13 +72,15 @@ Provider reads happen outside the tenant transaction. Settlement locks and reche
 The entitlement snapshot and event receipt commit together with the writes required by the fence.
 An unsuccessful settlement rolls back those changes together.
 
-The webhook admission adapter must verify the Stripe signature and the configured mode before
+The webhook admission adapter verifies the Stripe signature and the configured mode before
 global resolution. The lookup returns the provider pair and its revision with the organization
-ID. Admission must compare that token under a tenant lock and preserve the verified provider
-pair for the worker to recheck against the current binding before applying any entitlement update.
+ID. Reconciliation compares the token before reading Stripe, then rechecks under the tenant
+binding lock before applying an entitlement update. Supported events remain retryable until
+this settlement commits. The endpoint does not store raw provider deliveries.
 
 ## Decisions
 
 - The Stripe SDK verifies signatures locally. The webhook adapter receives the active endpoint
   secrets and uses the SDK's five-minute tolerance with the server clock.
-- HTTP registration and the concrete quota and outbox fence await the published producer contracts.
+- Initial Checkout ownership and Stripe webhook subscription configuration are coordinated with
+  the quota and outbox fence before activation. Subscription deliveries never create bindings.
