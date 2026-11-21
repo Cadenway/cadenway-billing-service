@@ -55,6 +55,7 @@ function setup(current: UsageRebuildState): {
     abandon: vi.fn().mockResolvedValue(undefined),
     invalidateActive: vi.fn().mockResolvedValue(true),
     checkpointActive: vi.fn().mockResolvedValue(true),
+    flushThresholdIntents: vi.fn().mockResolvedValue(true),
   };
   const unit: UsageRebuildUnitOfWork = {
     async run<T>(
@@ -103,6 +104,7 @@ describe('AdvanceUsageRebuild', () => {
     await expect(service.advance('organization')).resolves.toBe('healthy');
     expect(transaction.startCandidate).not.toHaveBeenCalled();
     expect(transaction.checkpointActive).not.toHaveBeenCalled();
+    expect(transaction.flushThresholdIntents).toHaveBeenCalledWith('active', 2);
   });
 
   it('advances the active continuity checkpoint when broker coverage progresses', async () => {
@@ -116,6 +118,31 @@ describe('AdvanceUsageRebuild', () => {
     await expect(service.advance('organization')).resolves.toBe('healthy');
     expect(transaction.lockOrganization).toHaveBeenCalledOnce();
     expect(transaction.checkpointActive).toHaveBeenCalledWith('active', 2, newer.progress);
+    expect(transaction.flushThresholdIntents).toHaveBeenCalledBefore(
+      vi.mocked(transaction.checkpointActive),
+    );
+  });
+
+  it('does not publish pending crossings when the generation changed after the broker sample', async () => {
+    const { service, transaction } = setup({
+      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress },
+      candidate: null,
+    });
+    vi.mocked(transaction.flushThresholdIntents).mockResolvedValue(false);
+
+    await expect(service.advance('organization')).resolves.toBe('stale');
+    expect(transaction.checkpointActive).not.toHaveBeenCalled();
+  });
+
+  it('does not flush pending crossings while broker continuity is unconfirmed', async () => {
+    const { service, transaction, proof } = setup({
+      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress },
+      candidate: null,
+    });
+    vi.mocked(proof.assess).mockReturnValue('pending');
+
+    await expect(service.advance('organization')).resolves.toBe('waiting');
+    expect(transaction.flushThresholdIntents).not.toHaveBeenCalled();
   });
 
   it('preserves the active generation when checkpoint update loses the version race', async () => {
@@ -141,6 +168,7 @@ describe('AdvanceUsageRebuild', () => {
     await expect(service.advance('organization')).resolves.toBe('invalidated');
     expect(transaction.invalidateActive).toHaveBeenCalledWith('active', null);
     expect(transaction.abandon).toHaveBeenCalledWith(candidate.id);
+    expect(transaction.flushThresholdIntents).not.toHaveBeenCalled();
     expect(proof.assess).not.toHaveBeenCalled();
   });
 
@@ -193,8 +221,20 @@ describe('AdvanceUsageRebuild', () => {
     const { service, transaction, brokerRead } = setup({ active: null, candidate });
     brokerRead.mockResolvedValue({ ...sample, advisoriesClear: false });
     vi.mocked(transaction.candidate).mockResolvedValue({ ...candidate, id: 'replacement' });
+    vi.mocked(transaction.invalidateActive).mockResolvedValue(false);
 
     await expect(service.advance('organization')).resolves.toBe('waiting');
+    expect(transaction.abandon).not.toHaveBeenCalled();
+  });
+
+  it('invalidates the observed candidate if it became active before the tenant lock', async () => {
+    const { service, transaction, brokerRead } = setup({ active: null, candidate });
+    brokerRead.mockResolvedValue({ ...sample, advisoriesClear: false });
+    vi.mocked(transaction.candidate).mockResolvedValue(null);
+    vi.mocked(transaction.invalidateActive).mockResolvedValue(true);
+
+    await expect(service.advance('organization')).resolves.toBe('invalidated');
+    expect(transaction.invalidateActive).toHaveBeenCalledWith(candidate.id, null);
     expect(transaction.abandon).not.toHaveBeenCalled();
   });
 

@@ -18,8 +18,10 @@ None.
   each generation.
 - `usage_observations` records the latest contribution or terminal version of each membership or
   attachment per generation. Its foreign key scopes the row to the same organization.
+- `usage_threshold_intents` holds the latest pending threshold crossing per organization and
+  metric, scoped to the generation that observed the crossing.
 
-The additive migration enables and forces row-level security for all three tables. Observation
+The additive migrations enable and force row-level security for each table. Observation
 writes verify the current generation pointers under the organization lock before using them.
 
 ## API
@@ -33,8 +35,9 @@ All responses use `Cache-Control: private, no-store`.
 
 ## Events emitted
 
-`evt.quota.threshold-reached.v1` records the metric, used amount, limit and quota version for
-Notification. Its outbox row is committed with the observation that crossed the threshold.
+`evt.quota.threshold-reached.v1` records the metric, confirmed used amount, limit and quota
+version for Notification. Its outbox row is committed when a covered generation confirms the
+crossing after retained events have been acknowledged.
 
 ## Events consumed
 
@@ -59,8 +62,10 @@ apply versioned observations to the current generations.
 
 `RecordUsageObservation` joins the event receipt transaction when called by a kit consumer. The
 Drizzle unit of work locks the organization before changing observations and totals in the current
-generations. Its quota writer receives the same scope and the advanced metric version. Candidate
-updates, unchanged observations and failed writes do not create a committed alert.
+generations and recording an intent. The worker checks delivery continuity after acknowledgements,
+then uses the same tenant lock to confirm the exact active generation and version. It commits the
+outbox event and removes the intent together. A changed generation or a current total below the
+threshold cancels publication. Candidate updates and failed writes do not create an alert.
 
 The rebuild worker reads signed roster, membership and attachment pages outside transactions.
 An organization lock serializes each page, invalidation and promotion. The persisted generation

@@ -176,9 +176,7 @@ describe('usage rebuild PostgreSQL transactions', () => {
     ).rejects.toThrow();
 
     const record = new RecordUsageObservation(
-      new DrizzleUsageObservationUnitOfWork(runner, { seats: 5, storageBytes: 2_000_000_000 }, () =>
-        Promise.resolve(),
-      ),
+      new DrizzleUsageObservationUnitOfWork(runner, { seats: 5, storageBytes: 2_000_000_000 }),
     );
     const roleChange = () =>
       record.execute({

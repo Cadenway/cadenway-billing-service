@@ -7,7 +7,7 @@ import type { UsageObservationUnitOfWork } from '../../../../ports/outbound/tran
 import type { RecordUsageObservationInput } from './record-usage-observation.input.js';
 import type { RecordUsageObservationOutput } from './record-usage-observation.output.js';
 
-/** Records a source event in every current projection and emits live quota crossings. */
+/** Records a source event in every current projection and retains active quota crossings. */
 export class RecordUsageObservation {
   // #region Constructor
   /** Receives the tenant transaction boundary and its bound persistence operations. */
@@ -17,7 +17,7 @@ export class RecordUsageObservation {
   // #region Methods
   /**
    * Applies source versions idempotently. Event handlers must use the kit's deduplication
-   * transaction so its receipt, projection changes and outbox entries commit together.
+   * transaction so its receipt, projection changes and threshold intents commit together.
    */
   public async execute(input: RecordUsageObservationInput): Promise<RecordUsageObservationOutput> {
     return this.unitOfWork.run(input.organizationId, async (transaction) => {
@@ -38,8 +38,10 @@ export class RecordUsageObservation {
             organization.active.totals.storageBytes,
             organization.limits.storageBytes,
           ).thresholdCrossedAt(nextTotals.storageBytes);
-          if (seats !== undefined) await transaction.appendThreshold(seats);
-          if (storage !== undefined) await transaction.appendThreshold(storage);
+          if (seats !== undefined)
+            await transaction.recordThresholdIntent(organization.active.id, seats);
+          if (storage !== undefined)
+            await transaction.recordThresholdIntent(organization.active.id, storage);
         }
       }
 

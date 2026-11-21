@@ -1,23 +1,37 @@
-import type { DatabaseSchema, TenantTransactionRunner } from '@cadenway/nest-common/database';
+import type {
+  DatabaseSchema,
+  TenantTransactionRunner,
+  TransactionScope,
+} from '@cadenway/nest-common/database';
 import { and, eq, sql } from 'drizzle-orm';
 
 import type { UsageRebuildBrokerProgress } from '../../../../../application/models/rebuild/usage-rebuild-broker-progress.model.js';
 import type { UsageRebuildCandidate } from '../../../../../application/models/rebuild/usage-rebuild-candidate.model.js';
 import type { UsageRebuildTransaction } from '../../../../../application/ports/outbound/transactions/rebuild/usage-rebuild-transaction.port.js';
 import type { UsageRebuildUnitOfWork } from '../../../../../application/ports/outbound/transactions/rebuild/usage-rebuild-unit-of-work.port.js';
+import type { QuotaThresholdReached } from '../../../../../domain/events/quotas/quota-threshold-reached.event.js';
 import type { RecordedUsageObservation } from '../../../../../domain/value-objects/observations/recorded-usage-observation.value-object.js';
 import { usageRebuildCheckpoint } from '../../mappers/rebuild/usage-rebuild-checkpoint.mapper.js';
 import {
   usageGenerations,
   usageObservations,
   usageOrganizations,
+  usageThresholdIntents,
 } from '../../schemas/usage/usage.schema.js';
 
 /** Persists one organization's usage rebuild in its tenant transaction. */
 export class DrizzleUsageRebuildUnitOfWork implements UsageRebuildUnitOfWork {
   // #region Constructor
-  /** Binds all rebuild writes to the kit's tenant runner. */
-  public constructor(private readonly runner: TenantTransactionRunner<DatabaseSchema>) {}
+  /** Binds rebuild writes and an optional transaction-bound threshold outbox writer. */
+  public constructor(
+    private readonly runner: TenantTransactionRunner<DatabaseSchema>,
+    private readonly appendQuota?: (
+      scope: TransactionScope<DatabaseSchema>,
+      organizationId: string,
+      version: number,
+      fact: QuotaThresholdReached,
+    ) => Promise<void>,
+  ) {}
   // #endregion
 
   // #region Methods
@@ -306,6 +320,14 @@ export class DrizzleUsageRebuildUnitOfWork implements UsageRebuildUnitOfWork {
             .returning({ id: usageGenerations.id });
           if (invalidated.length === 0) return false;
           await scope.db
+            .delete(usageThresholdIntents)
+            .where(
+              and(
+                eq(usageThresholdIntents.organizationId, organizationId),
+                eq(usageThresholdIntents.generationId, generationId),
+              ),
+            );
+          await scope.db
             .update(usageOrganizations)
             .set({
               activeGenerationId: null,
@@ -314,6 +336,59 @@ export class DrizzleUsageRebuildUnitOfWork implements UsageRebuildUnitOfWork {
             })
             .where(eq(usageOrganizations.organizationId, organizationId));
           activeId = null;
+          return true;
+        },
+        flushThresholdIntents: async (generationId, expectedVersion) => {
+          requireLock();
+          if (activeId !== generationId) return false;
+          const generations = await scope.db
+            .select({ seats: usageGenerations.seats, storageBytes: usageGenerations.storageBytes })
+            .from(usageGenerations)
+            .where(
+              and(
+                eq(usageGenerations.organizationId, organizationId),
+                eq(usageGenerations.id, generationId),
+                eq(usageGenerations.status, 'ready'),
+                eq(usageGenerations.version, expectedVersion),
+              ),
+            )
+            .limit(1);
+          const generation = generations[0];
+          if (generation === undefined) return false;
+
+          const intents = await scope.db
+            .select()
+            .from(usageThresholdIntents)
+            .where(eq(usageThresholdIntents.organizationId, organizationId))
+            .orderBy(usageThresholdIntents.metric)
+            .limit(2);
+          for (const intent of intents) {
+            if (intent.generationId === generationId) {
+              if (intent.metric !== 'seats' && intent.metric !== 'storage') {
+                throw new Error('Stored quota intent has an invalid metric.');
+              }
+              const used = intent.metric === 'seats' ? generation.seats : generation.storageBytes;
+              if (BigInt(used) * 100n >= BigInt(intent.quotaLimit) * 80n) {
+                if (this.appendQuota === undefined) {
+                  throw new Error('Quota outbox writer is unavailable.');
+                }
+                await this.appendQuota(scope, organizationId, intent.eventVersion, {
+                  metric: intent.metric,
+                  used,
+                  limit: intent.quotaLimit,
+                  thresholdPercent: 80,
+                });
+              }
+            }
+            await scope.db
+              .delete(usageThresholdIntents)
+              .where(
+                and(
+                  eq(usageThresholdIntents.organizationId, organizationId),
+                  eq(usageThresholdIntents.metric, intent.metric),
+                ),
+              );
+          }
           return true;
         },
         checkpointActive: async (generationId, version, progress) => {

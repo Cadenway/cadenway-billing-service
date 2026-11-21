@@ -2,13 +2,11 @@ import { CONFIG } from '@cadenway/nest-common';
 import { TenantTransactionRunner } from '@cadenway/nest-common/database';
 import type { DatabaseSchema } from '@cadenway/nest-common/database';
 import { EventConsumers } from '@cadenway/nest-messaging';
-import { OutboxWriter } from '@cadenway/nest-messaging/outbox/writer';
 import type { FactoryProvider } from '@nestjs/common';
 
 import type { AppConfig } from '../../../../../../config/app-config.js';
 import { GetFreePlan } from '../../../../../plans/public/limits/get-free-plan.js';
 import { RecordUsageObservation } from '../../../../application/use-cases/commands/observations/record-usage-observation/record-usage-observation.use-case.js';
-import { QuotaThresholdOutbox } from '../../../../infrastructure/messaging/outbox/quotas/quota-threshold-outbox.adapter.js';
 import { DrizzleUsageObservationUnitOfWork } from '../../../../infrastructure/persistence/drizzle/transactions/observations/drizzle-usage-observation.unit-of-work.js';
 import { DrizzleUsageRebuildUnitOfWork } from '../../../../infrastructure/persistence/drizzle/transactions/rebuild/drizzle-usage-rebuild.unit-of-work.js';
 import { UsageObservationEventsHandler } from '../../../../presentation/messaging/handlers/observations/usage-observation-events.handler.js';
@@ -16,20 +14,14 @@ import { UsageOrganizationCreatedHandler } from '../../../../presentation/messag
 
 const observationsProvider: FactoryProvider<UsageObservationEventsHandler> = {
   provide: UsageObservationEventsHandler,
-  inject: [EventConsumers, TenantTransactionRunner, OutboxWriter, GetFreePlan, CONFIG],
+  inject: [EventConsumers, TenantTransactionRunner, GetFreePlan, CONFIG],
   useFactory: (
     consumers: EventConsumers,
     runner: TenantTransactionRunner<DatabaseSchema>,
-    outbox: OutboxWriter,
     freePlan: GetFreePlan,
     config: AppConfig,
   ): UsageObservationEventsHandler => {
-    const writer = new QuotaThresholdOutbox(outbox);
-    const observations = new DrizzleUsageObservationUnitOfWork(
-      runner,
-      freePlan.execute(),
-      (scope, organizationId, version, fact) => writer.append(scope, organizationId, version, fact),
-    );
+    const observations = new DrizzleUsageObservationUnitOfWork(runner, freePlan.execute());
     return new UsageObservationEventsHandler(
       consumers,
       new RecordUsageObservation(observations),

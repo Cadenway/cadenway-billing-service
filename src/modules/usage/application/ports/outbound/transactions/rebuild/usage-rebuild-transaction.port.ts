@@ -57,5 +57,11 @@ export interface UsageRebuildTransaction {
     expectedVersion: number,
     progress: UsageRebuildBrokerProgress,
   ) => Promise<boolean>;
+
+  /** Publishes valid pending crossings only for the still-current active generation and version. */
+  readonly flushThresholdIntents: (
+    generationId: string,
+    expectedVersion: number,
+  ) => Promise<boolean>;
   // #endregion
 }

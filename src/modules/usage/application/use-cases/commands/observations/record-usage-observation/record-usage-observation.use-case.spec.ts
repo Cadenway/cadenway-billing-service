@@ -25,7 +25,7 @@ function setup(organization: LockedUsageOrganization): {
     lockOrganization: vi.fn().mockResolvedValue(organization),
     loadObservation: vi.fn().mockResolvedValue(null),
     saveObservation: vi.fn().mockResolvedValue(undefined),
-    appendThreshold: vi.fn().mockResolvedValue(undefined),
+    recordThresholdIntent: vi.fn().mockResolvedValue(undefined),
   };
   const run = vi.fn<(organizationId: string) => void>();
   const unitOfWork: UsageObservationUnitOfWork = {
@@ -41,7 +41,7 @@ function setup(organization: LockedUsageOrganization): {
 }
 
 describe('RecordUsageObservation', () => {
-  it('records both generations and emits the active 80 percent crossing once', async () => {
+  it('records both generations and retains the active 80 percent crossing once', async () => {
     const { command, transaction, run } = setup({
       active: { id: 'active', totals },
       candidate: { id: 'candidate', totals },
@@ -61,7 +61,7 @@ describe('RecordUsageObservation', () => {
       ...totals,
       seats: 4,
     });
-    expect(transaction.appendThreshold).toHaveBeenCalledExactlyOnceWith({
+    expect(transaction.recordThresholdIntent).toHaveBeenCalledExactlyOnceWith('active', {
       metric: 'seats',
       used: 4,
       limit: 5,
@@ -86,7 +86,7 @@ describe('RecordUsageObservation', () => {
       await expect(command.execute(memberInput)).resolves.toBe('unchanged');
       expect(transaction.loadObservation).toHaveBeenCalledTimes(2);
       expect(transaction.saveObservation).not.toHaveBeenCalled();
-      expect(transaction.appendThreshold).not.toHaveBeenCalled();
+      expect(transaction.recordThresholdIntent).not.toHaveBeenCalled();
     },
   );
 
@@ -100,10 +100,10 @@ describe('RecordUsageObservation', () => {
     await expect(command.execute(memberInput)).resolves.toBe('unchanged');
     expect(transaction.loadObservation).not.toHaveBeenCalled();
     expect(transaction.saveObservation).not.toHaveBeenCalled();
-    expect(transaction.appendThreshold).not.toHaveBeenCalled();
+    expect(transaction.recordThresholdIntent).not.toHaveBeenCalled();
   });
 
-  it('emits the storage crossing without emitting a seat event', async () => {
+  it('retains the storage crossing without creating a seat intent', async () => {
     const { command, transaction } = setup({
       active: { id: 'active', totals: { ...totals, storageBytes: 1_590_000_000 } },
       candidate: null,
@@ -121,7 +121,7 @@ describe('RecordUsageObservation', () => {
       }),
     ).resolves.toBe('recorded');
 
-    expect(transaction.appendThreshold).toHaveBeenCalledExactlyOnceWith({
+    expect(transaction.recordThresholdIntent).toHaveBeenCalledExactlyOnceWith('active', {
       metric: 'storage',
       used: 1_600_000_000,
       limit: 2_000_000_000,
@@ -145,17 +145,17 @@ describe('RecordUsageObservation', () => {
       ...totals,
       seats: 4,
     });
-    expect(transaction.appendThreshold).not.toHaveBeenCalled();
+    expect(transaction.recordThresholdIntent).not.toHaveBeenCalled();
   });
 
-  it('propagates an outbox failure so the unit of work rolls back', async () => {
+  it('propagates an intent persistence failure so the unit of work rolls back', async () => {
     const { command, transaction } = setup({
       active: { id: 'active', totals },
       candidate: null,
       limits: { seats: 5, storageBytes: 2_000_000_000 },
     });
-    vi.mocked(transaction.appendThreshold).mockRejectedValue(new Error('outbox failed'));
+    vi.mocked(transaction.recordThresholdIntent).mockRejectedValue(new Error('intent failed'));
 
-    await expect(command.execute(memberInput)).rejects.toThrow('outbox failed');
+    await expect(command.execute(memberInput)).rejects.toThrow('intent failed');
   });
 });

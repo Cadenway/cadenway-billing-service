@@ -362,6 +362,21 @@ describe('enabled Billing projection', () => {
       )
       .toBe(1);
 
+    publish('evt.member.removed.v1', {
+      ...joined,
+      id: '01938f6e-8a42-7d5b-b2c9-5e1f3a6d9c34',
+      version: 2,
+    });
+    await expect
+      .poll(
+        async () => {
+          const response = await subscription();
+          return GetBillingSubscriptionInternalResponse.parse(response.body).seats.used;
+        },
+        { timeout: 15_000, interval: 250 },
+      )
+      .toBe(3);
+
     publish(
       '$JS.EVENT.ADVISORY.CONSUMER.MSG_TERMINATED.EVENTS.billing-service__record-member-joined',
       { type: 'io.nats.jetstream.advisory.v1.terminated', id: 'fixture' },
@@ -384,6 +399,29 @@ describe('enabled Billing projection', () => {
     expect(unavailable.body).toMatchObject({ code: 'billing.unavailable' });
     expect(unavailable.headers['cache-control']).toBe('private, no-store');
 
+    const afterAdvisoryId = '01938f6e-8a42-7d5b-b2c9-5e1f3a6d9c35';
+    publish('evt.member.joined.v1', {
+      ...joined,
+      id: afterAdvisoryId,
+      memberId: '01938f6e-8a42-7d5b-b2c9-5e1f3a6d9c36',
+    });
+    await expect
+      .poll(
+        () =>
+          system.run(
+            async (scope) => {
+              const result = await scope.client.query(
+                'select count(*)::int as count from processed_events where event_id = $1',
+                [afterAdvisoryId],
+              );
+              return (result.rows[0] as { readonly count: number } | undefined)?.count;
+            },
+            { readOnly: true },
+          ),
+        { timeout: 10_000, interval: 100 },
+      )
+      .toBe(1);
+
     await expect
       .poll(
         () =>
@@ -402,5 +440,14 @@ describe('enabled Billing projection', () => {
         { timeout: 15_000, interval: 250 },
       )
       .toBeNull();
+    const outbox = await system.run(
+      (scope) =>
+        scope.client.query(
+          'select count(*)::int as count from outbox_events where event_name = $1',
+          [QUOTA_THRESHOLD_REACHED_V1],
+        ),
+      { readOnly: true },
+    );
+    expect(outbox.rows).toEqual([{ count: 1 }]);
   });
 });

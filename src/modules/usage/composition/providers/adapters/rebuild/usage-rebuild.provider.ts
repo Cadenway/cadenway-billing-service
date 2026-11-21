@@ -2,6 +2,7 @@ import { CONFIG, InternalHttpClient, InternalTokenSigner, PinoLogger } from '@ca
 import { SystemTransactionRunner, TenantTransactionRunner } from '@cadenway/nest-common/database';
 import type { DatabaseSchema } from '@cadenway/nest-common/database';
 import { EventConsumers, MessagingConnection } from '@cadenway/nest-messaging';
+import { OutboxWriter } from '@cadenway/nest-messaging/outbox/writer';
 import type { FactoryProvider } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
 
@@ -15,6 +16,7 @@ import { BillingUsageBrokerProof } from '../../../../infrastructure/adapters/jet
 import { JetStreamUsageBrokerProgressAdapter } from '../../../../infrastructure/adapters/jetstream/jetstream-usage-broker-progress.adapter.js';
 import { UsageRebuildScheduler } from '../../../../infrastructure/adapters/rebuild/usage-rebuild-scheduler.adapter.js';
 import { UsageSnapshotHttpAdapter } from '../../../../infrastructure/adapters/usage-snapshot/usage-snapshot-http.adapter.js';
+import { QuotaThresholdOutbox } from '../../../../infrastructure/messaging/outbox/quotas/quota-threshold-outbox.adapter.js';
 import { DrizzleUsageRebuildRegistryReader } from '../../../../infrastructure/persistence/drizzle/repositories/rebuild/drizzle-usage-rebuild-registry.repository.js';
 import { DrizzleUsageRebuildStateReader } from '../../../../infrastructure/persistence/drizzle/repositories/rebuild/drizzle-usage-rebuild-state.repository.js';
 import { DrizzleUsageRebuildUnitOfWork } from '../../../../infrastructure/persistence/drizzle/transactions/rebuild/drizzle-usage-rebuild.unit-of-work.js';
@@ -29,6 +31,7 @@ export const usageRebuildProvider: FactoryProvider<UsageRebuildScheduler | null>
     SystemTransactionRunner,
     MessagingConnection,
     EventConsumers,
+    OutboxWriter,
     HttpAdapterHost,
     PinoLogger,
   ],
@@ -38,6 +41,7 @@ export const usageRebuildProvider: FactoryProvider<UsageRebuildScheduler | null>
     system: SystemTransactionRunner<DatabaseSchema>,
     connection: MessagingConnection,
     consumers: EventConsumers,
+    outbox: OutboxWriter,
     host: HttpAdapterHost,
     logger: PinoLogger,
   ): Promise<UsageRebuildScheduler | null> => {
@@ -57,7 +61,11 @@ export const usageRebuildProvider: FactoryProvider<UsageRebuildScheduler | null>
       new InternalHttpClient({ service: 'storage-service', baseUrl: storage, signer }),
     );
     const proof = new BillingUsageBrokerProof(usageObservationHandlerNames);
-    const rebuild = new DrizzleUsageRebuildUnitOfWork(tenant);
+    const writer = new QuotaThresholdOutbox(outbox);
+    const rebuild = new DrizzleUsageRebuildUnitOfWork(
+      tenant,
+      (scope, organizationId, version, fact) => writer.append(scope, organizationId, version, fact),
+    );
     const advance = new AdvanceUsageRebuild(
       new DrizzleUsageRebuildStateReader(tenant),
       new JetStreamUsageBrokerProgressAdapter(connection, consumers, usageObservationHandlerNames),

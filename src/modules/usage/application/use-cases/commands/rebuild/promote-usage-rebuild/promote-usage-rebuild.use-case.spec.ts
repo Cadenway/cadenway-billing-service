@@ -49,6 +49,7 @@ function setup(current: UsageRebuildCandidate | null): {
     abandon: vi.fn().mockResolvedValue(undefined),
     invalidateActive: vi.fn().mockResolvedValue(true),
     checkpointActive: vi.fn().mockResolvedValue(true),
+    flushThresholdIntents: vi.fn().mockResolvedValue(true),
   };
   const proof: UsageBrokerProof = {
     validStart: vi.fn().mockReturnValue(true),

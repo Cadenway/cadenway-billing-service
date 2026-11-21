@@ -1,36 +1,26 @@
-import type {
-  DatabaseSchema,
-  TenantTransactionRunner,
-  TransactionScope,
-} from '@cadenway/nest-common/database';
+import type { DatabaseSchema, TenantTransactionRunner } from '@cadenway/nest-common/database';
 import { and, eq, sql } from 'drizzle-orm';
 
 import type { LockedUsageOrganization } from '../../../../../application/models/observations/locked-usage-organization.model.js';
 import type { UsageObservationGeneration } from '../../../../../application/models/observations/usage-observation-generation.model.js';
 import type { UsageObservationTransaction } from '../../../../../application/ports/outbound/transactions/observations/usage-observation-transaction.port.js';
 import type { UsageObservationUnitOfWork } from '../../../../../application/ports/outbound/transactions/observations/usage-observation-unit-of-work.port.js';
-import type { QuotaThresholdReached } from '../../../../../domain/events/quotas/quota-threshold-reached.event.js';
 import type { RecordedUsageObservation } from '../../../../../domain/value-objects/observations/recorded-usage-observation.value-object.js';
 import type { UsageTotals } from '../../../../../domain/value-objects/observations/usage-totals.value-object.js';
 import {
   usageGenerations,
   usageObservations,
   usageOrganizations,
+  usageThresholdIntents,
 } from '../../schemas/usage/usage.schema.js';
 
 /** Runs observation writes on the kit's tenant transaction. */
 export class DrizzleUsageObservationUnitOfWork implements UsageObservationUnitOfWork {
   // #region Constructor
-  /** The writer appends the threshold fact through the supplied transaction scope. */
+  /** Binds the tenant transaction and the current quota limits. */
   public constructor(
     private readonly runner: TenantTransactionRunner<DatabaseSchema>,
     private readonly limits: LockedUsageOrganization['limits'],
-    private readonly appendQuota: (
-      scope: TransactionScope<DatabaseSchema>,
-      organizationId: string,
-      version: number,
-      fact: QuotaThresholdReached,
-    ) => Promise<void>,
   ) {}
   // #endregion
 
@@ -46,6 +36,7 @@ export class DrizzleUsageObservationUnitOfWork implements UsageObservationUnitOf
       }
       let locked = false;
       let allowedGenerations = new Set<string>();
+      let activeGenerationId: string | null = null;
 
       const requireLock = (): void => {
         if (!locked) throw new Error('The usage organization must be locked first.');
@@ -102,6 +93,7 @@ export class DrizzleUsageObservationUnitOfWork implements UsageObservationUnitOf
             };
           };
           const active = await loadGeneration(organization.activeGenerationId, false);
+          activeGenerationId = active?.id ?? null;
           const candidate = await loadGeneration(organization.candidateGenerationId, true);
           allowedGenerations = new Set(
             [active?.id, candidate?.id].filter((id): id is string => id !== undefined),
@@ -220,8 +212,11 @@ export class DrizzleUsageObservationUnitOfWork implements UsageObservationUnitOf
             .returning({ id: usageGenerations.id });
           if (updated.length !== 1) throw new Error('Usage generation could not be updated.');
         },
-        appendThreshold: async (fact) => {
+        recordThresholdIntent: async (generationId, fact) => {
           requireLock();
+          if (generationId !== activeGenerationId) {
+            throw new Error('Quota threshold intent requires the active generation.');
+          }
           const column =
             fact.metric === 'seats'
               ? usageOrganizations.seatsEventVersion
@@ -241,7 +236,24 @@ export class DrizzleUsageObservationUnitOfWork implements UsageObservationUnitOf
             .returning({ version: column });
           const row = rows[0];
           if (row === undefined) throw new Error('Usage metric version could not be advanced.');
-          await this.appendQuota(scope, organizationId, row.version, fact);
+          await scope.db
+            .insert(usageThresholdIntents)
+            .values({
+              organizationId,
+              generationId,
+              metric: fact.metric,
+              eventVersion: row.version,
+              quotaLimit: fact.limit,
+            })
+            .onConflictDoUpdate({
+              target: [usageThresholdIntents.organizationId, usageThresholdIntents.metric],
+              set: {
+                generationId,
+                eventVersion: row.version,
+                quotaLimit: fact.limit,
+                updatedAt: sql`now()`,
+              },
+            });
         },
       });
     });

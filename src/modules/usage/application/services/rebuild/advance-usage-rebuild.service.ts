@@ -57,9 +57,11 @@ export class AdvanceUsageRebuild {
           expectedVersion: active.version,
         });
       }
-      if (health === 'covered' && !sameProgress(active.brokerAtPromotion, observation.progress)) {
+      if (health === 'covered') {
         const updated = await this.unitOfWork.run(organizationId, async (transaction) => {
           await transaction.lockOrganization();
+          if (!(await transaction.flushThresholdIntents(active.id, active.version))) return false;
+          if (sameProgress(active.brokerAtPromotion, observation.progress)) return true;
           return transaction.checkpointActive(active.id, active.version, observation.progress);
         });
         if (!updated) return 'stale';
@@ -147,18 +149,18 @@ export class AdvanceUsageRebuild {
       await transaction.lockOrganization();
       const selectedCandidate = await transaction.candidate();
       const invalidateCandidate = candidate !== null && selectedCandidate?.id === candidate.id;
-      if (active !== null) {
-        // The generation crossed the unconfirmed interval even if an event advanced its version.
-        const invalidated = await transaction.invalidateActive(active.id, null);
-        if (!invalidated) {
-          if (invalidateCandidate) await transaction.abandon(selectedCandidate.id);
-          return 'stale';
-        }
-      }
+      // An observation can advance the same generation's version before we acquire the lock.
+      const invalidatedActive =
+        active !== null && (await transaction.invalidateActive(active.id, null));
       if (invalidateCandidate) {
         await transaction.abandon(selectedCandidate.id);
+        return invalidatedActive || active === null ? 'invalidated' : 'stale';
       }
-      return active !== null || invalidateCandidate ? 'invalidated' : 'waiting';
+      // A scheduler in another replica may have promoted the observed candidate in the meantime.
+      const invalidatedPromotion =
+        candidate !== null && (await transaction.invalidateActive(candidate.id, null));
+      if (invalidatedActive || invalidatedPromotion) return 'invalidated';
+      return active === null ? 'waiting' : 'stale';
     });
   }
   // #endregion

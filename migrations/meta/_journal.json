@@ -15,6 +15,13 @@
       "when": 1795248681352,
       "tag": "0001_usage_projection",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1795255555940,
+      "tag": "0002_usage_threshold_intents",
+      "breakpoints": true
     }
   ]
 }

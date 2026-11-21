@@ -23,7 +23,10 @@ export interface UsageObservationTransaction {
     totals: UsageTotals,
   ) => Promise<void>;
 
-  /** Advances the metric version and records the fact in the transaction-bound outbox. */
-  readonly appendThreshold: (fact: QuotaThresholdReached) => Promise<void>;
+  /** Persists a crossing intent with its active generation in the receipt transaction. */
+  readonly recordThresholdIntent: (
+    generationId: string,
+    fact: QuotaThresholdReached,
+  ) => Promise<void>;
   // #endregion
 }

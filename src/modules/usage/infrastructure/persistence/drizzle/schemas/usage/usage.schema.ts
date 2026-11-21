@@ -117,6 +117,41 @@ export const usageGenerations = pgTable(
   ],
 ).enableRLS();
 
+/** A pending threshold crossing held until the active generation's delivery is verified. */
+export const usageThresholdIntents = pgTable(
+  'usage_threshold_intents',
+  {
+    organizationId: uuid('organization_id').notNull(),
+    metric: text('metric').notNull(),
+    generationId: uuid('generation_id').notNull(),
+    eventVersion: bigint('event_version', { mode: 'number' }).notNull(),
+    quotaLimit: bigint('quota_limit', { mode: 'number' }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.organizationId, table.metric] }),
+    foreignKey({
+      columns: [table.organizationId, table.generationId],
+      foreignColumns: [usageGenerations.organizationId, usageGenerations.id],
+      name: 'usage_threshold_intents_generation_fk',
+    }),
+    check('usage_threshold_intents_metric_check', sql`${table.metric} in ('seats', 'storage')`),
+    check(
+      'usage_threshold_intents_event_version_check',
+      sql`${table.eventVersion} between 1 and ${maxSafeInteger}`,
+    ),
+    check(
+      'usage_threshold_intents_quota_limit_check',
+      sql`${table.quotaLimit} between 1 and ${maxSafeInteger}`,
+    ),
+    pgPolicy('usage_threshold_intents_tenant_isolation', {
+      using: sql`organization_id = nullif(current_setting('app.organization_id', true), '')::uuid or current_setting('app.system_access', true) = 'on'`,
+      withCheck: sql`organization_id = nullif(current_setting('app.organization_id', true), '')::uuid or current_setting('app.system_access', true) = 'on'`,
+    }),
+  ],
+).enableRLS();
+
 /** Current source observation, including terminal removals, in a usage generation. */
 export const usageObservations = pgTable(
   'usage_observations',

@@ -72,7 +72,12 @@ const platformTables = [
 ] as const;
 
 /** Tenant-scoped tables of the usage module. */
-const usageTables = ['usage_generations', 'usage_observations', 'usage_organizations'] as const;
+const usageTables = [
+  'usage_generations',
+  'usage_observations',
+  'usage_organizations',
+  'usage_threshold_intents',
+] as const;
 
 /**
  * Runs `docker compose` on the throwaway project.
@@ -331,7 +336,7 @@ describe('billing-service wiring', () => {
         tableowner: 'billing_migrator',
       })),
     );
-    expect(journal.rows).toEqual([{ applied: 2 }]);
+    expect(journal.rows).toEqual([{ applied: 3 }]);
   });
 
   it('applies nothing when the migrator runs again', async () => {
@@ -340,7 +345,7 @@ describe('billing-service wiring', () => {
     const journal = await migrator.query<{ applied: number }>(
       'select count(*)::int as applied from drizzle.__drizzle_migrations',
     );
-    expect(journal.rows).toEqual([{ applied: 2 }]);
+    expect(journal.rows).toEqual([{ applied: 3 }]);
   });
 
   it('upgrades the previous platform schema without losing its rows or application privileges', async () => {
@@ -391,12 +396,12 @@ describe('billing-service wiring', () => {
         (
           await application.query(`
             select count(*)::int as allowed
-              from (values ('usage_organizations'), ('usage_generations'), ('usage_observations')) as tables(name)
+              from (values ('usage_organizations'), ('usage_generations'), ('usage_observations'), ('usage_threshold_intents')) as tables(name)
               cross join (values ('select'), ('insert'), ('update'), ('delete')) as privileges(name)
              where has_table_privilege(current_user, tables.name, privileges.name)
           `)
         ).rows,
-      ).toEqual([{ allowed: 12 }]);
+      ).toEqual([{ allowed: 16 }]);
       await expect(
         application.query('create table upgrade_probe (id integer)'),
       ).rejects.toMatchObject({
@@ -405,7 +410,7 @@ describe('billing-service wiring', () => {
       expect(
         (await upgrade.query('select count(*)::int as applied from drizzle.__drizzle_migrations'))
           .rows,
-      ).toEqual([{ applied: 2 }]);
+      ).toEqual([{ applied: 3 }]);
     } finally {
       await application.end();
       await upgrade.end();
@@ -436,6 +441,7 @@ describe('billing-service wiring', () => {
       { relname: 'usage_generations', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'usage_observations', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'usage_organizations', relrowsecurity: true, relforcerowsecurity: true },
+      { relname: 'usage_threshold_intents', relrowsecurity: true, relforcerowsecurity: true },
     ]);
     expect(policies.rows).toEqual([
       { tablename: 'event_versions', policyname: 'event_versions_organization_isolation' },
@@ -444,6 +450,10 @@ describe('billing-service wiring', () => {
       { tablename: 'usage_generations', policyname: 'usage_generations_tenant_isolation' },
       { tablename: 'usage_observations', policyname: 'usage_observations_tenant_isolation' },
       { tablename: 'usage_organizations', policyname: 'usage_organizations_tenant_isolation' },
+      {
+        tablename: 'usage_threshold_intents',
+        policyname: 'usage_threshold_intents_tenant_isolation',
+      },
     ]);
   });
 
@@ -473,6 +483,12 @@ describe('billing-service wiring', () => {
            values ($1, $2, 'attachment', $3, 2, 'absent')`,
           [atelierNordId, generationId, camilleMartinId],
         );
+        await tx.client.query(
+          `insert into usage_threshold_intents
+             (organization_id, generation_id, metric, event_version, quota_limit)
+           values ($1, $2, 'seats', 1, 5)`,
+          [atelierNordId, generationId],
+        );
       }),
     );
 
@@ -487,8 +503,8 @@ describe('billing-service wiring', () => {
           return result;
         }),
       );
-    expect(await counts(atelierNordId)).toEqual([1, 2, 1]);
-    expect(await counts(otherOrganizationId)).toEqual([0, 0, 0]);
+    expect(await counts(atelierNordId)).toEqual([1, 2, 1, 1]);
+    expect(await counts(otherOrganizationId)).toEqual([0, 0, 0, 0]);
     expect(
       (await system.run((tx) => tx.client.query('select organization_id from usage_organizations')))
         .rows,
@@ -509,6 +525,7 @@ describe('billing-service wiring', () => {
 
     await runWithOrganizationContext(memberOf(atelierNordId), () =>
       tenant.run(async (tx) => {
+        await tx.client.query('delete from usage_threshold_intents');
         await tx.client.query('delete from usage_observations');
         await tx.client.query('delete from usage_generations');
         await tx.client.query('delete from usage_organizations');
@@ -573,25 +590,26 @@ describe('billing-service wiring', () => {
     const thresholdMember = '01938f6e-0000-7000-8000-000000000046';
     const otherMember = '01938f6e-0000-7000-8000-000000000047';
     const memberDuringRebuild = '01938f6e-0000-7000-8000-000000000048';
-    const failure = new Error('threshold event was not recorded');
+    const failure = new Error('threshold intent was not recorded');
     let rejectThreshold = true;
-    const thresholds: number[] = [];
     const readUsage = new DrizzleActiveUsageReader(tenant);
-    const projection = new RecordUsageObservation(
-      new DrizzleUsageObservationUnitOfWork(
-        tenant,
-        { seats: 5, storageBytes: 2_000_000_000 },
-        (tx, selectedOrganization, version, fact) => {
-          expect(tx.organizationId).toBe(organizationId);
-          expect(selectedOrganization).toBe(organizationId);
-          expect(fact).toMatchObject({ metric: 'seats', used: 4, thresholdPercent: 80 });
-          expect(version).toBe(1);
-          if (rejectThreshold) return Promise.reject(failure);
-          thresholds.push(version);
-          return Promise.resolve();
-        },
-      ),
-    );
+    const unitOfWork = new DrizzleUsageObservationUnitOfWork(tenant, {
+      seats: 5,
+      storageBytes: 2_000_000_000,
+    });
+    const projection = new RecordUsageObservation({
+      run: (selectedOrganization, work) =>
+        unitOfWork.run(selectedOrganization, (transaction) =>
+          work({
+            ...transaction,
+            recordThresholdIntent: (generationId, fact) => {
+              expect(fact).toMatchObject({ metric: 'seats', used: 4, thresholdPercent: 80 });
+              if (rejectThreshold) return Promise.reject(failure);
+              return transaction.recordThresholdIntent(generationId, fact);
+            },
+          }),
+        ),
+    });
     const record = (sourceId: string): Promise<'recorded' | 'unchanged'> =>
       projection.execute({
         organizationId,
@@ -653,6 +671,12 @@ describe('billing-service wiring', () => {
         ]),
       );
       expect(receipt.rows).toEqual([]);
+      const rolledBackIntents = await tenant.run((tx) =>
+        tx.client.query('select metric from usage_threshold_intents where organization_id = $1', [
+          organizationId,
+        ]),
+      );
+      expect(rolledBackIntents.rows).toEqual([]);
 
       rejectThreshold = false;
       expect(await Promise.all([record(thresholdMember), record(otherMember)])).toEqual([
@@ -660,6 +684,15 @@ describe('billing-service wiring', () => {
         'recorded',
       ]);
       expect(await record(thresholdMember)).toBe('unchanged');
+      const intents = await tenant.run((tx) =>
+        tx.client.query(
+          'select metric, generation_id, event_version::int, quota_limit::int from usage_threshold_intents where organization_id = $1',
+          [organizationId],
+        ),
+      );
+      expect(intents.rows).toEqual([
+        { metric: 'seats', generation_id: activeId, event_version: 1, quota_limit: 5 },
+      ]);
       expect(await totals()).toEqual([
         { seats: 5, notification_version: 1, organization_version: 2 },
         { seats: 5, notification_version: 1, organization_version: 2 },
@@ -693,7 +726,13 @@ describe('billing-service wiring', () => {
         { seats: 5, notification_version: 1, organization_version: 2 },
         { seats: 6, notification_version: 1, organization_version: 2 },
       ]);
-      expect(thresholds).toEqual([1]);
+      const remainingIntents = await tenant.run((tx) =>
+        tx.client.query(
+          'select event_version::int from usage_threshold_intents where organization_id = $1',
+          [organizationId],
+        ),
+      );
+      expect(remainingIntents.rows).toEqual([{ event_version: 1 }]);
     });
   });
 
@@ -909,7 +948,7 @@ describe('billing-service wiring', () => {
     const journal = await migrator.query<{ applied: number }>(
       'select count(*)::int as applied from drizzle.__drizzle_migrations',
     );
-    expect(journal.rows).toEqual([{ applied: 2 }]);
+    expect(journal.rows).toEqual([{ applied: 3 }]);
   });
 
   it('publishes a pending event through the outbox relay', async () => {
