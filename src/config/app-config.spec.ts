@@ -106,6 +106,23 @@ describe('appConfigSchema', () => {
     );
   });
 
+  it('requires configured settlement, a Team price and the initial Checkout authorities', () => {
+    const config = {
+      ...complete,
+      BILLING_STRIPE_CHECKOUT_PRICE_ID: 'price_checkout',
+      BILLING_STRIPE_TEAM_PRICE_IDS: '["price_different"]',
+    };
+    const result = appConfigSchema.safeParse(config);
+    if (result.success) throw new Error('Incomplete Checkout configuration was accepted.');
+    expect(result.error.issues.map(({ path }) => path[0])).toEqual([
+      'BILLING_STRIPE_CHECKOUT_PRICE_ID',
+      'BILLING_STRIPE_CHECKOUT_SUCCESS_URL',
+      'BILLING_STRIPE_CHECKOUT_CANCEL_URL',
+      'ORGANIZATION_SERVICE_URL',
+      'INTERNAL_TOKEN_PRIVATE_JWK',
+    ]);
+  });
+
   it('requires a mode-matched Stripe key to enable linked invoice reads', () => {
     const cursorKey = Buffer.alloc(32, 7).toString('base64url');
     const linkedInvoices = { ...complete, BILLING_STRIPE_INVOICE_CURSOR_KEY: cursorKey };

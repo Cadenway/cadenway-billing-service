@@ -1,9 +1,10 @@
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import type { NextFunction, Request, Response } from 'express';
 
-const billingReadPath = /^\/internal\/v1\/billing\/(?:subscription|entitlement|invoices)\/?$/iu;
+const billingReadPath =
+  /^\/internal\/v1\/billing\/(?:subscription|entitlement|invoices|checkout)\/?$/iu;
 
-/** Applies private cache control before guards and to body-parser errors on Billing reads. */
+/** Applies private cache control before guards and to body-parser errors on Billing operations. */
 export function configureBillingReadCache(app: Pick<NestExpressApplication, 'use'>): void {
   app.use(billingReadPath, (request: Request, response: Response, next: NextFunction): void => {
     response.setHeader('Cache-Control', 'private, no-store');

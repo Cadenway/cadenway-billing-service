@@ -41,6 +41,18 @@ export class DrizzleStripeReconciliationUnitOfWork implements StripeReconciliati
       return await work({
         lockBinding: async () => {
           await lockBillingEntitlement(scope, organizationId, 'exclusive');
+          await scope.client.query('select pg_advisory_xact_lock(hashtextextended($1, 0))', [
+            `billing.checkout:${organizationId.toLowerCase()}`,
+          ]);
+          // A possibly payable Checkout must settle before unrelated subscription events can
+          // replace the entitlement. Its terminal transaction uses these same locks in order.
+          const pending = await scope.client.query(
+            `select id from stripe_checkout_attempts
+             where organization_id = $1 and provider_started_at is not null and resolved_at is null
+             limit 1 for update`,
+            [organizationId],
+          );
+          if (pending.rows.length !== 0) return null;
           const [row] = await scope.db
             .select()
             .from(stripeBindings)

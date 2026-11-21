@@ -72,14 +72,15 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
       }
 
       const subscription = await scope.client.query(
-        'select plan from stripe_subscription_snapshots where organization_id = $1 limit 1',
+        `select binding.organization_id, snapshot.plan
+         from stripe_bindings binding
+         left join stripe_subscription_snapshots snapshot using (organization_id)
+         where binding.organization_id = $1 limit 1`,
         [input.organizationId],
       );
-      if (
-        subscription.rows[0] !== undefined &&
-        z.object({ plan: z.string() }).parse(subscription.rows[0]).plan === 'team'
-      ) {
-        return { status: 'subscription-active' };
+      if (subscription.rows[0] !== undefined) {
+        const { plan } = z.object({ plan: z.string().nullable() }).parse(subscription.rows[0]);
+        return { status: plan === 'team' ? 'subscription-active' : 'unavailable' };
       }
 
       if (existing) {
@@ -152,8 +153,7 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
          where organization_id = $1 and lease_token = $2 and provider_key = $3
            and lease_expires_at > clock_timestamp() and response_url is null and resolved_at is null
            and not exists (
-             select 1 from stripe_subscription_snapshots
-             where organization_id = $1 and plan = 'team'
+             select 1 from stripe_bindings where organization_id = $1
            )
            and (provider_started_at is null or (
              provider_started_at > clock_timestamp() - interval '23 hours 55 minutes'

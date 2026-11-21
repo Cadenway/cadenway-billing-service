@@ -55,7 +55,41 @@ describe('Stripe webhook authentication and envelope', () => {
     expect(authenticate(rawBody, signature)).toEqual({ kind: 'invalid-event' });
   });
 
-  it('intentionally ignores correctly signed events outside the subscription allowlist', () => {
+  it.each([
+    'checkout.session.completed',
+    'checkout.session.async_payment_succeeded',
+    'checkout.session.expired',
+  ])('takes only the verified event and session IDs for %s', (type) => {
+    const { rawBody, signature } = signed({
+      ...event,
+      type,
+      data: {
+        object: {
+          object: 'checkout.session',
+          id: 'cs_test_fixture',
+          client_reference_id: 'checkout_untrusted',
+          metadata: { organizationId: 'tenant-of-choice' },
+          payment_status: 'paid',
+        },
+      },
+    });
+    expect(authenticate(rawBody, signature)).toEqual({
+      kind: 'checkout',
+      eventId: event.id,
+      sessionId: 'cs_test_fixture',
+    });
+  });
+
+  it('rejects a signed Checkout event without a well-formed session ID', () => {
+    const { rawBody, signature } = signed({
+      ...event,
+      type: 'checkout.session.completed',
+      data: { object: { object: 'checkout.session', id: 'sub_fixture' } },
+    });
+    expect(authenticate(rawBody, signature)).toEqual({ kind: 'invalid-event' });
+  });
+
+  it('intentionally ignores correctly signed events outside the supported allowlists', () => {
     const { rawBody, signature } = signed({
       ...event,
       type: 'invoice.created',

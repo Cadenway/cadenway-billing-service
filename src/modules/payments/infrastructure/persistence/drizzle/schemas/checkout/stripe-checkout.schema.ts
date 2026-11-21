@@ -2,6 +2,7 @@ import { sql } from 'drizzle-orm';
 import {
   bigint,
   check,
+  index,
   pgPolicy,
   pgTable,
   text,
@@ -37,6 +38,7 @@ export const stripeCheckoutAttempts = pgTable(
     version: bigint('version', { mode: 'number' }).notNull().default(1),
   },
   (table) => [
+    uniqueIndex('stripe_checkout_attempts_provider_key_unique').on(table.providerKey),
     uniqueIndex('stripe_checkout_attempts_actor_key_unique').on(
       table.organizationId,
       table.actorId,
@@ -69,6 +71,44 @@ export const stripeCheckoutAttempts = pgTable(
     pgPolicy('stripe_checkout_attempts_tenant_isolation', {
       using: sql`organization_id = nullif(current_setting('app.organization_id', true), '')::uuid`,
       withCheck: sql`organization_id = nullif(current_setting('app.organization_id', true), '')::uuid`,
+    }),
+    pgPolicy('stripe_checkout_attempts_exact_system_lookup', {
+      for: 'select',
+      using: sql`current_setting('app.system_access', true) = 'on'
+        and provider_key = nullif(current_setting('app.stripe_checkout_provider_key', true), '')`,
+    }),
+  ],
+).enableRLS();
+
+/** Immutable receipt for each applied or expired Checkout event. */
+export const stripeCheckoutReceipts = pgTable(
+  'stripe_checkout_receipts',
+  {
+    organizationId: uuid('organization_id').notNull(),
+    eventId: text('event_id').primaryKey(),
+    providerKey: text('provider_key').notNull(),
+    sessionId: text('session_id').notNull(),
+    terminalStatus: text('terminal_status').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('stripe_checkout_receipts_reservation').on(
+      table.organizationId,
+      table.providerKey,
+      table.sessionId,
+    ),
+    check(
+      'stripe_checkout_receipts_terminal_check',
+      sql`${table.terminalStatus} in ('complete', 'expired')`,
+    ),
+    pgPolicy('stripe_checkout_receipts_tenant_isolation', {
+      using: sql`organization_id = nullif(current_setting('app.organization_id', true), '')::uuid`,
+      withCheck: sql`organization_id = nullif(current_setting('app.organization_id', true), '')::uuid`,
+    }),
+    pgPolicy('stripe_checkout_receipts_exact_system_lookup', {
+      for: 'select',
+      using: sql`current_setting('app.system_access', true) = 'on'
+        and event_id = nullif(current_setting('app.stripe_checkout_event_id', true), '')`,
     }),
   ],
 ).enableRLS();

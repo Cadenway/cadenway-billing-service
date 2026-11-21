@@ -22,6 +22,8 @@ Authenticates Stripe payment deliveries. Stripe owns hosted checkout and card da
 - `stripe_checkout_attempts` reserves one unresolved hosted Checkout per organization, with
   a hashed key per actor. It stores a short lease, immutable Stripe request parameters and
   the response needed for replay.
+- `stripe_checkout_receipts` deduplicates authenticated terminal Checkout deliveries. An expired
+  session can have a receipt before any subscription binding exists.
 
 Migration `0003_stripe_reconciliation.sql` creates the binding, snapshot and receipt tables
 with forced tenant RLS.
@@ -34,12 +36,19 @@ dormant receipts table. Existing tenant scoping stays in place. A collision at s
 rolls back the entitlement and its receipt. The prior Billing release can run with these
 additive indexes in place.
 Migration `0006_stripe_checkout_attempts.sql` adds the Checkout table with forced tenant RLS.
+Migration `0007_stripe_checkout_settlement.sql` adds the receipt table with forced RLS and
+unique provider keys. Global webhook lookup policies permit reads only for the exact provider
+key or event ID selected in the system transaction.
 
 ## API
 
+- `POST /internal/v1/billing/checkout` starts hosted Team Checkout for the verified Gateway
+  user and organization. Gateway checks the owner's current role before forwarding every call.
+  The service replays the original URL for the same actor and key for 24 hours.
 - `POST /internal/v1/billing/webhooks/stripe` verifies the exact raw bytes after the signed
-  global Gateway identity is established. Replies are private and noncacheable. Verified
-  types outside subscription creation, update, deletion, pause and resume receive an empty 204. A supported event receives 204 after durable settlement or a confirmed duplicate.
+  global Gateway identity is established. Replies are private and noncacheable. Unsupported
+  verified event types receive an empty 204. A supported event receives 204 after durable
+  settlement or a confirmed duplicate.
   The account-wide receipt is checked before looking up the binding, so a replay can stop
   even if its original customer or subscription has since been replaced.
   Missing bindings, deferred settlement and settlement errors return `503 billing.unavailable`.
@@ -112,3 +121,10 @@ this settlement commits. The endpoint does not store raw provider deliveries.
 - Checkout leases fence concurrent attempts and recoveries after an uncertain provider call.
   Any Checkout with a saved provider request stays exclusive until a durable reconciliation
   proves its outcome. The provider call and that reconciliation are separate from reservation.
+- Checkout creation requires one complete Organization membership page and charges the current
+  number of active billable seats. Creation refuses any paid quantity that would lower the
+  committed seat limit. A paid session matching its reservation records the initial binding,
+  entitlement, receipt and outbox fact in one tenant transaction.
+- Start refuses creation for an organization with an existing Stripe binding. A submitted
+  attempt with an unknown provider outcome retains its reservation when the idempotency
+  key approaches the provider's retention limit. An authenticated terminal delivery resolves it.

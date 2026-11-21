@@ -57,6 +57,9 @@ export type AppConfig = BaseConfig &
     readonly BILLING_STRIPE_API_KEY?: string | undefined;
     readonly BILLING_STRIPE_TEAM_PRICE_IDS?: readonly string[] | undefined;
     readonly BILLING_STRIPE_INVOICE_CURSOR_KEY?: string | undefined;
+    readonly BILLING_STRIPE_CHECKOUT_PRICE_ID?: string | undefined;
+    readonly BILLING_STRIPE_CHECKOUT_SUCCESS_URL?: string | undefined;
+    readonly BILLING_STRIPE_CHECKOUT_CANCEL_URL?: string | undefined;
     readonly ORGANIZATION_SERVICE_URL?: string | undefined;
     readonly STORAGE_SERVICE_URL?: string | undefined;
     readonly INTERNAL_TOKEN_PRIVATE_JWK?: InternalTokenSignerConfig['INTERNAL_TOKEN_PRIVATE_JWK'];
@@ -75,6 +78,15 @@ function sourceOrigin(service: 'Organization' | 'Storage'): z.ZodType<string> {
       return url.origin;
     });
 }
+
+const checkoutReturnUrl = z.url({ protocol: /^https?$/u }).refine((value) => {
+  const url = URL.parse(value);
+  if (url === null) return false;
+  const loopback =
+    ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) ||
+    url.hostname.endsWith('.localhost');
+  return (url.protocol === 'https:' || loopback) && !url.username && !url.password && !url.hash;
+}, 'Expected a trusted HTTPS or local loopback Checkout return URL.');
 
 /** Parses a JSON list without exposing configured values in errors. */
 function stripeList(schema: z.ZodType<string[]>, message: string): z.ZodType<string[]> {
@@ -163,6 +175,12 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
       .regex(/^(?:sk|rk)_(?:test|live)_[A-Za-z0-9_]{1,255}$/u)
       .optional(),
     BILLING_STRIPE_TEAM_PRICE_IDS: stripeTeamPrices.optional(),
+    BILLING_STRIPE_CHECKOUT_PRICE_ID: z
+      .string()
+      .regex(/^price_[A-Za-z0-9_]{1,249}$/u)
+      .optional(),
+    BILLING_STRIPE_CHECKOUT_SUCCESS_URL: checkoutReturnUrl.optional(),
+    BILLING_STRIPE_CHECKOUT_CANCEL_URL: checkoutReturnUrl.optional(),
     BILLING_STRIPE_INVOICE_CURSOR_KEY: z
       .string()
       .regex(/^[A-Za-z0-9_-]{43}$/u)
@@ -180,6 +198,29 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
       internalTokenSignerConfigShape.INTERNAL_TOKEN_PRIVATE_JWK.optional(),
   })
   .superRefine((config, context) => {
+    const checkoutPrice = config.BILLING_STRIPE_CHECKOUT_PRICE_ID;
+    if (checkoutPrice !== undefined) {
+      if (
+        !config.BILLING_STRIPE_SETTLEMENT_ENABLED ||
+        !config.BILLING_STRIPE_TEAM_PRICE_IDS?.includes(checkoutPrice)
+      ) {
+        context.addIssue({
+          code: 'custom',
+          path: ['BILLING_STRIPE_CHECKOUT_PRICE_ID'],
+          message: 'Checkout requires enabled settlement and an allowed Team price.',
+        });
+      }
+      for (const key of [
+        'BILLING_STRIPE_CHECKOUT_SUCCESS_URL',
+        'BILLING_STRIPE_CHECKOUT_CANCEL_URL',
+        'ORGANIZATION_SERVICE_URL',
+        'INTERNAL_TOKEN_PRIVATE_JWK',
+      ] as const) {
+        if (config[key] === undefined) {
+          context.addIssue({ code: 'custom', path: [key], message: 'Required for Checkout.' });
+        }
+      }
+    }
     if (config.BILLING_STRIPE_SETTLEMENT_ENABLED || config.BILLING_STRIPE_INVOICE_CURSOR_KEY) {
       const key = config.BILLING_STRIPE_API_KEY;
       if (

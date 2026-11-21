@@ -10,6 +10,11 @@ export type StripeWebhookAuthenticator = (
       readonly subscriptionId: string;
     }
   | {
+      readonly kind: 'checkout';
+      readonly eventId: string;
+      readonly sessionId: string;
+    }
+  | {
       readonly kind:
         'ignored' | 'invalid-signature' | 'invalid-event' | 'body-too-large' | 'unavailable';
     };

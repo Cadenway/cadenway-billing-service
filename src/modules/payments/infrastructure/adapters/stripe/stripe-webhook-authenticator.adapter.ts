@@ -22,6 +22,11 @@ const subscriptionEvents = new Set([
   'customer.subscription.paused',
   'customer.subscription.resumed',
 ]);
+const checkoutEvents = new Set([
+  'checkout.session.completed',
+  'checkout.session.async_payment_succeeded',
+  'checkout.session.expired',
+]);
 
 const event = z.object({
   id: eventId,
@@ -41,6 +46,13 @@ const subscription = z.object({
     z.object({ object: z.literal('customer'), id: customerId }).transform((value) => value.id),
   ]),
 });
+const checkout = z.object({
+  object: z.literal('checkout.session'),
+  id: z
+    .string()
+    .max(255)
+    .regex(/^cs_[A-Za-z0-9_]+$/u),
+});
 
 /** Authenticates original bytes before narrowing the single-account Stripe event envelope. */
 export function createStripeWebhookAuthenticator(
@@ -54,6 +66,12 @@ export function createStripeWebhookAuthenticator(
     const envelope = event.safeParse(result.event);
     if (!envelope.success || envelope.data.livemode !== liveMode) {
       return { kind: 'invalid-event' };
+    }
+    if (checkoutEvents.has(envelope.data.type)) {
+      const target = checkout.safeParse(envelope.data.data.object);
+      return target.success
+        ? { kind: 'checkout', eventId: envelope.data.id, sessionId: target.data.id }
+        : { kind: 'invalid-event' };
     }
     if (!subscriptionEvents.has(envelope.data.type)) return { kind: 'ignored' };
 

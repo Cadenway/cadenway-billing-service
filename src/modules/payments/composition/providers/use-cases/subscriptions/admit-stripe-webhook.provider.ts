@@ -3,6 +3,7 @@ import { SystemTransactionRunner, type DatabaseSchema } from '@cadenway/nest-com
 import type { FactoryProvider } from '@nestjs/common';
 
 import type { AppConfig } from '../../../../../../config/app-config.js';
+import { ReconcileStripeCheckout } from '../../../../application/use-cases/commands/checkout/reconcile-stripe-checkout/reconcile-stripe-checkout.use-case.js';
 import { AdmitStripeWebhook } from '../../../../application/use-cases/commands/subscriptions/admit-stripe-webhook/admit-stripe-webhook.use-case.js';
 import { ReconcileStripeSubscription } from '../../../../application/use-cases/commands/subscriptions/reconcile-stripe-subscription/reconcile-stripe-subscription.use-case.js';
 import { createStripeWebhookAuthenticator } from '../../../../infrastructure/adapters/stripe/stripe-webhook-authenticator.adapter.js';
@@ -11,11 +12,12 @@ import { DrizzleStripeWebhookBindingReader } from '../../../../infrastructure/pe
 /** Starts with settlement gated on a real quota fence and subscription outbox. */
 export const admitStripeWebhookProvider: FactoryProvider<AdmitStripeWebhook> = {
   provide: AdmitStripeWebhook,
-  inject: [CONFIG, SystemTransactionRunner, ReconcileStripeSubscription],
+  inject: [CONFIG, SystemTransactionRunner, ReconcileStripeSubscription, ReconcileStripeCheckout],
   useFactory: (
     config: AppConfig,
     runner: SystemTransactionRunner<DatabaseSchema>,
     reconciliation: ReconcileStripeSubscription | null,
+    checkout: ReconcileStripeCheckout | null,
   ) => {
     const secrets = config.BILLING_STRIPE_WEBHOOK_SECRETS;
     return new AdmitStripeWebhook(
@@ -35,6 +37,7 @@ export const admitStripeWebhookProvider: FactoryProvider<AdmitStripeWebhook> = {
               },
               () => reconciliation.execute(delivery),
             ),
+      checkout === null ? null : (delivery) => checkout.execute(delivery),
     );
   },
 };

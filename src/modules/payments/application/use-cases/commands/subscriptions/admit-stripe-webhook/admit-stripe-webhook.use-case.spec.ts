@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { StripeWebhookAuthenticator } from '../../../../models/subscriptions/stripe-webhook-authenticator.model.js';
 import type { ReconcileStripeSubscription } from '../reconcile-stripe-subscription/reconcile-stripe-subscription.use-case.js';
+import type { ReconcileStripeCheckout } from '../../checkout/reconcile-stripe-checkout/reconcile-stripe-checkout.use-case.js';
 import { AdmitStripeWebhook } from './admit-stripe-webhook.use-case.js';
 
 const subscription = {
@@ -34,6 +35,54 @@ function setup() {
 }
 
 describe('AdmitStripeWebhook', () => {
+  it.each(['applied', 'unchanged', 'expired', 'duplicate'] as const)(
+    'acknowledges Checkout only after settlement returns %s',
+    async (status) => {
+      const { authenticate, hasSettlement, resolve, settle } = setup();
+      authenticate.mockReturnValue({
+        kind: 'checkout',
+        eventId: 'evt_checkout',
+        sessionId: 'cs_test',
+      });
+      const checkout = vi.fn<ReconcileStripeCheckout['execute']>().mockResolvedValue({ status });
+      const useCase = new AdmitStripeWebhook(
+        authenticate,
+        { hasSettlement, resolve },
+        settle,
+        checkout,
+      );
+
+      await expect(useCase.execute(input)).resolves.toBe('accepted');
+      expect(checkout).toHaveBeenCalledExactlyOnceWith({
+        eventId: 'evt_checkout',
+        sessionId: 'cs_test',
+      });
+      expect(hasSettlement).not.toHaveBeenCalled();
+      expect(resolve).not.toHaveBeenCalled();
+      expect(settle).not.toHaveBeenCalled();
+    },
+  );
+
+  it('leaves Checkout retryable when settlement is unavailable or deferred', async () => {
+    const { authenticate, hasSettlement, resolve, settle } = setup();
+    authenticate.mockReturnValue({
+      kind: 'checkout',
+      eventId: 'evt_checkout',
+      sessionId: 'cs_test',
+    });
+    const checkout = vi
+      .fn<ReconcileStripeCheckout['execute']>()
+      .mockResolvedValue({ status: 'retry' });
+    await expect(
+      new AdmitStripeWebhook(authenticate, { hasSettlement, resolve }, settle).execute(input),
+    ).resolves.toBe('unavailable');
+    await expect(
+      new AdmitStripeWebhook(authenticate, { hasSettlement, resolve }, settle, checkout).execute(
+        input,
+      ),
+    ).resolves.toBe('unavailable');
+  });
+
   it.each(['applied', 'unchanged', 'ignored', 'duplicate'] as const)(
     'acknowledges a supported delivery only after the durable settlement returns %s',
     async (status) => {

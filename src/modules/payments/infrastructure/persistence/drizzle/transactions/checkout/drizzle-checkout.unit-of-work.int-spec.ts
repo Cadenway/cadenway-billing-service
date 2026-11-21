@@ -223,6 +223,57 @@ describe('Checkout reservation PostgreSQL transactions', () => {
     ).toBe(false);
   });
 
+  it.each([
+    ['without a snapshot', '01938f6e-6d1a-7c3e-9a51-2f0c4b8d7e30', false],
+    ['with a Free snapshot', '01938f6e-6d1a-7c3e-9a51-2f0c4b8d7e31', true],
+  ])('refuses a Stripe binding %s before and after reservation', async (_label, tenant, free) => {
+    const next = { ...input, organizationId: tenant };
+    const claim = await inTenant(tenant, () => checkout.claim(next));
+    if (claim.status !== 'claimed') throw new Error('The tenant did not acquire a lease.');
+    await inTenant(tenant, () =>
+      runner.run(async ({ client }) => {
+        await client.query(
+          'insert into stripe_bindings (organization_id, customer_id, subscription_id) values ($1, $2, $3)',
+          [tenant, `cus_${tenant}`, `sub_${tenant}`],
+        );
+        if (free) {
+          await client.query(
+            `insert into stripe_subscription_snapshots (organization_id, plan, seats, storage_bytes)
+             values ($1, 'free', 5, 2000000000)`,
+            [tenant],
+          );
+        }
+      }),
+    );
+    expect(await inTenant(tenant, () => checkout.claim(next))).toEqual({ status: 'unavailable' });
+    expect(
+      await inTenant(tenant, () =>
+        checkout.claim({ ...next, idempotencyKey: 'new-checkout-fixture' }),
+      ),
+    ).toEqual({ status: 'unavailable' });
+    expect(
+      await inTenant(tenant, () =>
+        checkout.saveRequest(tenant, claim.token, {
+          organizationId: tenant,
+          providerKey: claim.providerKey,
+          priceId: 'price_test_team',
+          quantity: 5,
+          successUrl: 'https://app.example.test/success',
+          cancelUrl: 'https://app.example.test/cancel',
+        }),
+      ),
+    ).toBe(false);
+    const attempt = await inTenant(tenant, () =>
+      runner.run(({ client }) =>
+        client.query(
+          'select provider_started_at, price_id, quantity from stripe_checkout_attempts where organization_id = $1',
+          [tenant],
+        ),
+      ),
+    );
+    expect(attempt.rows).toEqual([{ provider_started_at: null, price_id: null, quantity: null }]);
+  });
+
   it('checks the retention margin again immediately before dispatch', async () => {
     const next = { ...input, organizationId: boundaryOrganizationId };
     const first = await inTenant(boundaryOrganizationId, () => checkout.claim(next));

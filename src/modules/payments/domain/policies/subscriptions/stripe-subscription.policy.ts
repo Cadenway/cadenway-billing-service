@@ -1,7 +1,8 @@
 import type { StripeSubscriptionDecision } from '../../value-objects/subscriptions/stripe-subscription-decision.value-object.js';
 import type { StripeSubscriptionReconciliation } from '../../value-objects/subscriptions/stripe-subscription-reconciliation.value-object.js';
 
-const teamStorageByteLimit = 100_000_000_000;
+/** The storage grant applied to a Team subscription. */
+export const teamStorageByteLimit = 100_000_000_000;
 
 /**
  * Resolves the self-service Team entitlement from an allowlisted Stripe subscription. The
