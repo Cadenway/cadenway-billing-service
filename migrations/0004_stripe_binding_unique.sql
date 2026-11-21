@@ -1,0 +1,2 @@
+CREATE UNIQUE INDEX "stripe_bindings_customer_id_unique" ON "stripe_bindings" USING btree ("customer_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "stripe_bindings_subscription_id_unique" ON "stripe_bindings" USING btree ("subscription_id");

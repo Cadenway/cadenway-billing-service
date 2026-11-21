@@ -9,6 +9,7 @@ import {
   primaryKey,
   text,
   timestamp,
+  uniqueIndex,
   uuid,
 } from 'drizzle-orm/pg-core';
 
@@ -26,6 +27,8 @@ export const stripeBindings = pgTable(
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
+    uniqueIndex('stripe_bindings_customer_id_unique').on(table.customerId),
+    uniqueIndex('stripe_bindings_subscription_id_unique').on(table.subscriptionId),
     check('stripe_bindings_customer_id_check', sql`length(${table.customerId}) between 1 and 255`),
     check(
       'stripe_bindings_subscription_id_check',

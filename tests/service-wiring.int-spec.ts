@@ -87,7 +87,7 @@ const paymentsTables = [
 ] as const;
 
 /** Migrations applied on a clean or upgraded database. */
-const migrationCount = 4;
+const migrationCount = 5;
 
 /**
  * Runs `docker compose` on the throwaway project.
@@ -358,7 +358,7 @@ describe('billing-service wiring', () => {
     expect(journal.rows).toEqual([{ applied: migrationCount }]);
   });
 
-  it.each([1, migrationCount - 1])(
+  it.each([1, 3, 4])(
     'upgrades from %i applied migrations without losing rows or application privileges',
     async (previousCount) => {
       const port = hostPort('postgres', '5432');
@@ -401,12 +401,33 @@ describe('billing-service wiring', () => {
          values ('billing-service__upgrade', $1)`,
           [camilleMartinId],
         );
+        if (previousCount === 4) {
+          await upgrade.query("set local app.system_access = 'on'");
+          await upgrade.query(
+            'insert into stripe_bindings (organization_id, customer_id, subscription_id) values ($1, $2, $3)',
+            [camilleMartinId, 'cus_upgrade', 'sub_upgrade'],
+          );
+        }
         await upgrade.query('commit');
 
         await migrate(drizzle({ client: upgrade }), { migrationsFolder });
         expect(
           (await application.query('select consumer, event_id from processed_events')).rows,
         ).toEqual([{ consumer: 'billing-service__upgrade', event_id: camilleMartinId }]);
+        if (previousCount === 4) {
+          const system = new SystemTransactionRunner(application);
+          const binding = await system.run(
+            ({ client }) =>
+              client.query(
+                'select customer_id, subscription_id from stripe_bindings where organization_id = $1',
+                [camilleMartinId],
+              ),
+            { readOnly: true },
+          );
+          expect(binding.rows).toEqual([
+            { customer_id: 'cus_upgrade', subscription_id: 'sub_upgrade' },
+          ]);
+        }
         expect(
           (
             await application.query(

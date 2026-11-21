@@ -2,19 +2,38 @@ import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 
 import { runWithOrganizationContext, type OrganizationContext } from '@cadenway/nest-common';
-import { TenantTransactionRunner, type DatabaseSchema } from '@cadenway/nest-common/database';
+import {
+  SystemTransactionRunner,
+  TenantTransactionRunner,
+  type DatabaseSchema,
+} from '@cadenway/nest-common/database';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
+import { ReconcileStripeSubscription } from '../../../../../application/use-cases/commands/subscriptions/reconcile-stripe-subscription/reconcile-stripe-subscription.use-case.js';
 import { DrizzleStripeBindingReader } from '../../repositories/subscriptions/drizzle-stripe-binding.repository.js';
+import { DrizzleStripeWebhookBindingReader } from '../../repositories/subscriptions/drizzle-stripe-webhook-binding.repository.js';
 import { DrizzleStripeReconciliationUnitOfWork } from './drizzle-stripe-reconciliation.unit-of-work.js';
 import type { StripeEntitlementFence } from './stripe-entitlement-fence.transaction.js';
 
 const project = `cadenway-billing-stripe-test-${String(process.pid)}`;
 const organizationId = '01938f6e-6d1a-7c3e-9a51-2f0c4b8d7e10';
 const otherId = '01938f6e-6d1a-7c3e-9a51-2f0c4b8d7e11';
+const secondBoundId = '01938f6e-6d1a-7c3e-9a51-2f0c4b8d7e12';
+const localIdentity = {
+  account: null,
+  authContext: null,
+  customerId: 'cus_local',
+  subscriptionId: 'sub_local',
+};
+const verifiedWebhookCaller: OrganizationContext = {
+  organizationId: null,
+  actor: { type: 'system', id: 'api-gateway' },
+  role: null,
+  scopes: [],
+};
 const team = {
   kind: 'apply' as const,
   plan: 'team' as const,
@@ -47,6 +66,7 @@ describe('Stripe reconciliation PostgreSQL transactions', () => {
   let migrator: pg.Pool | undefined;
   let application: pg.Pool | undefined;
   let runner: TenantTransactionRunner<DatabaseSchema>;
+  let webhookBindings: DrizzleStripeWebhookBindingReader;
   let started = false;
   const inTenant = <T>(organization: string, work: () => Promise<T>): Promise<T> =>
     runWithOrganizationContext(context(organization), work);
@@ -65,6 +85,9 @@ describe('Stripe reconciliation PostgreSQL transactions', () => {
       max: 5,
     });
     runner = new TenantTransactionRunner<DatabaseSchema>(application);
+    webhookBindings = new DrizzleStripeWebhookBindingReader(
+      new SystemTransactionRunner<DatabaseSchema>(application),
+    );
     await inTenant(organizationId, () =>
       runner.run(async ({ client }) => {
         await client.query(
@@ -123,6 +146,20 @@ describe('Stripe reconciliation PostgreSQL transactions', () => {
     await expect(inTenant(otherId, () => bindings.read(organizationId))).rejects.toThrow(
       'tenant scope',
     );
+
+    const retrieve = vi.fn().mockRejectedValue(new Error('Stripe is unavailable.'));
+    const reconcile = new ReconcileStripeSubscription(bindings, { retrieve }, unit, {
+      liveMode: false,
+      teamPriceIds: ['price_team'],
+      freePlanLimits: { seats: 5, storageBytes: 2_000_000_000 },
+    });
+    await expect(
+      inTenant(organizationId, () => reconcile.execute({ organizationId, eventId: 'evt_one' })),
+    ).resolves.toEqual({ status: 'duplicate' });
+    expect(retrieve).not.toHaveBeenCalled();
+    await expect(
+      inTenant(otherId, () => unit.run(otherId, (transaction) => transaction.isSettled('evt_one'))),
+    ).resolves.toBe(false);
   });
 
   it('does not settle a change without the admission fence', async () => {
@@ -142,5 +179,50 @@ describe('Stripe reconciliation PostgreSQL transactions', () => {
         new DrizzleStripeBindingReader(runner).read(organizationId),
       ),
     ).toMatchObject({ revision: 2 });
+  });
+
+  it('resolves the exact provider pair and returns the live revision only for a global system actor', async () => {
+    await inTenant(secondBoundId, () =>
+      runner.run(async ({ client }) => {
+        await client.query(
+          'insert into stripe_bindings (organization_id, customer_id, subscription_id) values ($1, $2, $3)',
+          [secondBoundId, 'cus_other', 'sub_other'],
+        );
+      }),
+    );
+    const snapshot = await inTenant(organizationId, () =>
+      new DrizzleStripeBindingReader(runner).read(organizationId),
+    );
+    const read = (identity: Parameters<DrizzleStripeWebhookBindingReader['resolve']>[0]) =>
+      runWithOrganizationContext(verifiedWebhookCaller, () => webhookBindings.resolve(identity));
+
+    expect(await read(localIdentity)).toEqual({ organizationId, ...snapshot });
+    expect(await read({ ...localIdentity, customerId: 'cus_other' })).toBeNull();
+    expect(await read({ ...localIdentity, subscriptionId: 'sub_other' })).toBeNull();
+    expect(await read({ ...localIdentity, subscriptionId: 'sub_missing' })).toBeNull();
+    expect(await read({ ...localIdentity, customerId: 'cus_Local' })).toBeNull();
+    await expect(
+      inTenant(organizationId, () => webhookBindings.resolve(localIdentity)),
+    ).rejects.toThrow('global system actor');
+    await expect(webhookBindings.resolve(localIdentity)).rejects.toThrow('global system actor');
+  });
+
+  it.each([
+    { customerId: 'cus_local', subscriptionId: 'sub_distinct' },
+    { customerId: 'cus_distinct', subscriptionId: 'sub_local' },
+  ])('prevents another tenant claiming either bound provider identity', async (identity) => {
+    await expect(
+      inTenant(otherId, () =>
+        runner.run(({ client }) =>
+          client.query(
+            'insert into stripe_bindings (organization_id, customer_id, subscription_id) values ($1, $2, $3)',
+            [otherId, identity.customerId, identity.subscriptionId],
+          ),
+        ),
+      ),
+    ).rejects.toMatchObject({ code: '23505' });
+    expect(
+      await inTenant(otherId, () => new DrizzleStripeBindingReader(runner).read(otherId)),
+    ).toBeNull();
   });
 });

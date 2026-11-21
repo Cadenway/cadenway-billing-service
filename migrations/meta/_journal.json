@@ -29,6 +29,13 @@
       "when": 1795269196630,
       "tag": "0003_stripe_reconciliation",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1795274408342,
+      "tag": "0004_stripe_binding_unique",
+      "breakpoints": true
     }
   ]
 }
