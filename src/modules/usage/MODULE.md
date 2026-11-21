@@ -42,6 +42,8 @@ depend on the published source and threshold contracts and their configured dura
   one guest. Pending invitations and removed memberships contribute zero.
 - A ready attachment contributes its verified size in bytes. Pending and deleted attachments
   contribute zero.
+- Reads require a ready active generation in the signed organization. A candidate continues
+  recording observations during a rebuild while measured usage is unavailable.
 - Observed usage can exceed the limit. An increase may reach the limit. An increase above the limit
   is refused. Valid reductions and unchanged counts are allowed.
 - The threshold fact is produced for a transition from below 80% to at least 80%. A subsequent

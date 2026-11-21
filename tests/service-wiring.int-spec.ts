@@ -28,6 +28,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AppModule } from '../src/app.module.js';
 import { appConfigSchema } from '../src/config/app-config.js';
 import { RecordUsageObservation } from '../src/modules/usage/application/use-cases/commands/observations/record-usage-observation/record-usage-observation.use-case.js';
+import { DrizzleActiveUsageReader } from '../src/modules/usage/infrastructure/persistence/drizzle/repositories/usage/drizzle-active-usage.repository.js';
 import { DrizzleUsageObservationUnitOfWork } from '../src/modules/usage/infrastructure/persistence/drizzle/transactions/observations/drizzle-usage-observation.unit-of-work.js';
 
 // The service as main.ts assembles it, on a disposable PostgreSQL and NATS. `@cadenway/nest-testing`
@@ -569,9 +570,11 @@ describe('billing-service wiring', () => {
     ];
     const thresholdMember = '01938f6e-0000-7000-8000-000000000046';
     const otherMember = '01938f6e-0000-7000-8000-000000000047';
+    const memberDuringRebuild = '01938f6e-0000-7000-8000-000000000048';
     const failure = new Error('threshold event was not recorded');
     let rejectThreshold = true;
     const thresholds: number[] = [];
+    const readUsage = new DrizzleActiveUsageReader(tenant);
     const projection = new RecordUsageObservation(
       new DrizzleUsageObservationUnitOfWork(
         tenant,
@@ -598,6 +601,8 @@ describe('billing-service wiring', () => {
       });
 
     await runWithOrganizationContext(memberOf(organizationId), async () => {
+      await expect(readUsage.read(organizationId)).resolves.toBeNull();
+      await expect(readUsage.read(otherOrganizationId)).rejects.toThrow();
       await tenant.run(async (tx) => {
         await tx.client.query('insert into usage_organizations (organization_id) values ($1)', [
           organizationId,
@@ -656,6 +661,24 @@ describe('billing-service wiring', () => {
       expect(await totals()).toEqual([
         { seats: 5, notification_version: 1, organization_version: 2 },
         { seats: 5, notification_version: 1, organization_version: 2 },
+      ]);
+      expect(await readUsage.read(organizationId)).toEqual({
+        seats: 5,
+        guests: 0,
+        storageBytes: 0,
+      });
+
+      await tenant.run((tx) =>
+        tx.client.query(
+          `update usage_generations set status = 'invalid' where organization_id = $1 and id = $2`,
+          [organizationId, activeId],
+        ),
+      );
+      expect(await record(memberDuringRebuild)).toBe('recorded');
+      expect(await readUsage.read(organizationId)).toBeNull();
+      expect(await totals()).toEqual([
+        { seats: 5, notification_version: 1, organization_version: 2 },
+        { seats: 6, notification_version: 1, organization_version: 2 },
       ]);
       expect(thresholds).toEqual([1]);
     });
