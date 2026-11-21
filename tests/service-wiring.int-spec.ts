@@ -677,14 +677,9 @@ describe('billing-service wiring', () => {
         .get('/internal/v1/billing/subscription')
         .set('Authorization', `Bearer ${token}`)
         .set('If-None-Match', '*');
-      expect(subscription.status).toBe(200);
+      expect(subscription.status).toBe(503);
       expect(subscription.headers['cache-control']).toBe('private, no-store');
-      expect(subscription.body).toEqual({
-        plan: 'free',
-        seats: { used: 5, limit: 5 },
-        guestCount: 0,
-        storage: { attachmentBytesUsed: 0, limitBytes: 2_000_000_000 },
-      });
+      expect(subscription.body).toMatchObject({ code: 'billing.unavailable' });
 
       await tenant.run((tx) =>
         tx.client.query(

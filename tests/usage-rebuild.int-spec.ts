@@ -251,6 +251,34 @@ describe('usage rebuild PostgreSQL transactions', () => {
     expect(active.active).toMatchObject({ id: generationId, brokerAtPromotion: progress });
     if (active.active === null) throw new Error('Promotion did not persist.');
     const activeVersion = active.active.version;
+    const advanced = { ...progress, firstSequence: 2, lastSequence: 11 };
+    const checkpoint = (version: number): Promise<boolean> =>
+      inTenant(() =>
+        uow.run(organizationId, async (tx) => {
+          await tx.lockOrganization();
+          return tx.checkpointActive(generationId, version, advanced);
+        }),
+      );
+    await expect(checkpoint(activeVersion - 1)).resolves.toBe(false);
+    await expect(checkpoint(activeVersion)).resolves.toBe(true);
+    await expect(checkpoint(activeVersion)).resolves.toBe(false);
+    const refreshed = await inTenant(() => state.read(organizationId));
+    expect(refreshed.active).toMatchObject({
+      id: generationId,
+      version: activeVersion + 1,
+      brokerAtPromotion: advanced,
+    });
+    const persisted = await inTenant(() =>
+      runner.run((tx) =>
+        tx.client.query(
+          'select stream_checkpoint from usage_generations where organization_id = $1 and id = $2',
+          [organizationId, generationId],
+        ),
+      ),
+    );
+    expect(persisted.rows).toMatchObject([
+      { stream_checkpoint: { start: progress, promotion: progress, verified: advanced } },
+    ]);
     await expect(
       inTenant(() =>
         invalidate.execute({
@@ -265,7 +293,7 @@ describe('usage rebuild PostgreSQL transactions', () => {
         invalidate.execute({
           organizationId,
           generationId,
-          expectedVersion: activeVersion,
+          expectedVersion: activeVersion + 1,
         }),
       ),
     ).resolves.toBe('invalidated');

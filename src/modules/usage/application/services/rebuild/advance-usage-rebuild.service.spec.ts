@@ -7,6 +7,7 @@ import type { UsageRebuildCandidate } from '../../models/rebuild/usage-rebuild-c
 import type { UsageRebuildState } from '../../models/rebuild/usage-rebuild-state.model.js';
 import type { UsageSnapshotSource } from '../../ports/outbound/http/snapshot/usage-snapshot-source.port.js';
 import type { UsageBrokerProof } from '../../ports/outbound/messaging/rebuild/usage-broker-proof.port.js';
+import type { UsageBrokerSampleReader } from '../../ports/outbound/messaging/rebuild/usage-broker-sample-reader.port.js';
 import type { UsageRebuildTransaction } from '../../ports/outbound/transactions/rebuild/usage-rebuild-transaction.port.js';
 import type { UsageRebuildUnitOfWork } from '../../ports/outbound/transactions/rebuild/usage-rebuild-unit-of-work.port.js';
 import { ApplyUsageRebuildPage } from '../../use-cases/commands/rebuild/apply-usage-rebuild-page/apply-usage-rebuild-page.use-case.js';
@@ -41,6 +42,7 @@ function setup(current: UsageRebuildState): {
   readonly attachments: Mock<UsageSnapshotSource['listAttachments']>;
   readonly proof: UsageBrokerProof;
   readonly transaction: UsageRebuildTransaction;
+  readonly brokerRead: Mock<UsageBrokerSampleReader['read']>;
 } {
   const transaction: UsageRebuildTransaction = {
     lockOrganization: vi.fn().mockResolvedValue(undefined),
@@ -52,6 +54,7 @@ function setup(current: UsageRebuildState): {
     promote: vi.fn().mockResolvedValue(undefined),
     abandon: vi.fn().mockResolvedValue(undefined),
     invalidateActive: vi.fn().mockResolvedValue(true),
+    checkpointActive: vi.fn().mockResolvedValue(true),
   };
   const unit: UsageRebuildUnitOfWork = {
     async run<T>(
@@ -76,9 +79,10 @@ function setup(current: UsageRebuildState): {
     listMemberships: memberships,
     listAttachments: attachments,
   };
+  const brokerRead = vi.fn<UsageBrokerSampleReader['read']>().mockResolvedValue(sample);
   const service = new AdvanceUsageRebuild(
     { read: vi.fn().mockResolvedValue(current) },
-    { read: vi.fn().mockResolvedValue(sample) },
+    { read: brokerRead },
     proof,
     source,
     new StartUsageRebuild(unit, proof),
@@ -87,7 +91,7 @@ function setup(current: UsageRebuildState): {
     new InvalidateActiveUsage(unit),
     unit,
   );
-  return { service, memberships, attachments, proof, transaction };
+  return { service, memberships, attachments, proof, transaction, brokerRead };
 }
 
 describe('AdvanceUsageRebuild', () => {
@@ -98,6 +102,100 @@ describe('AdvanceUsageRebuild', () => {
     });
     await expect(service.advance('organization')).resolves.toBe('healthy');
     expect(transaction.startCandidate).not.toHaveBeenCalled();
+    expect(transaction.checkpointActive).not.toHaveBeenCalled();
+  });
+
+  it('advances the active continuity checkpoint when broker coverage progresses', async () => {
+    const { service, transaction, brokerRead } = setup({
+      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress },
+      candidate: null,
+    });
+    const newer = { ...sample, progress: { ...sample.progress, lastSequence: 2 } };
+    brokerRead.mockResolvedValue(newer);
+
+    await expect(service.advance('organization')).resolves.toBe('healthy');
+    expect(transaction.lockOrganization).toHaveBeenCalledOnce();
+    expect(transaction.checkpointActive).toHaveBeenCalledWith('active', 2, newer.progress);
+  });
+
+  it('preserves the active generation when checkpoint update loses the version race', async () => {
+    const { service, transaction, brokerRead } = setup({
+      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress },
+      candidate: null,
+    });
+    brokerRead.mockResolvedValue({ ...sample, progress: { ...sample.progress, lastSequence: 2 } });
+    vi.mocked(transaction.checkpointActive).mockResolvedValue(false);
+
+    await expect(service.advance('organization')).resolves.toBe('stale');
+    expect(transaction.invalidateActive).not.toHaveBeenCalled();
+  });
+
+  it('invalidates active usage when the advisory latch is uncleared or unverifiable', async () => {
+    const { service, transaction, proof, brokerRead } = setup({
+      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress },
+      candidate,
+    });
+    brokerRead.mockResolvedValue({ ...sample, advisoriesClear: false });
+    vi.mocked(proof.assess).mockReturnValue('pending');
+
+    await expect(service.advance('organization')).resolves.toBe('invalidated');
+    expect(transaction.invalidateActive).toHaveBeenCalledWith('active', null);
+    expect(transaction.abandon).toHaveBeenCalledWith(candidate.id);
+    expect(proof.assess).not.toHaveBeenCalled();
+  });
+
+  it('keeps a newly replaced active generation when invalidation is stale', async () => {
+    const { service, transaction, brokerRead } = setup({
+      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress },
+      candidate: null,
+    });
+    brokerRead.mockResolvedValue({ ...sample, advisoriesClear: false });
+    vi.mocked(transaction.invalidateActive).mockResolvedValue(false);
+
+    await expect(service.advance('organization')).resolves.toBe('stale');
+    expect(transaction.invalidateActive).toHaveBeenCalledWith('active', null);
+  });
+
+  it('abandons an uncertain candidate even if the active generation changed before locking', async () => {
+    const { service, transaction, brokerRead } = setup({
+      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress },
+      candidate,
+    });
+    brokerRead.mockResolvedValue({ ...sample, advisoriesClear: false });
+    vi.mocked(transaction.invalidateActive).mockResolvedValue(false);
+
+    await expect(service.advance('organization')).resolves.toBe('stale');
+    expect(transaction.abandon).toHaveBeenCalledWith(candidate.id);
+  });
+
+  it('waits without invalidation when no broker observation is available', async () => {
+    const { service, transaction, brokerRead } = setup({
+      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress },
+      candidate: null,
+    });
+    brokerRead.mockResolvedValue(null);
+
+    await expect(service.advance('organization')).resolves.toBe('waiting');
+    expect(transaction.invalidateActive).not.toHaveBeenCalled();
+  });
+
+  it('abandons a candidate when the advisory latch is uncleared', async () => {
+    const { service, transaction, proof, brokerRead } = setup({ active: null, candidate });
+    brokerRead.mockResolvedValue({ ...sample, advisoriesClear: false });
+    vi.mocked(proof.assess).mockReturnValue('pending');
+
+    await expect(service.advance('organization')).resolves.toBe('invalidated');
+    expect(transaction.abandon).toHaveBeenCalledWith(candidate.id);
+    expect(transaction.promote).not.toHaveBeenCalled();
+  });
+
+  it('leaves a replacement candidate intact after an unclear advisory observation', async () => {
+    const { service, transaction, brokerRead } = setup({ active: null, candidate });
+    brokerRead.mockResolvedValue({ ...sample, advisoriesClear: false });
+    vi.mocked(transaction.candidate).mockResolvedValue({ ...candidate, id: 'replacement' });
+
+    await expect(service.advance('organization')).resolves.toBe('waiting');
+    expect(transaction.abandon).not.toHaveBeenCalled();
   });
 
   it('invalidates only the sampled active generation when continuity was lost', async () => {

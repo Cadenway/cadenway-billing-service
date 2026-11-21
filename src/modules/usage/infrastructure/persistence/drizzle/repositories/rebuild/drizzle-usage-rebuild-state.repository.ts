@@ -50,7 +50,11 @@ export class DrizzleUsageRebuildStateReader implements UsageRebuildStateReader {
         if (root.activeGenerationId !== null) {
           const { row, checkpoint } = await getGeneration(root.activeGenerationId);
           if (row.status === 'ready' && checkpoint.promotion !== undefined) {
-            active = { id: row.id, version: row.version, brokerAtPromotion: checkpoint.promotion };
+            active = {
+              id: row.id,
+              version: row.version,
+              brokerAtPromotion: checkpoint.verified ?? checkpoint.promotion,
+            };
           } else if (row.status !== 'invalid') {
             throw new Error('Usage active generation has an invalid state.');
           }

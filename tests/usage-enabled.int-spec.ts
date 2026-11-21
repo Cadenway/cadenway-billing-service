@@ -240,7 +240,7 @@ describe('enabled Billing projection', () => {
     }
   });
 
-  it('reconciles a concurrent event with a captured page and records one threshold across replay', async () => {
+  it('reconciles a concurrent event, deduplicates replay and refuses usage after a terminal advisory', async () => {
     if (app === undefined || database === undefined) throw new Error('Billing did not start.');
     const signer = await InternalTokenSigner.create({
       issuer: 'api-gateway',
@@ -361,5 +361,46 @@ describe('enabled Billing projection', () => {
         { timeout: 10_000, interval: 250 },
       )
       .toBe(1);
+
+    publish(
+      '$JS.EVENT.ADVISORY.CONSUMER.MSG_TERMINATED.EVENTS.billing-service__record-member-joined',
+      { type: 'io.nats.jetstream.advisory.v1.terminated', id: 'fixture' },
+    );
+    const latch: unknown = JSON.parse(
+      compose(
+        'exec',
+        '-T',
+        'nats-streams',
+        'nats',
+        'stream',
+        'info',
+        'BILLING_REBUILD_ADVISORIES',
+        '--json',
+      ),
+    );
+    expect(latch).toMatchObject({ state: { messages: 1 } });
+    const unavailable = await subscription();
+    expect(unavailable.status).toBe(503);
+    expect(unavailable.body).toMatchObject({ code: 'billing.unavailable' });
+    expect(unavailable.headers['cache-control']).toBe('private, no-store');
+
+    await expect
+      .poll(
+        () =>
+          system.run(
+            async (scope) => {
+              const result = await scope.client.query(
+                'select active_generation_id from usage_organizations where organization_id = $1',
+                [organizationId],
+              );
+              return (
+                result.rows[0] as { readonly active_generation_id: string | null } | undefined
+              )?.active_generation_id;
+            },
+            { readOnly: true },
+          ),
+        { timeout: 15_000, interval: 250 },
+      )
+      .toBeNull();
   });
 });

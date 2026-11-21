@@ -1,8 +1,10 @@
 import type { DatabaseSchema, TenantTransactionRunner } from '@cadenway/nest-common/database';
 import { and, eq } from 'drizzle-orm';
 
+import type { UsageRebuildBrokerProgress } from '../../../../../application/models/rebuild/usage-rebuild-broker-progress.model.js';
 import type { ActiveUsageReader } from '../../../../../application/ports/outbound/persistence/usage/active-usage-reader.port.js';
 import type { UsageTotals } from '../../../../../domain/value-objects/observations/usage-totals.value-object.js';
+import { usageRebuildCheckpoint } from '../../mappers/rebuild/usage-rebuild-checkpoint.mapper.js';
 import { usageGenerations, usageOrganizations } from '../../schemas/usage/usage.schema.js';
 
 /** Reads the ready active usage generation within the signed tenant's transaction. */
@@ -13,8 +15,11 @@ export class DrizzleActiveUsageReader implements ActiveUsageReader {
   // #endregion
 
   // #region Methods
-  /** Returns the current ready totals, or null if no ready active generation exists. */
-  public read(organizationId: string): Promise<UsageTotals | null> {
+  /** Returns ready totals when the optional continuity check accepts the same generation. */
+  public read(
+    organizationId: string,
+    confirm?: (checkpoint: UsageRebuildBrokerProgress) => boolean,
+  ): Promise<UsageTotals | null> {
     return this.runner.run(
       async (scope) => {
         if (scope.kind !== 'tenant' || scope.organizationId !== organizationId) {
@@ -26,6 +31,7 @@ export class DrizzleActiveUsageReader implements ActiveUsageReader {
             seats: usageGenerations.seats,
             guests: usageGenerations.guests,
             storageBytes: usageGenerations.storageBytes,
+            streamCheckpoint: usageGenerations.streamCheckpoint,
           })
           .from(usageOrganizations)
           .innerJoin(
@@ -44,7 +50,15 @@ export class DrizzleActiveUsageReader implements ActiveUsageReader {
           )
           .limit(1);
 
-        return rows[0] ?? null;
+        const row = rows[0];
+        if (row === undefined) return null;
+        const { streamCheckpoint, ...totals } = row;
+        if (confirm !== undefined) {
+          const checkpoint = usageRebuildCheckpoint.safeParse(streamCheckpoint);
+          const frontier = checkpoint.data?.verified ?? checkpoint.data?.promotion;
+          if (frontier === undefined || !confirm(frontier)) return null;
+        }
+        return totals;
       },
       { readOnly: true },
     );

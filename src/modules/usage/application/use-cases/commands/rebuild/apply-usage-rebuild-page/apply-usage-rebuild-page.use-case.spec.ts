@@ -51,6 +51,7 @@ function setup(current: UsageRebuildCandidate | null): {
     promote: vi.fn().mockResolvedValue(undefined),
     abandon: vi.fn().mockResolvedValue(undefined),
     invalidateActive: vi.fn().mockResolvedValue(true),
+    checkpointActive: vi.fn().mockResolvedValue(true),
   };
   const unit: UsageRebuildUnitOfWork = {
     async run<T>(

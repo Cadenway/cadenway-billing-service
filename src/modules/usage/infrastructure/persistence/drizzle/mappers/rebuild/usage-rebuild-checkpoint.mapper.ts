@@ -24,4 +24,5 @@ export const usageRebuildCheckpoint = z.object({
   version: z.literal(1),
   start: brokerProgress,
   promotion: brokerProgress.optional(),
+  verified: brokerProgress.optional(),
 });

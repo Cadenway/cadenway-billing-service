@@ -300,11 +300,71 @@ export class DrizzleUsageRebuildUnitOfWork implements UsageRebuildUnitOfWork {
                 eq(usageGenerations.organizationId, organizationId),
                 eq(usageGenerations.id, generationId),
                 eq(usageGenerations.status, 'ready'),
+                version === null ? undefined : eq(usageGenerations.version, version),
+              ),
+            )
+            .returning({ id: usageGenerations.id });
+          if (invalidated.length === 0) return false;
+          await scope.db
+            .update(usageOrganizations)
+            .set({
+              activeGenerationId: null,
+              version: sql`${usageOrganizations.version} + 1`,
+              updatedAt: sql`now()`,
+            })
+            .where(eq(usageOrganizations.organizationId, organizationId));
+          activeId = null;
+          return true;
+        },
+        checkpointActive: async (generationId, version, progress) => {
+          requireLock();
+          if (activeId !== generationId) return false;
+          const rows = await scope.db
+            .select({
+              checkpoint: usageGenerations.streamCheckpoint,
+              checkpointVersion: usageGenerations.checkpointVersion,
+            })
+            .from(usageGenerations)
+            .where(
+              and(
+                eq(usageGenerations.organizationId, organizationId),
+                eq(usageGenerations.id, generationId),
+                eq(usageGenerations.status, 'ready'),
+                eq(usageGenerations.version, version),
+              ),
+            )
+            .limit(1);
+          const row = rows[0];
+          if (row === undefined) return false;
+          const current = usageRebuildCheckpoint.safeParse(row.checkpoint);
+          if (
+            row.checkpointVersion !== 1 ||
+            !current.success ||
+            current.data.promotion === undefined
+          ) {
+            throw new Error('Usage active checkpoint is invalid.');
+          }
+          const updatedCheckpoint = usageRebuildCheckpoint.parse({
+            ...current.data,
+            verified: progress,
+          });
+          const updated = await scope.db
+            .update(usageGenerations)
+            .set({
+              streamCheckpoint: updatedCheckpoint,
+              version: sql`${usageGenerations.version} + 1`,
+              updatedAt: sql`now()`,
+            })
+            .where(
+              and(
+                eq(usageGenerations.organizationId, organizationId),
+                eq(usageGenerations.id, generationId),
+                eq(usageGenerations.status, 'ready'),
                 eq(usageGenerations.version, version),
               ),
             )
             .returning({ id: usageGenerations.id });
-          return invalidated.length === 1;
+          return updated.length === 1;
         },
         abandon: async (generationId) => {
           requireCandidate(generationId);

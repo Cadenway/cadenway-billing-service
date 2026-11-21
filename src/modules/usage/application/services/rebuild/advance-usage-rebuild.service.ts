@@ -1,4 +1,6 @@
 import { UsageSnapshotReadError } from '../../../domain/errors/usage-snapshot/usage-snapshot-read.error.js';
+import type { ActiveUsageGeneration } from '../../models/rebuild/active-usage-generation.model.js';
+import type { UsageRebuildBrokerProgress } from '../../models/rebuild/usage-rebuild-broker-progress.model.js';
 import type { UsageRebuildCandidate } from '../../models/rebuild/usage-rebuild-candidate.model.js';
 import type { UsageSnapshotSource } from '../../ports/outbound/http/snapshot/usage-snapshot-source.port.js';
 import type { UsageBrokerProof } from '../../ports/outbound/messaging/rebuild/usage-broker-proof.port.js';
@@ -37,18 +39,30 @@ export class AdvanceUsageRebuild {
     const observation = await this.broker.read(signal);
     if (observation === null) return 'waiting';
 
+    if (!observation.advisoriesClear) {
+      return this.invalidateUncertain(organizationId, current.active, current.candidate);
+    }
+
     if (current.active !== null) {
+      const active = current.active;
       const health = this.proof.assess(
-        current.active.brokerAtPromotion,
+        active.brokerAtPromotion,
         observation.progress,
         observation.advisoriesClear,
       );
       if (health === 'lost') {
         return this.invalidateActive.execute({
           organizationId,
-          generationId: current.active.id,
-          expectedVersion: current.active.version,
+          generationId: active.id,
+          expectedVersion: active.version,
         });
+      }
+      if (health === 'covered' && !sameProgress(active.brokerAtPromotion, observation.progress)) {
+        const updated = await this.unitOfWork.run(organizationId, async (transaction) => {
+          await transaction.lockOrganization();
+          return transaction.checkpointActive(active.id, active.version, observation.progress);
+        });
+        if (!updated) return 'stale';
       }
       if (current.candidate === null) return health === 'covered' ? 'healthy' : 'waiting';
     }
@@ -71,8 +85,6 @@ export class AdvanceUsageRebuild {
       observation.advisoriesClear,
     );
     if (continuity === 'lost') return this.abandon(organizationId, candidate);
-    if (!observation.advisoriesClear) return 'waiting';
-
     if (candidate.membership.complete && candidate.attachment.complete) {
       const result = await this.promote.execute({
         organizationId,
@@ -125,5 +137,54 @@ export class AdvanceUsageRebuild {
       return 'invalidated';
     });
   }
+
+  private invalidateUncertain(
+    organizationId: string,
+    active: ActiveUsageGeneration | null,
+    candidate: UsageRebuildCandidate | null,
+  ): Promise<'waiting' | 'stale' | 'invalidated'> {
+    return this.unitOfWork.run(organizationId, async (transaction) => {
+      await transaction.lockOrganization();
+      const selectedCandidate = await transaction.candidate();
+      const invalidateCandidate = candidate !== null && selectedCandidate?.id === candidate.id;
+      if (active !== null) {
+        // The generation crossed the unconfirmed interval even if an event advanced its version.
+        const invalidated = await transaction.invalidateActive(active.id, null);
+        if (!invalidated) {
+          if (invalidateCandidate) await transaction.abandon(selectedCandidate.id);
+          return 'stale';
+        }
+      }
+      if (invalidateCandidate) {
+        await transaction.abandon(selectedCandidate.id);
+      }
+      return active !== null || invalidateCandidate ? 'invalidated' : 'waiting';
+    });
+  }
   // #endregion
+}
+
+function sameProgress(
+  left: UsageRebuildBrokerProgress,
+  right: UsageRebuildBrokerProgress,
+): boolean {
+  return (
+    left.stream === right.stream &&
+    left.createdAt === right.createdAt &&
+    left.firstSequence === right.firstSequence &&
+    left.lastSequence === right.lastSequence &&
+    left.retainedGapCount === right.retainedGapCount &&
+    left.consumers.length === right.consumers.length &&
+    left.consumers.every((consumer) =>
+      right.consumers.some(
+        (other) =>
+          consumer.handler === other.handler &&
+          consumer.createdAt === other.createdAt &&
+          consumer.deliveredSequence === other.deliveredSequence &&
+          consumer.ackFloorSequence === other.ackFloorSequence &&
+          consumer.pending === other.pending &&
+          consumer.ackPending === other.ackPending,
+      ),
+    )
+  );
 }

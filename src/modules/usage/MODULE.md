@@ -26,7 +26,9 @@ writes verify the current generation pointers under the organization lock before
 
 `GET /internal/v1/billing/subscription` accepts a gateway token with a user actor and a verified
 organization. The gateway proves that the user is an active owner. The endpoint reads the
-current ready projection and reports an unavailable baseline with `503 billing.unavailable`.
+current ready projection when usage ingestion is enabled and a bounded JetStream sample confirms
+continuity against the selected generation's checkpoint. This sample also checks that the terminal
+delivery latch is empty. Otherwise it returns `503 billing.unavailable`.
 All responses use `Cache-Control: private, no-store`.
 
 ## Events emitted

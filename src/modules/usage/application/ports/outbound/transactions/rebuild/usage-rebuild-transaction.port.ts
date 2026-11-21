@@ -45,7 +45,17 @@ export interface UsageRebuildTransaction {
   /** Marks a candidate invalid and clears its pointer. The previous active generation remains. */
   readonly abandon: (generationId: string) => Promise<void>;
 
-  /** Invalidates the still-selected active generation only at the observed row version. */
-  readonly invalidateActive: (generationId: string, expectedVersion: number) => Promise<boolean>;
+  /** Invalidates the still-selected generation, optionally checking its observed row version. */
+  readonly invalidateActive: (
+    generationId: string,
+    expectedVersion: number | null,
+  ) => Promise<boolean>;
+
+  /** Records a covered broker frontier for the still-current active row version. */
+  readonly checkpointActive: (
+    generationId: string,
+    expectedVersion: number,
+    progress: UsageRebuildBrokerProgress,
+  ) => Promise<boolean>;
   // #endregion
 }
