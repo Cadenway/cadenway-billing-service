@@ -39,7 +39,7 @@ export const reconcileStripeCheckoutProvider: FactoryProvider<ReconcileStripeChe
       { seatLimit: seats, storageByteLimit: storageBytes },
       new StripeEntitlementOutbox(writer),
     );
-    const settlement = new DrizzleStripeCheckoutSettlement(tenant, fence, liveMode);
+    const settlement = new DrizzleStripeCheckoutSettlement(tenant, fence, liveMode, seats);
     return new ReconcileStripeCheckout(
       new DrizzleStripeCheckoutAttemptReader(system),
       createStripeCheckoutSessionReader(key, liveMode),

@@ -45,7 +45,10 @@ function fixture(entitlement: BillingEntitlement = free) {
   return {
     fetch,
     readEntitlement,
-    ...createOrganizationCheckoutAuthority({ fetch }, readEntitlement, settings),
+    ...createOrganizationCheckoutAuthority({ fetch }, readEntitlement, {
+      ...settings,
+      freeSeatLimit: free.seatLimit,
+    }),
   };
 }
 
@@ -72,9 +75,34 @@ describe('Organization Checkout seat authority', () => {
     ]);
   });
 
+  it.each([1, 2, 3, 4, 6])(
+    'uses the exact paid quantity for %s active billable seats',
+    async (quantity) => {
+      const authority = fixture();
+      const removed = { memberId: memberId(8), state: 'removed', version: 2 };
+      const guest = { memberId: memberId(7), state: 'active', role: 'guest', version: 1 };
+      const active = Array.from({ length: quantity }, (_, index) => ({
+        memberId: memberId(index + 1),
+        state: 'active',
+        role: index === 0 ? 'owner' : 'member',
+        version: 1,
+      }));
+      authority.fetch.mockResolvedValueOnce(
+        snapshot({ ...page, items: [...active, guest, removed] }),
+      );
+
+      await expect(authority.prepare(organizationId, providerKey)).resolves.toEqual({
+        organizationId,
+        providerKey,
+        ...settings,
+        quantity,
+      });
+    },
+  );
+
   it.each([
     { ...page, nextCursor: 'valid-continuation' },
-    { ...page, items: page.items.slice(0, -1) },
+    { ...page, items: page.items.slice(2, 4) },
     { ...page, items: [...page.items, page.items[0]] },
     { ...page, items: [{ ...page.items[0], role: 'external' }, ...page.items.slice(1)] },
     {
@@ -86,6 +114,12 @@ describe('Organization Checkout seat authority', () => {
     authority.fetch.mockResolvedValueOnce(snapshot(invalid));
     await expect(authority.prepare(organizationId, providerKey)).resolves.toBeNull();
     expect(authority.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses Checkout if the effective Team allowance would reduce the existing seat limit', async () => {
+    const authority = fixture({ ...free, seatLimit: 6 });
+    authority.fetch.mockResolvedValueOnce(snapshot(page));
+    await expect(authority.prepare(organizationId, providerKey)).resolves.toBeNull();
   });
 
   it.each([

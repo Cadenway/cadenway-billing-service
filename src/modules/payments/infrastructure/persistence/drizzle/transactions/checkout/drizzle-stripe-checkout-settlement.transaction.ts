@@ -2,6 +2,7 @@ import type { DatabaseSchema, TenantTransactionRunner } from '@cadenway/nest-com
 import { z } from 'zod';
 
 import type { StripeCheckoutSettlement } from '../../../../../application/ports/outbound/transactions/checkout/stripe-checkout-settlement.port.js';
+import { effectiveTeamSeatLimit } from '../../../../../domain/policies/subscriptions/stripe-subscription.policy.js';
 import type { StripeSubscriptionDecision } from '../../../../../domain/value-objects/subscriptions/stripe-subscription-decision.value-object.js';
 import { lockBillingEntitlement } from '../subscriptions/lock-billing-entitlement.transaction.js';
 import type { StripeEntitlementFence } from '../subscriptions/stripe-entitlement-fence.transaction.js';
@@ -9,6 +10,7 @@ import type { StripeEntitlementFence } from '../subscriptions/stripe-entitlement
 const reservation = z.object({
   id: z.uuid(),
   provider_started_at: z.date().nullable(),
+  provider_session_id: z.string().nullable(),
   price_id: z.string().nullable(),
   quantity: z.coerce.number().int().nullable(),
   resolved_at: z.date().nullable(),
@@ -27,11 +29,12 @@ const stripeBinding = z.object({ customer_id: z.string(), subscription_id: z.str
 /** Commits a verified terminal Checkout and its entitlement in one tenant transaction. */
 export class DrizzleStripeCheckoutSettlement implements StripeCheckoutSettlement {
   // #region Constructor
-  /** Supplies tenant isolation, the shared quota fence and the configured Stripe mode. */
+  /** Supplies tenant isolation, the shared quota fence, Stripe mode and the Free seat allowance. */
   public constructor(
     private readonly runner: TenantTransactionRunner<DatabaseSchema>,
     private readonly fence: StripeEntitlementFence,
     private readonly liveMode: boolean,
+    private readonly freeSeatLimit: number,
   ) {}
   // #endregion
 
@@ -44,7 +47,7 @@ export class DrizzleStripeCheckoutSettlement implements StripeCheckoutSettlement
     if (
       session.liveMode !== this.liveMode ||
       !/^[!-~]{1,255}$/u.test(eventId) ||
-      !/^[!-~]{1,255}$/u.test(session.sessionId) ||
+      !/^cs_[A-Za-z0-9_]{1,252}$/u.test(session.sessionId) ||
       !/^[!-~]{1,255}$/u.test(session.providerKey)
     )
       return 'retry';
@@ -65,7 +68,7 @@ export class DrizzleStripeCheckoutSettlement implements StripeCheckoutSettlement
       if (settled.rows.length !== 0) return 'duplicate';
 
       const attempts = await scope.client.query(
-        `select id, provider_started_at, price_id, quantity, resolved_at
+        `select id, provider_started_at, provider_session_id, price_id, quantity, resolved_at
          from stripe_checkout_attempts
          where organization_id = $1 and provider_key = $2
          limit 1 for update`,
@@ -73,7 +76,11 @@ export class DrizzleStripeCheckoutSettlement implements StripeCheckoutSettlement
       );
       if (attempts.rows.length !== 1) return 'retry';
       const attempt = reservation.parse(attempts.rows[0]);
-      if (attempt.provider_started_at === null) return 'retry';
+      if (
+        attempt.provider_started_at === null ||
+        (attempt.provider_session_id !== null && attempt.provider_session_id !== session.sessionId)
+      )
+        return 'retry';
 
       if (attempt.resolved_at !== null) {
         const prior = await scope.client.query(
@@ -93,14 +100,16 @@ export class DrizzleStripeCheckoutSettlement implements StripeCheckoutSettlement
         return 'duplicate';
       }
 
+      let outcome: 'applied' | 'unchanged' | 'expired';
       if (session.status === 'expired') {
         if (decision !== null) return 'retry';
+        outcome = 'expired';
       } else {
         if (
           decision?.plan !== 'team' ||
           session.priceId !== attempt.price_id ||
           session.quantity !== attempt.quantity ||
-          decision.limits.seats !== session.quantity ||
+          decision.limits.seats !== effectiveTeamSeatLimit(session.quantity, this.freeSeatLimit) ||
           !session.customerId ||
           !session.subscriptionId
         )
@@ -190,22 +199,15 @@ export class DrizzleStripeCheckoutSettlement implements StripeCheckoutSettlement
             [organizationId, decision.scheduledCancellation],
           );
         }
-        await scope.client.query(
-          'update stripe_checkout_attempts set resolved_at = now(), lease_token = null, lease_expires_at = null, updated_at = now(), version = version + 1 where organization_id = $1 and id = $2',
-          [organizationId, attempt.id],
-        );
-        await scope.client.query(
-          `insert into stripe_checkout_receipts
-             (organization_id, event_id, provider_key, session_id, terminal_status)
-           values ($1, $2, $3, $4, $5)`,
-          [organizationId, eventId, session.providerKey, session.sessionId, session.status],
-        );
-        return changed ? 'applied' : 'unchanged';
+        outcome = changed ? 'applied' : 'unchanged';
       }
 
       await scope.client.query(
-        'update stripe_checkout_attempts set resolved_at = now(), lease_token = null, lease_expires_at = null, updated_at = now(), version = version + 1 where organization_id = $1 and id = $2',
-        [organizationId, attempt.id],
+        `update stripe_checkout_attempts
+         set resolved_at = now(), lease_token = null, lease_expires_at = null,
+             provider_session_id = $3, updated_at = now(), version = version + 1
+         where organization_id = $1 and id = $2`,
+        [organizationId, attempt.id, session.sessionId],
       );
       await scope.client.query(
         `insert into stripe_checkout_receipts
@@ -213,7 +215,7 @@ export class DrizzleStripeCheckoutSettlement implements StripeCheckoutSettlement
          values ($1, $2, $3, $4, $5)`,
         [organizationId, eventId, session.providerKey, session.sessionId, session.status],
       );
-      return 'expired';
+      return outcome;
     });
   }
   // #endregion

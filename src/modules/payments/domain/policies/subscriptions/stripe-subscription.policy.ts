@@ -4,6 +4,11 @@ import type { StripeSubscriptionReconciliation } from '../../value-objects/subsc
 /** The storage grant applied to a Team subscription. */
 export const teamStorageByteLimit = 100_000_000_000;
 
+/** Keeps the effective Team seat allowance at least as large as the Free allowance. */
+export function effectiveTeamSeatLimit(paidQuantity: number, freeSeatLimit: number): number {
+  return Math.max(paidQuantity, freeSeatLimit);
+}
+
 /**
  * Resolves the self-service Team entitlement from an allowlisted Stripe subscription. The
  * [Stripe lifecycle](https://docs.stripe.com/api/subscriptions/object#subscription_object-status)
@@ -55,7 +60,10 @@ export function resolveStripeSubscription({
     return {
       kind: 'apply',
       plan: 'team',
-      limits: { seats: item.quantity, storageBytes: teamStorageByteLimit },
+      limits: {
+        seats: effectiveTeamSeatLimit(item.quantity, settings.freePlanLimits.seats),
+        storageBytes: teamStorageByteLimit,
+      },
       scheduledCancellation: subscription.scheduledCancellation,
     };
   }

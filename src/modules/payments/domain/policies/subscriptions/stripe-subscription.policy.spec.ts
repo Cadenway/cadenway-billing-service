@@ -52,6 +52,18 @@ describe('Stripe subscription reconciliation', () => {
     });
   });
 
+  it.each([1, 2, 3, 4, 5])(
+    'maintains the Free seat allowance for a Team subscription with %s paid seats',
+    (quantity) => {
+      expect(reconcile({ items: [{ priceId: 'price_team_fixture', quantity }] })).toEqual({
+        kind: 'apply',
+        plan: 'team',
+        limits: { seats: 5, storageBytes: 100_000_000_000 },
+        scheduledCancellation: false,
+      });
+    },
+  );
+
   it('accepts a configured annual Team price in a live Stripe account', () => {
     expect(
       resolveStripeSubscription({
@@ -64,7 +76,7 @@ describe('Stripe subscription reconciliation', () => {
         },
         confirmedUsage: null,
       }),
-    ).toMatchObject({ kind: 'apply', plan: 'team', limits: { seats: 1 } });
+    ).toMatchObject({ kind: 'apply', plan: 'team', limits: { seats: 5 } });
   });
 
   it.each(['canceled', 'incomplete_expired'])(

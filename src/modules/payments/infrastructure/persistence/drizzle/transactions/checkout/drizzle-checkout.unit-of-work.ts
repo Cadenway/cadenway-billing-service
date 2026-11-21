@@ -10,6 +10,7 @@ import { z } from 'zod';
 
 import type { CheckoutClaim } from '../../../../../application/models/checkout/checkout-claim.model.js';
 import type { CheckoutProviderRequest } from '../../../../../application/models/checkout/checkout-provider-request.model.js';
+import type { CheckoutRecoveryTarget } from '../../../../../application/models/checkout/checkout-recovery-target.model.js';
 import type { CheckoutUnitOfWork } from '../../../../../application/ports/outbound/transactions/checkout/checkout-unit-of-work.port.js';
 import type { StartBillingCheckoutInput } from '../../../../../application/use-cases/commands/checkout/start-billing-checkout/start-billing-checkout.input.js';
 import { lockBillingEntitlement } from '../subscriptions/lock-billing-entitlement.transaction.js';
@@ -24,19 +25,36 @@ const checkoutRowSchema = z.object({
   cancel_url: z.string().nullable(),
   response_url: z.string().nullable(),
   provider_started: z.boolean(),
-  provider_retained: z.boolean().nullable(),
+  provider_expires_at: z.string().transform(Number).pipe(z.number().int().positive()).nullable(),
   replayable: z.boolean().nullable(),
   leased: z.boolean().nullable(),
   resolved: z.boolean(),
 });
+
+const recoveryRowSchema = z.object({
+  provider_key: z.string(),
+  provider_started_at: z.date(),
+  provider_session_id: z.string().nullable(),
+  price_id: z.string(),
+  quantity: z.string().transform(Number).pipe(z.number().int().positive()),
+  provider_expires_at: checkoutRowSchema.shape.provider_expires_at,
+});
+const stripeSessionId = /^cs_[A-Za-z0-9_]{1,252}$/u;
 
 type CheckoutRow = z.infer<typeof checkoutRowSchema>;
 
 /** Serializes durable checkout leases without holding a transaction over provider I/O. */
 export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
   // #region Constructor
-  /** Requires the tenant-scoped transaction runner. */
-  public constructor(private readonly runner: TenantTransactionRunner<DatabaseSchema>) {}
+  /** Binds provider dispatch to the credential digest and the tenant-scoped runner. */
+  public constructor(
+    private readonly runner: TenantTransactionRunner<DatabaseSchema>,
+    private readonly dispatchKeyDigest: string,
+  ) {
+    if (!/^[a-f0-9]{64}$/u.test(dispatchKeyDigest)) {
+      throw new Error('Checkout dispatch requires a valid credential digest.');
+    }
+  }
   // #endregion
 
   // #region Methods
@@ -50,8 +68,8 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
       await this.lockCheckout(scope, input.organizationId);
       const found = await scope.client.query(
         `select id, plan, provider_key, price_id, quantity, success_url, cancel_url, response_url,
+           provider_expires_at,
            provider_started_at is not null as provider_started,
-           provider_started_at > clock_timestamp() - interval '23 hours 55 minutes' as provider_retained,
            completed_at > clock_timestamp() - interval '24 hours' as replayable,
            lease_expires_at > clock_timestamp() as leased,
            resolved_at is not null as resolved
@@ -84,17 +102,15 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
       }
 
       if (existing) {
-        if (existing.resolved || (existing.provider_started && !existing.provider_retained)) {
-          return { status: 'unavailable' };
-        }
+        if (existing.resolved) return { status: 'unavailable' };
         if (existing.leased) return { status: 'request-in-progress' };
         return this.claimRow(scope, input.organizationId, existing);
       }
 
       const active = await scope.client.query(
         `select id, plan, provider_key, price_id, quantity, success_url, cancel_url, response_url,
+           provider_expires_at,
            provider_started_at is not null as provider_started,
-           provider_started_at > clock_timestamp() - interval '23 hours 55 minutes' as provider_retained,
            completed_at > clock_timestamp() - interval '24 hours' as replayable,
            lease_expires_at > clock_timestamp() as leased,
            resolved_at is not null as resolved
@@ -117,7 +133,7 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
          insert into stripe_checkout_attempts (id, organization_id, actor_id, key_digest, plan, provider_key)
          select id, $1, $2, $3, $4, 'checkout_' || id::text from generated
          returning id, plan, provider_key, price_id, quantity, success_url, cancel_url, response_url,
-           false as provider_started, false as provider_retained, false as replayable,
+           provider_expires_at, false as provider_started, false as replayable,
            false as leased, false as resolved`,
         [input.organizationId, input.actorId, digest, input.plan],
       );
@@ -133,10 +149,14 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
     token: string,
     request: CheckoutProviderRequest,
   ): Promise<boolean> {
+    const expiresAt = request.expiresAt;
     if (
       request.organizationId !== organizationId ||
       !Number.isSafeInteger(request.quantity) ||
-      request.quantity < 1
+      request.quantity < 1 ||
+      expiresAt === undefined ||
+      !Number.isSafeInteger(expiresAt) ||
+      expiresAt < 1
     )
       return false;
     assertNoActiveTransaction();
@@ -148,6 +168,8 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
         `update stripe_checkout_attempts
          set price_id = coalesce(price_id, $4), quantity = coalesce(quantity, $5),
              success_url = coalesce(success_url, $6), cancel_url = coalesce(cancel_url, $7),
+             provider_expires_at = coalesce(provider_expires_at, $8::bigint),
+             provider_dispatch_key_digest = coalesce(provider_dispatch_key_digest, $9),
              provider_started_at = coalesce(provider_started_at, clock_timestamp()),
              updated_at = clock_timestamp(), version = version + 1
          where organization_id = $1 and lease_token = $2 and provider_key = $3
@@ -155,9 +177,14 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
            and not exists (
              select 1 from stripe_bindings where organization_id = $1
            )
-           and (provider_started_at is null or (
+           and $8::bigint > extract(epoch from clock_timestamp() + interval '31 minutes')
+           and ((provider_started_at is null and
+             $8::bigint <= extract(epoch from clock_timestamp() + interval '2 hours 5 minutes'))
+             or (
              provider_started_at > clock_timestamp() - interval '23 hours 55 minutes'
              and price_id = $4 and quantity = $5 and success_url = $6 and cancel_url = $7
+             and provider_expires_at = $8::bigint
+             and provider_dispatch_key_digest = $9
            ))
          returning id`,
         [
@@ -168,25 +195,66 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
           request.quantity,
           request.successUrl,
           request.cancelUrl,
+          expiresAt,
+          this.dispatchKeyDigest,
         ],
       );
       return result.rows.length === 1;
     });
   }
 
+  /** Reads only this tenant's unresolved provider request for a read-only recovery check. */
+  public async findUnresolved(organizationId: string): Promise<CheckoutRecoveryTarget | null> {
+    assertNoActiveTransaction();
+    return this.runner.run(
+      async (scope) => {
+        this.assertTenant(scope, organizationId);
+        const result = await scope.client.query(
+          `select provider_key, provider_started_at, provider_session_id, price_id, quantity, provider_expires_at
+           from stripe_checkout_attempts
+           where organization_id = $1 and resolved_at is null and provider_started_at is not null
+           limit 1`,
+          [organizationId],
+        );
+        const raw = result.rows[0];
+        if (raw === undefined) return null;
+        const row = recoveryRowSchema.parse(raw);
+        return {
+          organizationId,
+          providerKey: row.provider_key,
+          providerStartedAt: row.provider_started_at,
+          sessionId: row.provider_session_id,
+          priceId: row.price_id,
+          quantity: row.quantity,
+          expiresAt: row.provider_expires_at ?? undefined,
+        };
+      },
+      { readOnly: true },
+    );
+  }
+
   /** Stores the response only for the unexpired lease that issued the request. */
-  public async complete(organizationId: string, token: string, url: string): Promise<boolean> {
+  public async complete(
+    organizationId: string,
+    token: string,
+    url: string,
+    sessionId?: string,
+  ): Promise<boolean> {
+    if (sessionId !== undefined && !stripeSessionId.test(sessionId)) return false;
     assertNoActiveTransaction();
     return this.runner.run(async (scope) => {
       this.assertTenant(scope, organizationId);
       const result = await scope.client.query(
         `update stripe_checkout_attempts
-         set response_url = $3, completed_at = now(), lease_token = null, lease_expires_at = null,
+         set response_url = $3, provider_session_id = coalesce(provider_session_id, $4::text),
+             completed_at = now(), lease_token = null, lease_expires_at = null,
              updated_at = now(), version = version + 1
          where organization_id = $1 and lease_token = $2 and lease_expires_at > clock_timestamp()
            and provider_started_at is not null and response_url is null and resolved_at is null
+           and (provider_expires_at is null or $4::text is not null)
+           and (provider_session_id is null or provider_session_id = $4::text)
          returning id`,
-        [organizationId, token, url],
+        [organizationId, token, url, sessionId ?? null],
       );
       return result.rows.length === 1;
     });
@@ -257,6 +325,7 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
         quantity,
         successUrl: row.success_url,
         cancelUrl: row.cancel_url,
+        ...(row.provider_expires_at === null ? {} : { expiresAt: row.provider_expires_at }),
       };
     }
     return { status: 'claimed', token, providerKey: row.provider_key, request };

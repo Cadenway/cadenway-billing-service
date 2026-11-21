@@ -171,4 +171,104 @@ describe('ReconcileStripeCheckout', () => {
     vi.mocked(settlement.settle).mockResolvedValue('retry');
     await expect(useCase.execute(input)).resolves.toEqual({ status: 'retry' });
   });
+
+  it.each([1, 2, 3, 4])(
+    'settles a recovered purchase of %i seats with the five-seat entitlement floor',
+    async (quantity) => {
+      const { useCase, attempts, sessions, subscriptions, settlement } = setup();
+      const session = { ...completed, quantity };
+      vi.mocked(sessions.retrieve).mockResolvedValue(session);
+      vi.mocked(subscriptions.retrieve).mockResolvedValue({
+        ...subscription,
+        items: [{ priceId: session.priceId, quantity }],
+      });
+
+      await expect(
+        useCase.recover('tenant-a', session.providerKey, session.sessionId),
+      ).resolves.toBe('paid');
+      expect(attempts.hasSettlement).not.toHaveBeenCalled();
+      expect(attempts.resolve).not.toHaveBeenCalled();
+      expect(settlement.settle).toHaveBeenCalledExactlyOnceWith({
+        organizationId: 'tenant-a',
+        eventId: `checkout-poll:${session.sessionId}`,
+        session,
+        decision: {
+          kind: 'apply',
+          plan: 'team',
+          limits: { seats: settings.freePlanLimits.seats, storageBytes: 100_000_000_000 },
+          scheduledCancellation: false,
+        },
+      });
+    },
+  );
+
+  it('rejects mismatched purchased quantities that would grant the same effective limit', async () => {
+    const { useCase, sessions, subscriptions, settlement } = setup();
+    const session = { ...completed, quantity: 3 };
+    vi.mocked(sessions.retrieve).mockResolvedValue(session);
+    vi.mocked(subscriptions.retrieve).mockResolvedValue({
+      ...subscription,
+      items: [{ priceId: session.priceId, quantity: 4 }],
+    });
+
+    await expect(useCase.recover('tenant-a', session.providerKey, session.sessionId)).resolves.toBe(
+      'unknown',
+    );
+    await expect(useCase.execute(input)).resolves.toEqual({ status: 'retry' });
+    expect(settlement.settle).not.toHaveBeenCalled();
+  });
+
+  it('keeps a matching Stripe session outside settlement if its reservation key changed', async () => {
+    const { useCase, subscriptions, settlement } = setup();
+
+    await expect(useCase.recover('tenant-a', 'checkout_other', completed.sessionId)).resolves.toBe(
+      'unknown',
+    );
+    expect(subscriptions.retrieve).not.toHaveBeenCalled();
+    expect(settlement.settle).not.toHaveBeenCalled();
+  });
+
+  it('uses the same reservation and decision when poll and webhook race', async () => {
+    const { useCase, settlement } = setup();
+    const settle = vi.mocked(settlement.settle);
+    settle.mockResolvedValue('duplicate');
+
+    await expect(
+      Promise.all([
+        useCase.recover('tenant-a', completed.providerKey, completed.sessionId),
+        useCase.execute(input),
+      ]),
+    ).resolves.toEqual(['paid', { status: 'duplicate' }]);
+    const poll = settle.mock.calls.find(([command]) => command.eventId !== input.eventId)?.[0];
+    const webhook = settle.mock.calls.find(([command]) => command.eventId === input.eventId)?.[0];
+    expect(poll).toBeDefined();
+    expect(webhook).toBeDefined();
+    expect(poll).toEqual({ ...webhook, eventId: `checkout-poll:${completed.sessionId}` });
+  });
+
+  it('reports recovered expiration only after committing its terminal proof', async () => {
+    const { useCase, sessions, subscriptions, settlement } = setup();
+    const expired = {
+      status: 'expired',
+      liveMode: false,
+      providerKey: completed.providerKey,
+      sessionId: completed.sessionId,
+    } as const;
+    vi.mocked(sessions.retrieve).mockResolvedValue(expired);
+    vi.mocked(settlement.settle).mockResolvedValueOnce('retry').mockResolvedValueOnce('expired');
+
+    await expect(useCase.recover('tenant-a', expired.providerKey, expired.sessionId)).resolves.toBe(
+      'unknown',
+    );
+    await expect(useCase.recover('tenant-a', expired.providerKey, expired.sessionId)).resolves.toBe(
+      'expired',
+    );
+    expect(subscriptions.retrieve).not.toHaveBeenCalled();
+    expect(settlement.settle).toHaveBeenLastCalledWith({
+      organizationId: 'tenant-a',
+      eventId: `checkout-poll:${completed.sessionId}`,
+      session: expired,
+      decision: null,
+    });
+  });
 });

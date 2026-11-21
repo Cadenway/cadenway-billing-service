@@ -39,6 +39,9 @@ Migration `0006_stripe_checkout_attempts.sql` adds the Checkout table with force
 Migration `0007_stripe_checkout_settlement.sql` adds the receipt table with forced RLS and
 unique provider keys. Global webhook lookup policies permit reads only for the exact provider
 key or event ID selected in the system transaction.
+Migration `0008_stripe_checkout_recovery.sql` adds the provider's session ID, immutable
+expiration deadline and a digest of the dispatch credential. These fields are nullable
+for attempts submitted by the earlier binary.
 
 ## API
 
@@ -122,9 +125,21 @@ this settlement commits. The endpoint does not store raw provider deliveries.
   Any Checkout with a saved provider request stays exclusive until a durable reconciliation
   proves its outcome. The provider call and that reconciliation are separate from reservation.
 - Checkout creation requires one complete Organization membership page and charges the current
-  number of active billable seats. Creation refuses any paid quantity that would lower the
-  committed seat limit. A paid session matching its reservation records the initial binding,
-  entitlement, receipt and outbox fact in one tenant transaction.
-- Start refuses creation for an organization with an existing Stripe binding. A submitted
-  attempt with an unknown provider outcome retains its reservation when the idempotency
-  key approaches the provider's retention limit. An authenticated terminal delivery resolves it.
+  number of active billable seats. Team admission capacity is at least the Free seat limit.
+  Creation refuses a lower effective quota than the committed quota. A paid session matching
+  its reservation records the initial binding, entitlement, receipt and outbox fact in one
+  tenant transaction.
+- Start refuses creation for an organization with an existing Stripe binding. Before sending
+  any new request, Billing commits its exact Stripe parameters, including an absolute two-hour
+  expiration. Every POST uses that same deadline and idempotency key. The database and adapter
+  stop sending POSTs before the expiration gets too close to Stripe's minimum lifetime. A
+  changed Stripe credential allows only read-only recovery for existing reservations.
+- A retry can read the saved Stripe session ID or locate a unique matching provider reference
+  through a bounded list followed by a canonical read. A verified open URL can be returned
+  only to the original actor and idempotency key. A paid session goes through the same
+  settlement transaction as a webhook. A verified expired session with no payment or
+  subscription can release the reservation. A missing, pending or ambiguous response keeps it
+  reserved. Historical requests without a stored expiration use read-only recovery.
+- Older Checkout dispatchers predate the immutable deadline. Stop them before enabling the
+  new path. The additive schema remains readable by the previous binary. Keep Checkout
+  creation disabled if reverting to that binary while newer reservations remain open.

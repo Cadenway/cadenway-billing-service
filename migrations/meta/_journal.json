@@ -57,6 +57,13 @@
       "when": 1795284743135,
       "tag": "0007_stripe_checkout_settlement",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1795292776075,
+      "tag": "0008_stripe_checkout_recovery",
+      "breakpoints": true
     }
   ]
 }

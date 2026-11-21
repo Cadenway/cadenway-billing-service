@@ -1,5 +1,6 @@
 import { resolveStripeSubscription } from '../../../../../domain/policies/subscriptions/stripe-subscription.policy.js';
 import type { StripeSubscriptionReconciliation } from '../../../../../domain/value-objects/subscriptions/stripe-subscription-reconciliation.value-object.js';
+import type { StripeCheckoutSession } from '../../../../models/checkout/stripe-checkout-session.model.js';
 import type { StripeCheckoutAttemptReader } from '../../../../ports/outbound/persistence/checkout/stripe-checkout-attempt-reader.port.js';
 import type { StripeCheckoutSessionReader } from '../../../../ports/outbound/providers/checkout/stripe-checkout-session-reader.port.js';
 import type { StripeSubscriptionProvider } from '../../../../ports/outbound/providers/subscriptions/stripe-subscription-provider.port.js';
@@ -27,25 +28,55 @@ export class ReconcileStripeCheckout {
   ): Promise<ReconcileStripeCheckoutOutput> {
     if (await this.attempts.hasSettlement(input.eventId)) return { status: 'duplicate' };
 
-    const session = await this.sessions.retrieve(input.sessionId);
-    if (
-      session.status === 'pending' ||
-      session.sessionId !== input.sessionId ||
-      session.liveMode !== this.settings.liveMode ||
-      session.providerKey.length === 0
-    )
-      return { status: 'retry' };
-
+    const session = await this.readTerminal(input.sessionId);
+    if (session === null) return { status: 'retry' };
     const attempt = await this.attempts.resolve(session.providerKey);
     if (attempt === null) {
       return { status: (await this.attempts.hasSettlement(input.eventId)) ? 'duplicate' : 'retry' };
     }
 
+    return this.settle(attempt.organizationId, input.eventId, session);
+  }
+
+  /** Reconciles a positive read anchored to a reservation from the current organization. */
+  public async recover(
+    organizationId: string,
+    providerKey: string,
+    sessionId: string,
+  ): Promise<'paid' | 'expired' | 'unknown'> {
+    const session = await this.readTerminal(sessionId);
+    if (session?.providerKey !== providerKey) return 'unknown';
+    const result = await this.settle(organizationId, `checkout-poll:${sessionId}`, session);
+    if (result.status === 'retry') return 'unknown';
+    return session.status === 'expired' ? 'expired' : 'paid';
+  }
+
+  /** Validates the observed identity and mode before selecting any settlement scope. */
+  private async readTerminal(
+    sessionId: string,
+  ): Promise<Exclude<StripeCheckoutSession, { readonly status: 'pending' }> | null> {
+    const session = await this.sessions.retrieve(sessionId);
+    if (
+      session.status === 'pending' ||
+      session.sessionId !== sessionId ||
+      session.liveMode !== this.settings.liveMode ||
+      session.providerKey.length === 0
+    )
+      return null;
+    return session;
+  }
+
+  /** Reuses one transaction and decision for both webhook and recovery admission. */
+  private async settle(
+    organizationId: string,
+    eventId: string,
+    session: Exclude<StripeCheckoutSession, { readonly status: 'pending' }>,
+  ): Promise<ReconcileStripeCheckoutOutput> {
     if (session.status === 'expired') {
       return {
         status: await this.settlement.settle({
-          organizationId: attempt.organizationId,
-          eventId: input.eventId,
+          organizationId,
+          eventId,
           session,
           decision: null,
         }),
@@ -64,14 +95,14 @@ export class ReconcileStripeCheckout {
       decision.plan !== 'team' ||
       subscription.items.length !== 1 ||
       subscription.items[0]?.priceId !== session.priceId ||
-      decision.limits.seats !== session.quantity
+      subscription.items[0].quantity !== session.quantity
     )
       return { status: 'retry' };
 
     return {
       status: await this.settlement.settle({
-        organizationId: attempt.organizationId,
-        eventId: input.eventId,
+        organizationId,
+        eventId,
         session,
         decision,
       }),

@@ -8,9 +8,14 @@ import { assertNoActiveTransaction } from '@cadenway/nest-common/database';
 import type { CheckoutProviderRequest } from '../../../application/models/checkout/checkout-provider-request.model.js';
 import type { BillingEntitlement } from '../../../application/models/subscriptions/billing-entitlement.model.js';
 import type { CheckoutAuthority } from '../../../application/ports/outbound/providers/checkout/checkout-authority.port.js';
-import { teamStorageByteLimit } from '../../../domain/policies/subscriptions/stripe-subscription.policy.js';
+import {
+  effectiveTeamSeatLimit,
+  teamStorageByteLimit,
+} from '../../../domain/policies/subscriptions/stripe-subscription.policy.js';
 
-type CheckoutSettings = Pick<CheckoutProviderRequest, 'priceId' | 'successUrl' | 'cancelUrl'>;
+type CheckoutSettings = Pick<CheckoutProviderRequest, 'priceId' | 'successUrl' | 'cancelUrl'> & {
+  readonly freeSeatLimit: number;
+};
 
 const maxPageRows = 100;
 const maxPageBytes = 1_048_576;
@@ -30,7 +35,13 @@ export function createOrganizationCheckoutAuthority(
       }
 
       const quantity = await readCurrentSeats(client, organizationId);
-      if (quantity === null || quantity < 1 || quantity < entitlement.seatLimit) return null;
+      if (
+        quantity === null ||
+        quantity < 1 ||
+        effectiveTeamSeatLimit(quantity, settings.freeSeatLimit) < entitlement.seatLimit
+      ) {
+        return null;
+      }
       const { priceId, successUrl, cancelUrl } = settings;
       return { organizationId, providerKey, quantity, priceId, successUrl, cancelUrl };
     },

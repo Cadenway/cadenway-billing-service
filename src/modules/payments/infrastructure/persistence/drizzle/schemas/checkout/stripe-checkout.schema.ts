@@ -28,6 +28,9 @@ export const stripeCheckoutAttempts = pgTable(
     successUrl: text('success_url'),
     cancelUrl: text('cancel_url'),
     providerStartedAt: timestamp('provider_started_at', { withTimezone: true }),
+    providerExpiresAt: bigint('provider_expires_at', { mode: 'number' }),
+    providerSessionId: text('provider_session_id'),
+    providerDispatchKeyDigest: text('provider_dispatch_key_digest'),
     responseUrl: text('response_url'),
     completedAt: timestamp('completed_at', { withTimezone: true }),
     resolvedAt: timestamp('resolved_at', { withTimezone: true }),
@@ -39,6 +42,9 @@ export const stripeCheckoutAttempts = pgTable(
   },
   (table) => [
     uniqueIndex('stripe_checkout_attempts_provider_key_unique').on(table.providerKey),
+    uniqueIndex('stripe_checkout_attempts_provider_session_unique')
+      .on(table.providerSessionId)
+      .where(sql`${table.providerSessionId} is not null`),
     uniqueIndex('stripe_checkout_attempts_actor_key_unique').on(
       table.organizationId,
       table.actorId,
@@ -67,6 +73,21 @@ export const stripeCheckoutAttempts = pgTable(
       sql`(${table.responseUrl} is null and ${table.completedAt} is null)
         or (${table.responseUrl} is not null and ${table.completedAt} is not null
           and ${table.providerStartedAt} is not null and ${table.leaseToken} is null)`,
+    ),
+    check(
+      'stripe_checkout_attempts_provider_expiry_check',
+      sql`${table.providerExpiresAt} is null
+        or (${table.providerStartedAt} is not null and ${table.providerExpiresAt} between 1 and 9007199254740991)`,
+    ),
+    check(
+      'stripe_checkout_attempts_dispatch_key_digest_check',
+      sql`${table.providerDispatchKeyDigest} is null
+        or (${table.providerStartedAt} is not null and ${table.providerDispatchKeyDigest} ~ '^[a-f0-9]{64}$')`,
+    ),
+    check(
+      'stripe_checkout_attempts_provider_session_check',
+      sql`${table.providerSessionId} is null
+        or (${table.providerStartedAt} is not null and ${table.providerSessionId} ~ '^cs_[A-Za-z0-9_]{1,252}$')`,
     ),
     pgPolicy('stripe_checkout_attempts_tenant_isolation', {
       using: sql`organization_id = nullif(current_setting('app.organization_id', true), '')::uuid`,

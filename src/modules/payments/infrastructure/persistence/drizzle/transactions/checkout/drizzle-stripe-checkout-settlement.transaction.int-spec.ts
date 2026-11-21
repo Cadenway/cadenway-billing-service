@@ -10,6 +10,7 @@ import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { DrizzleStripeReconciliationUnitOfWork } from '../subscriptions/drizzle-stripe-reconciliation.unit-of-work.js';
+import { MonotonicStripeEntitlementFence } from '../subscriptions/monotonic-stripe-entitlement-fence.transaction.js';
 import type { StripeEntitlementFence } from '../subscriptions/stripe-entitlement-fence.transaction.js';
 import { DrizzleCheckoutUnitOfWork } from './drizzle-checkout.unit-of-work.js';
 import { DrizzleStripeCheckoutSettlement } from './drizzle-stripe-checkout-settlement.transaction.js';
@@ -28,6 +29,8 @@ const decision = {
   limits: { seats: 5, storageBytes: 100_000_000_000 },
   scheduledCancellation: false,
 };
+const freeSeats = 5;
+const freeStorageBytes = 2_000_000_000;
 
 function compose(...args: readonly string[]): string {
   return execFileSync(
@@ -79,7 +82,7 @@ describe('Stripe Checkout settlement PostgreSQL transactions', () => {
       max: 5,
     });
     runner = new TenantTransactionRunner<DatabaseSchema>(application);
-    checkout = new DrizzleCheckoutUnitOfWork(runner);
+    checkout = new DrizzleCheckoutUnitOfWork(runner, 'a'.repeat(64));
   });
 
   afterAll(async () => {
@@ -91,7 +94,7 @@ describe('Stripe Checkout settlement PostgreSQL transactions', () => {
     }
   });
 
-  async function reserve(organizationId: string) {
+  async function reserve(organizationId: string, quantity = freeSeats) {
     const claim = await inTenant(organizationId, () =>
       checkout.claim({ organizationId, actorId, idempotencyKey: 'key', plan: 'team' }),
     );
@@ -101,21 +104,22 @@ describe('Stripe Checkout settlement PostgreSQL transactions', () => {
         organizationId,
         providerKey: claim.providerKey,
         priceId: 'price_test_fixture',
-        quantity: 5,
+        quantity,
         successUrl: 'https://app.example.test/success',
         cancelUrl: 'https://app.example.test/cancel',
+        expiresAt: Math.floor(Date.now() / 1_000) + 2 * 60 * 60,
       }),
     );
     expect(saved).toBe(true);
     return {
       status: 'complete' as const,
-      sessionId: 'cs_test_fixture',
+      sessionId: `cs_test_${organizationId.replaceAll('-', '')}`,
       providerKey: claim.providerKey,
       liveMode: false,
       customerId: `cus_${organizationId}`,
       subscriptionId: `sub_${organizationId}`,
       priceId: 'price_test_fixture',
-      quantity: 5,
+      quantity,
     };
   }
 
@@ -139,7 +143,7 @@ describe('Stripe Checkout settlement PostgreSQL transactions', () => {
   it('atomically creates the initial binding, entitlement, outbox and receipt exactly once', async () => {
     const organizationId = orgs[0];
     const session = await reserve(organizationId);
-    const transaction = new DrizzleStripeCheckoutSettlement(runner, fence, false);
+    const transaction = new DrizzleStripeCheckoutSettlement(runner, fence, false, freeSeats);
     const settle = (eventId: string) =>
       inTenant(organizationId, () =>
         transaction.settle({ organizationId, eventId, session, decision }),
@@ -165,6 +169,7 @@ describe('Stripe Checkout settlement PostgreSQL transactions', () => {
       runner,
       { ...fence, authorizeChange: () => Promise.resolve(false) },
       false,
+      freeSeats,
     );
     expect(
       await inTenant(organizationId, () =>
@@ -208,7 +213,7 @@ describe('Stripe Checkout settlement PostgreSQL transactions', () => {
   it('rolls back the outbox when receipt insertion fails', async () => {
     const organizationId = orgs[2];
     const session = await reserve(organizationId);
-    const transaction = new DrizzleStripeCheckoutSettlement(runner, fence, false);
+    const transaction = new DrizzleStripeCheckoutSettlement(runner, fence, false, freeSeats);
     await expect(
       inTenant(organizationId, () =>
         transaction.settle({ organizationId, eventId: 'evt_one', session, decision }),
@@ -238,7 +243,7 @@ describe('Stripe Checkout settlement PostgreSQL transactions', () => {
     const lock = () =>
       inTenant(organizationId, () => subscriptions.run(organizationId, (tx) => tx.lockBinding()));
     expect(await lock()).toBeNull();
-    const checkoutSettlement = new DrizzleStripeCheckoutSettlement(runner, fence, false);
+    const checkoutSettlement = new DrizzleStripeCheckoutSettlement(runner, fence, false, freeSeats);
     expect(
       await inTenant(organizationId, () =>
         checkoutSettlement.settle({
@@ -256,6 +261,102 @@ describe('Stripe Checkout settlement PostgreSQL transactions', () => {
     ).toBe('expired');
     expect(await lock()).toMatchObject({
       binding: { customerId: 'cus_existing', subscriptionId: 'sub_existing' },
+    });
+  });
+
+  it.each([1, 2, 3, 4, 6])(
+    'settles %s paid seats with the effective Team allowance under the monotonic quota fence',
+    async (quantity) => {
+      const organizationId = randomUUID();
+      const session = await reserve(organizationId, quantity);
+      const effectiveSeatLimit = quantity > freeSeats ? quantity : freeSeats;
+      const monotonic = new MonotonicStripeEntitlementFence(
+        { seatLimit: freeSeats, storageByteLimit: freeStorageBytes },
+        {
+          append: async (scope, tenantId, entitlement) => {
+            await scope.client.query(
+              `insert into outbox_events (id, event_name, subject, stream, organization_id, payload)
+               values ($1, 'fixture', 'fixture', 'EVENTS', $2, $3)`,
+              [randomUUID(), tenantId, JSON.stringify(entitlement)],
+            );
+          },
+        },
+      );
+      const transaction = new DrizzleStripeCheckoutSettlement(runner, monotonic, false, freeSeats);
+      const result = await inTenant(organizationId, () =>
+        transaction.settle({
+          organizationId,
+          eventId: `evt_paid_seats_${String(quantity)}`,
+          session,
+          decision: { ...decision, limits: { ...decision.limits, seats: effectiveSeatLimit } },
+        }),
+      );
+      expect(result).toBe('applied');
+      expect(
+        await inTenant(organizationId, () =>
+          runner.run(async ({ client }) => {
+            const { rows } = await client.query(
+              `select s.plan, s.seats, a.quantity, a.provider_session_id, o.payload
+               from stripe_subscription_snapshots s
+               join stripe_checkout_attempts a using (organization_id)
+               join outbox_events o using (organization_id)
+               where s.organization_id = $1`,
+              [organizationId],
+            );
+            return rows;
+          }),
+        ),
+      ).toEqual([
+        {
+          plan: 'team',
+          seats: String(effectiveSeatLimit),
+          quantity: String(quantity),
+          provider_session_id: session.sessionId,
+          payload: {
+            plan: 'team',
+            seatLimit: effectiveSeatLimit,
+            storageByteLimit: 100_000_000_000,
+            version: 1,
+          },
+        },
+      ]);
+    },
+  );
+
+  it('refuses a terminal fact for a session other than the stored Checkout session', async () => {
+    const organizationId = randomUUID();
+    const session = await reserve(organizationId);
+    await inTenant(organizationId, () =>
+      runner.run(async ({ client }) => {
+        await client.query(
+          `update stripe_checkout_attempts set provider_session_id = $2
+           where organization_id = $1 and provider_key = $3`,
+          [organizationId, session.sessionId, session.providerKey],
+        );
+      }),
+    );
+    const transaction = new DrizzleStripeCheckoutSettlement(runner, fence, false, freeSeats);
+    expect(
+      await inTenant(organizationId, () =>
+        transaction.settle({
+          organizationId,
+          eventId: 'evt_other_session',
+          session: {
+            status: 'expired',
+            sessionId: 'cs_test_other',
+            providerKey: session.providerKey,
+            liveMode: false,
+          },
+          decision: null,
+        }),
+      ),
+    ).toBe('retry');
+    expect(await counts(organizationId)).toEqual({
+      bindings: 0,
+      snapshots: 0,
+      receipts: 0,
+      outbox: 0,
+      resolved: 0,
     });
   });
 });

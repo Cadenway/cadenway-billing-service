@@ -18,5 +18,8 @@ export interface CheckoutProviderRequest {
 
   /** Billing-configured destination when checkout is cancelled. */
   readonly cancelUrl: string;
+
+  /** Absolute Stripe expiration in Unix seconds. Historical requests may omit it. */
+  readonly expiresAt?: number;
   // #endregion
 }

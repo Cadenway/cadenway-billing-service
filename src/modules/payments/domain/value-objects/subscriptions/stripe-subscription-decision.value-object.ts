@@ -1,6 +1,6 @@
 interface Limits {
   // #region Properties
-  /** Licensed seats. */
+  /** Effective seat admission limit. */
   readonly seats: number;
 
   /** Storage allowance, in bytes. */
