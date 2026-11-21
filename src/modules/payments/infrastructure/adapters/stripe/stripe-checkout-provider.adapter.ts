@@ -145,7 +145,8 @@ export function createStripeCheckoutProvider(apiKey: string, liveMode: boolean):
           },
           { idempotencyKey: request.providerKey },
         );
-      } catch {
+      } catch (error) {
+        if (isMissingCheckoutPrice(error)) return { status: 'rejected-before-execution' };
         // The provider may have created a session. Billing can only retry the same request.
         throw unavailable();
       }
@@ -201,9 +202,55 @@ function checkoutClient(apiKey: string): Stripe['checkout']['sessions'] {
   const stripe = new Stripe(apiKey, {
     timeout: requestTimeoutMs,
     maxNetworkRetries: 0,
+    httpClient: checkoutHttpClient(),
     telemetry: false,
   });
   return stripe.checkout.sessions;
+}
+
+/** Prevents Stripe's implicit retry of a POST after a closed connection, even at zero retries. */
+function checkoutHttpClient(): Stripe.HttpClient {
+  const transport = Stripe.createNodeHttpClient();
+  return {
+    getClientName: () => transport.getClientName(),
+    makeRequest(host, port, path, method, headers, data, protocol, timeout) {
+      const response = transport.makeRequest(
+        host,
+        port,
+        path,
+        method,
+        headers,
+        data,
+        protocol,
+        timeout,
+      );
+      return method === 'POST'
+        ? response.catch(() => {
+            throw unavailable();
+          })
+        : response;
+    },
+  };
+}
+
+/** Recognizes only the validation failure for the required Price of the single Checkout item. */
+function isMissingCheckoutPrice(error: unknown): boolean {
+  if (!(error instanceof Stripe.errors.StripeInvalidRequestError)) return false;
+  const { headers } = error;
+  return (
+    error.statusCode === 400 &&
+    error.rawType === 'invalid_request_error' &&
+    error.code === 'resource_missing' &&
+    error.param === 'line_items[0][price]' &&
+    typeof error.requestId === 'string' &&
+    error.requestId.trim() !== '' &&
+    headers !== undefined &&
+    (headers['idempotent-replayed'] ?? 'false') === 'false' &&
+    (headers['stripe-should-retry'] ?? 'false') === 'false' &&
+    error.payment_intent === undefined &&
+    error.setup_intent === undefined &&
+    error.charge === undefined
+  );
 }
 
 function canCreateBeforeExpiry(expiresAt: number): boolean {

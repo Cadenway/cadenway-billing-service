@@ -95,15 +95,25 @@ export class StartBillingCheckout {
     if (
       request?.expiresAt === undefined ||
       request.providerKey !== claim.providerKey ||
-      request.organizationId !== input.organizationId ||
-      !(await this.work.saveRequest(input.organizationId, claim.token, request))
+      request.organizationId !== input.organizationId
     )
       return { status: 'unavailable' };
-    return this.storeResponse(
-      input.organizationId,
-      claim.token,
-      await this.provider.create(request),
-    );
+    const dispatch = await this.work.saveRequest(input.organizationId, claim.token, request);
+    if (dispatch === null) return { status: 'unavailable' };
+
+    const creation = await this.provider.create(request);
+    if ('status' in creation) {
+      if (dispatch.status === 'first-dispatch') {
+        await this.work.resolveRejected(
+          input.organizationId,
+          claim.token,
+          claim.providerKey,
+          dispatch,
+        );
+      }
+      return { status: 'unavailable' };
+    }
+    return this.storeResponse(input.organizationId, claim.token, creation);
   }
 
   /** Returns a hosted URL only after the caller's lease commits that exact session. */

@@ -110,7 +110,7 @@ describe('Stripe Checkout settlement PostgreSQL transactions', () => {
         expiresAt: Math.floor(Date.now() / 1_000) + 2 * 60 * 60,
       }),
     );
-    expect(saved).toBe(true);
+    expect(saved).toMatchObject({ status: 'first-dispatch' });
     return {
       status: 'complete' as const,
       sessionId: `cs_test_${organizationId.replaceAll('-', '')}`,

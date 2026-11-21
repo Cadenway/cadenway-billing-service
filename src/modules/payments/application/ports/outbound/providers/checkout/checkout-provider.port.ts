@@ -5,10 +5,13 @@ import type { CheckoutRecoveryTarget } from '../../../../models/checkout/checkou
 /** Creates a hosted checkout using the stored provider idempotency identity and parameters. */
 export interface CheckoutProvider {
   // #region Properties
-  /** Returns the Stripe ID and validated hosted URL or throws for an uncertain outcome. */
+  /** Returns the hosted session or proof of rejection before execution; throws for uncertainty. */
   readonly create: (
     request: CheckoutProviderRequest,
-  ) => Promise<{ readonly url: string; readonly sessionId: string }>;
+  ) => Promise<
+    | { readonly url: string; readonly sessionId: string }
+    | { readonly status: 'rejected-before-execution' }
+  >;
 
   /** Reads the original session without performing provider writes. */
   readonly recover: (target: CheckoutRecoveryTarget) => Promise<CheckoutRecoveryEvidence>;

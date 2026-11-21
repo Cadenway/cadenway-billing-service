@@ -208,7 +208,12 @@ async function startCheckoutUpstream(verifier: InternalTokenVerifier) {
   >();
   const paid = new Set<string>();
   const expired = new Set<string>();
-  const controls = { failNextRequest: false, failNextResponse: false, listUnavailable: false };
+  const controls = {
+    failNextRequest: false,
+    failNextResponse: false,
+    rejectNextPrice: false,
+    listUnavailable: false,
+  };
   const path = '/v1/checkout/sessions';
   const canonicalSession = (session: StripeFixtureSession) =>
     stripeCheckoutFixture(
@@ -230,6 +235,22 @@ async function startCheckoutUpstream(verifier: InternalTokenVerifier) {
       if (controls.failNextRequest) {
         controls.failNextRequest = false;
         failStripeRequest(response, 503);
+        return;
+      }
+      if (controls.rejectNextPrice) {
+        controls.rejectNextPrice = false;
+        response.statusCode = 400;
+        response.setHeader('Request-Id', 'req_checkout_rejected_fixture');
+        response.end(
+          JSON.stringify({
+            error: {
+              type: 'invalid_request_error',
+              code: 'resource_missing',
+              param: 'line_items[0][price]',
+              message: 'No such price',
+            },
+          }),
+        );
         return;
       }
       const previous = sessionsByKey.get(key);
@@ -1495,6 +1516,91 @@ describe('billing-service wiring', () => {
       organizationId,
       actor: { type: 'system', id: 'billing-service' },
     });
+  });
+
+  it('releases a first Checkout rejected before execution and admits only one replacement', async () => {
+    const organizationId = '01938f6e-0000-7000-8000-000000000150';
+    const start = await checkoutRequest(organizationId);
+    const upstream = checkoutFixture();
+    const sessionsBefore = upstream.sessions.size;
+    const postsBefore = upstream.creates.length;
+    upstream.quantities.set(organizationId, 2);
+    upstream.controls.rejectNextPrice = true;
+
+    await start('invalid-first-price-fixture').expect(503);
+    expect(upstream.sessions.size).toBe(sessionsBefore);
+
+    const tenant = service().get(TenantTransactionRunner);
+    const persisted = await runWithOrganizationContext(memberOf(organizationId), () =>
+      tenant.run(async ({ client }) => {
+        const attempts = await client.query(
+          `select resolved_at is not null as resolved, provider_session_id, response_url
+           from stripe_checkout_attempts where organization_id = $1`,
+          [organizationId],
+        );
+        const receipts = await client.query(
+          'select count(*)::int as count from stripe_checkout_receipts where organization_id = $1',
+          [organizationId],
+        );
+        return { attempts: attempts.rows, receipts: receipts.rows };
+      }),
+    );
+    expect(persisted).toEqual({
+      attempts: [{ resolved: true, provider_session_id: null, response_url: null }],
+      receipts: [{ count: 0 }],
+    });
+
+    await start('invalid-first-price-fixture').expect(503);
+    expect(upstream.creates).toHaveLength(postsBefore + 1);
+
+    const replacements = await Promise.all([
+      start('replacement-after-invalid-price-a'),
+      start('replacement-after-invalid-price-b'),
+    ]);
+    expect(replacements.map(({ status }) => status).sort((left, right) => left - right)).toEqual([
+      200, 409,
+    ]);
+    expect(upstream.sessions.size).toBe(sessionsBefore + 1);
+    expect(upstream.creates).toHaveLength(postsBefore + 2);
+    const winner =
+      replacements[0].status === 200
+        ? { response: replacements[0], key: 'replacement-after-invalid-price-a' }
+        : { response: replacements[1], key: 'replacement-after-invalid-price-b' };
+    expect(winner.response.body).toEqual({
+      url: `https://checkout.stripe.com/c/pay/${latestStripeSession().id}`,
+    });
+    expect((await start(winner.key).expect(200)).body).toEqual(winner.response.body);
+    expect(upstream.creates).toHaveLength(postsBefore + 2);
+  });
+
+  it('keeps Checkout reserved when a later rejected retry follows an uncertain provider call', async () => {
+    const organizationId = '01938f6e-0000-7000-8000-000000000151';
+    const start = await checkoutRequest(organizationId);
+    const upstream = checkoutFixture();
+    const sessionsBefore = upstream.sessions.size;
+    const postsBefore = upstream.creates.length;
+    upstream.controls.failNextRequest = true;
+
+    await start('uncertain-before-price-rejection').expect(503);
+    upstream.controls.rejectNextPrice = true;
+    await start('uncertain-before-price-rejection').expect(503);
+    await start('replacement-after-uncertainty').expect(409);
+    expect(upstream.sessions.size).toBe(sessionsBefore);
+    expect(upstream.creates).toHaveLength(postsBefore + 2);
+
+    const tenant = service().get(TenantTransactionRunner);
+    const persisted = await runWithOrganizationContext(memberOf(organizationId), () =>
+      tenant.run(({ client }) =>
+        client.query(
+          `select resolved_at, provider_session_id, response_url
+           from stripe_checkout_attempts where organization_id = $1`,
+          [organizationId],
+        ),
+      ),
+    );
+    expect(persisted.rows).toEqual([
+      { resolved_at: null, provider_session_id: null, response_url: null },
+    ]);
   });
 
   it('recovers the same hosted URL after Stripe created a session and its response was lost', async () => {

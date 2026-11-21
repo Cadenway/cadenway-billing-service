@@ -122,8 +122,12 @@ this settlement commits. The endpoint does not store raw provider deliveries.
   Billing rechecks the customer binding after reading Stripe. The cursor key is configured
   independently of webhook verification and rekeying invalidates existing invoice cursors.
 - Checkout leases fence concurrent attempts and recoveries after an uncertain provider call.
-  Any Checkout with a saved provider request stays exclusive until a durable reconciliation
-  proves its outcome. The provider call and that reconciliation are separate from reservation.
+  A Checkout with a saved provider request stays exclusive until Billing can prove its
+  outcome. A Stripe validation error identifying a missing line-item price can resolve only
+  the first dispatch, with its exact unexpired lease and unchanged reservation version.
+  Billing keeps the resolved idempotency record and accepts a fresh key once the price is fixed.
+  A failed retry or any other provider error keeps the reservation exclusive until reconciliation.
+  Provider I/O stays outside reservation and resolution transactions.
 - Checkout creation requires one complete Organization membership page and charges the current
   number of active billable seats. Team admission capacity is at least the Free seat limit.
   Creation refuses a lower effective quota than the committed quota. A paid session matching

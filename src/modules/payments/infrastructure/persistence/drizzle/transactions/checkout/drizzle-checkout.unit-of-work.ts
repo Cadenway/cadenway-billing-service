@@ -11,6 +11,7 @@ import { z } from 'zod';
 import type { CheckoutClaim } from '../../../../../application/models/checkout/checkout-claim.model.js';
 import type { CheckoutProviderRequest } from '../../../../../application/models/checkout/checkout-provider-request.model.js';
 import type { CheckoutRecoveryTarget } from '../../../../../application/models/checkout/checkout-recovery-target.model.js';
+import type { FirstCheckoutDispatch } from '../../../../../application/models/checkout/first-checkout-dispatch.model.js';
 import type { CheckoutUnitOfWork } from '../../../../../application/ports/outbound/transactions/checkout/checkout-unit-of-work.port.js';
 import type { StartBillingCheckoutInput } from '../../../../../application/use-cases/commands/checkout/start-billing-checkout/start-billing-checkout.input.js';
 import { lockBillingEntitlement } from '../subscriptions/lock-billing-entitlement.transaction.js';
@@ -40,6 +41,10 @@ const recoveryRowSchema = z.object({
   provider_expires_at: checkoutRowSchema.shape.provider_expires_at,
 });
 const stripeSessionId = /^cs_[A-Za-z0-9_]{1,252}$/u;
+const dispatchRowSchema = z.object({
+  first_dispatch: z.boolean(),
+  version: z.string().transform(Number).pipe(z.number().int().positive()),
+});
 
 type CheckoutRow = z.infer<typeof checkoutRowSchema>;
 
@@ -148,7 +153,7 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
     organizationId: string,
     token: string,
     request: CheckoutProviderRequest,
-  ): Promise<boolean> {
+  ): ReturnType<CheckoutUnitOfWork['saveRequest']> {
     const expiresAt = request.expiresAt;
     if (
       request.organizationId !== organizationId ||
@@ -158,7 +163,7 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
       !Number.isSafeInteger(expiresAt) ||
       expiresAt < 1
     )
-      return false;
+      return null;
     assertNoActiveTransaction();
     return this.runner.run(async (scope) => {
       this.assertTenant(scope, organizationId);
@@ -186,7 +191,7 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
              and provider_expires_at = $8::bigint
              and provider_dispatch_key_digest = $9
            ))
-         returning id`,
+         returning old.provider_started_at is null as first_dispatch, new.version`,
         [
           organizationId,
           token,
@@ -198,6 +203,39 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
           expiresAt,
           this.dispatchKeyDigest,
         ],
+      );
+      const row = result.rows[0];
+      if (row === undefined) return null;
+      const dispatch = dispatchRowSchema.parse(row);
+      return dispatch.first_dispatch
+        ? { status: 'first-dispatch', version: dispatch.version }
+        : { status: 'retry' };
+    });
+  }
+
+  /** Resolves a rejected first dispatch without forgetting its idempotency record. */
+  public async resolveRejected(
+    organizationId: string,
+    token: string,
+    providerKey: string,
+    dispatch: FirstCheckoutDispatch,
+  ): Promise<boolean> {
+    assertNoActiveTransaction();
+    return this.runner.run(async (scope) => {
+      this.assertTenant(scope, organizationId);
+      await lockBillingEntitlement(scope, organizationId, 'shared');
+      await this.lockCheckout(scope, organizationId);
+      const result = await scope.client.query(
+        `update stripe_checkout_attempts
+         set resolved_at = clock_timestamp(), lease_token = null, lease_expires_at = null,
+             updated_at = clock_timestamp(), version = version + 1
+         where organization_id = $1 and lease_token = $2 and provider_key = $3
+           and version = $4 and provider_dispatch_key_digest = $5
+           and lease_expires_at > clock_timestamp()
+           and provider_started_at is not null and provider_expires_at is not null
+           and response_url is null and provider_session_id is null and resolved_at is null
+         returning id`,
+        [organizationId, token, providerKey, dispatch.version, this.dispatchKeyDigest],
       );
       return result.rows.length === 1;
     });

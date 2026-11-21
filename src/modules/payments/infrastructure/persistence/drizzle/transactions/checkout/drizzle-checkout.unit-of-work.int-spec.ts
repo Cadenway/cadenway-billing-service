@@ -117,7 +117,7 @@ describe('Checkout reservation PostgreSQL transactions', () => {
       await inTenant(organizationId, () =>
         checkout.saveRequest(organizationId, winner.token, request),
       ),
-    ).toBe(true);
+    ).toMatchObject({ status: 'first-dispatch' });
     const unresolved = await inTenant(organizationId, () =>
       checkout.findUnresolved(organizationId),
     );
@@ -138,7 +138,7 @@ describe('Checkout reservation PostgreSQL transactions', () => {
       await inTenant(organizationId, () =>
         checkout.saveRequest(organizationId, retried.token, { ...request, quantity: 6 }),
       ),
-    ).toBe(false);
+    ).toBeNull();
     expect(
       await inTenant(organizationId, () =>
         checkout.saveRequest(organizationId, retried.token, {
@@ -146,12 +146,12 @@ describe('Checkout reservation PostgreSQL transactions', () => {
           expiresAt: expiresAt + 1,
         }),
       ),
-    ).toBe(false);
+    ).toBeNull();
     expect(
       await inTenant(organizationId, () =>
         checkout.saveRequest(organizationId, retried.token, request),
       ),
-    ).toBe(true);
+    ).toEqual({ status: 'retry' });
     expect(
       await inTenant(organizationId, () =>
         checkout.complete(
@@ -242,7 +242,7 @@ describe('Checkout reservation PostgreSQL transactions', () => {
           expiresAt: providerExpiry(),
         }),
       ),
-    ).toBe(false);
+    ).toBeNull();
     expect(
       await inTenant(otherOrganizationId, () =>
         checkout.claim({ ...second, idempotencyKey: 'a-replacement-key' }),
@@ -285,7 +285,9 @@ describe('Checkout reservation PostgreSQL transactions', () => {
         cancelUrl: 'https://app.example.test/cancel',
         expiresAt: providerExpiry(),
       };
-      expect(await checkout.saveRequest(tenant, initial.token, request)).toBe(true);
+      expect(await checkout.saveRequest(tenant, initial.token, request)).toMatchObject({
+        status: 'first-dispatch',
+      });
       await checkout.release(tenant, initial.token);
       const rotated = new DrizzleCheckoutUnitOfWork(runner, 'b'.repeat(64));
       const retry = await rotated.claim(next);
@@ -295,8 +297,8 @@ describe('Checkout reservation PostgreSQL transactions', () => {
         providerKey: initial.providerKey,
         sessionId: null,
       });
-      expect(await rotated.saveRequest(tenant, retry.token, request)).toBe(false);
-      expect(await checkout.saveRequest(tenant, retry.token, request)).toBe(true);
+      expect(await rotated.saveRequest(tenant, retry.token, request)).toBeNull();
+      expect(await checkout.saveRequest(tenant, retry.token, request)).toEqual({ status: 'retry' });
     });
   });
 
@@ -330,7 +332,7 @@ describe('Checkout reservation PostgreSQL transactions', () => {
           expiresAt: providerExpiry(),
         }),
       ),
-    ).toBe(false);
+    ).toBeNull();
   });
 
   it.each([
@@ -373,7 +375,7 @@ describe('Checkout reservation PostgreSQL transactions', () => {
           expiresAt: providerExpiry(),
         }),
       ),
-    ).toBe(false);
+    ).toBeNull();
     const attempt = await inTenant(tenant, () =>
       runner.run(({ client }) =>
         client.query(
@@ -403,19 +405,19 @@ describe('Checkout reservation PostgreSQL transactions', () => {
       await inTenant(boundaryOrganizationId, () =>
         checkout.saveRequest(boundaryOrganizationId, first.token, unsignedRequest),
       ),
-    ).toBe(false);
+    ).toBeNull();
     for (const expiresAt of [expiry - 90 * 60, expiry + 6 * 60]) {
       expect(
         await inTenant(boundaryOrganizationId, () =>
           checkout.saveRequest(boundaryOrganizationId, first.token, { ...request, expiresAt }),
         ),
-      ).toBe(false);
+      ).toBeNull();
     }
     expect(
       await inTenant(boundaryOrganizationId, () =>
         checkout.saveRequest(boundaryOrganizationId, first.token, request),
       ),
-    ).toBe(true);
+    ).toMatchObject({ status: 'first-dispatch' });
     await inTenant(boundaryOrganizationId, () =>
       checkout.release(boundaryOrganizationId, first.token),
     );
@@ -441,7 +443,49 @@ describe('Checkout reservation PostgreSQL transactions', () => {
       await inTenant(boundaryOrganizationId, () =>
         checkout.saveRequest(boundaryOrganizationId, retry.token, request),
       ),
-    ).toBe(false);
+    ).toBeNull();
+  });
+
+  it('will not resolve an ambiguous reservation using a rejection proof from an earlier dispatch', async () => {
+    const tenant = '01938f6e-6d1a-7c3e-9a51-2f0c4b8d7e34';
+    await inTenant(tenant, async () => {
+      const attempt = { ...input, organizationId: tenant };
+      const firstLease = await checkout.claim(attempt);
+      if (firstLease.status !== 'claimed') throw new Error('First dispatch needs a lease.');
+      const request = {
+        organizationId: tenant,
+        providerKey: firstLease.providerKey,
+        priceId: 'price_test_team',
+        quantity: 5,
+        successUrl: 'https://app.example.test/success',
+        cancelUrl: 'https://app.example.test/cancel',
+        expiresAt: providerExpiry(),
+      };
+      const dispatch = await checkout.saveRequest(tenant, firstLease.token, request);
+      if (dispatch?.status !== 'first-dispatch') throw new Error('Missing first dispatch proof.');
+
+      await runner.run(async ({ client }) => {
+        await client.query(
+          "update stripe_checkout_attempts set lease_expires_at = now() - interval '1 second' where organization_id = $1",
+          [tenant],
+        );
+      });
+      await expect(
+        checkout.resolveRejected(tenant, firstLease.token, request.providerKey, dispatch),
+      ).resolves.toBe(false);
+
+      const retryLease = await checkout.claim(attempt);
+      if (retryLease.status !== 'claimed') throw new Error('Retry needs a lease.');
+      await expect(checkout.saveRequest(tenant, retryLease.token, request)).resolves.toEqual({
+        status: 'retry',
+      });
+      await expect(
+        checkout.resolveRejected(tenant, retryLease.token, request.providerKey, dispatch),
+      ).resolves.toBe(false);
+      await expect(
+        checkout.claim({ ...attempt, idempotencyKey: 'replacement-key' }),
+      ).resolves.toEqual({ status: 'checkout-in-progress' });
+    });
   });
 
   it('keeps one globally unique provider session while fencing out resolved rows', async () => {
@@ -461,7 +505,7 @@ describe('Checkout reservation PostgreSQL transactions', () => {
             cancelUrl: 'https://app.example.test/cancel',
             expiresAt: providerExpiry(),
           }),
-        ).toBe(true);
+        ).toMatchObject({ status: 'first-dispatch' });
         return claim.token;
       });
     const firstToken = await prepare(firstTenant);

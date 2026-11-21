@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { CheckoutClaim } from '../../../../models/checkout/checkout-claim.model.js';
 import type { CheckoutProviderRequest } from '../../../../models/checkout/checkout-provider-request.model.js';
 import type { CheckoutRecoveryTarget } from '../../../../models/checkout/checkout-recovery-target.model.js';
+import type { FirstCheckoutDispatch } from '../../../../models/checkout/first-checkout-dispatch.model.js';
 import type { CheckoutAuthority } from '../../../../ports/outbound/providers/checkout/checkout-authority.port.js';
 import type { CheckoutProvider } from '../../../../ports/outbound/providers/checkout/checkout-provider.port.js';
 import type { CheckoutUnitOfWork } from '../../../../ports/outbound/transactions/checkout/checkout-unit-of-work.port.js';
@@ -30,6 +31,7 @@ const requestedAt = new Date('2026-11-21T12:00:00.000Z');
 const expiresAt = requestedAt.getTime() / 1000 + 7200;
 const savedRequest = { ...request, expiresAt };
 const opened = { sessionId: 'cs_fixture', url: 'https://checkout.example.test/one' };
+const firstDispatch: FirstCheckoutDispatch = { status: 'first-dispatch', version: 3 };
 const unresolved: CheckoutRecoveryTarget = {
   organizationId: input.organizationId,
   providerKey: request.providerKey,
@@ -65,7 +67,12 @@ function fixture(
 } {
   const work: CheckoutUnitOfWork = {
     claim: vi.fn().mockResolvedValue(claim),
-    saveRequest: vi.fn().mockResolvedValue(true),
+    saveRequest: vi
+      .fn()
+      .mockResolvedValue(
+        claim.status === 'claimed' && claim.request === null ? firstDispatch : { status: 'retry' },
+      ),
+    resolveRejected: vi.fn().mockResolvedValue(true),
     complete: vi.fn().mockResolvedValue(true),
     findUnresolved: vi.fn().mockResolvedValue(null),
     release: vi.fn().mockResolvedValue(undefined),
@@ -162,7 +169,7 @@ describe('StartBillingCheckout', () => {
 
   it('does not retry a stored request when the final authorization refuses dispatch', async () => {
     const { work, authority, provider, useCase } = fixture(recoveryClaim());
-    vi.mocked(work.saveRequest).mockResolvedValue(false);
+    vi.mocked(work.saveRequest).mockResolvedValue(null);
 
     expect(await useCase.execute(input)).toEqual({ status: 'unavailable' });
     expect(work.release).toHaveBeenCalledExactlyOnceWith(input.organizationId, 'lease-b');
@@ -175,7 +182,34 @@ describe('StartBillingCheckout', () => {
     vi.mocked(provider.create).mockRejectedValue(new Error('timeout'));
     expect(await useCase.execute(input)).toEqual({ status: 'unavailable' });
     expect(work.complete).not.toHaveBeenCalled();
+    expect(work.resolveRejected).not.toHaveBeenCalled();
     expect(work.release).toHaveBeenCalledExactlyOnceWith(input.organizationId, 'lease-a');
+  });
+
+  it('resolves a proven first rejection using the exact committed dispatch', async () => {
+    const { work, provider, useCase } = fixture();
+    vi.mocked(provider.create).mockResolvedValue({ status: 'rejected-before-execution' });
+
+    await expect(useCase.execute(input)).resolves.toEqual({ status: 'unavailable' });
+    expect(work.resolveRejected).toHaveBeenCalledExactlyOnceWith(
+      input.organizationId,
+      'lease-a',
+      request.providerKey,
+      firstDispatch,
+    );
+    expect(work.complete).not.toHaveBeenCalled();
+  });
+
+  it('keeps a stored request reserved when its retry receives a price rejection', async () => {
+    const { work, provider, useCase } = fixture(recoveryClaim());
+    vi.mocked(work.findUnresolved).mockResolvedValue(unresolved);
+    vi.mocked(provider.create).mockResolvedValue({ status: 'rejected-before-execution' });
+
+    await expect(useCase.execute(input)).resolves.toEqual({ status: 'unavailable' });
+    expect(provider.create).toHaveBeenCalledExactlyOnceWith(savedRequest);
+    expect(work.resolveRejected).not.toHaveBeenCalled();
+    expect(work.complete).not.toHaveBeenCalled();
+    expect(work.release).toHaveBeenCalledExactlyOnceWith(input.organizationId, 'lease-b');
   });
 
   it('refuses a seat result scoped to a different organization', async () => {
@@ -189,7 +223,7 @@ describe('StartBillingCheckout', () => {
 
   it('does not call Stripe if the lease expires before parameters are recorded', async () => {
     const { work, provider, useCase } = fixture();
-    vi.mocked(work.saveRequest).mockResolvedValue(false);
+    vi.mocked(work.saveRequest).mockResolvedValue(null);
     expect(await useCase.execute(input)).toEqual({ status: 'unavailable' });
     expect(provider.create).not.toHaveBeenCalled();
   });

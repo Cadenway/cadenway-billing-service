@@ -1,6 +1,7 @@
 import type { CheckoutProviderRequest } from '../../../../models/checkout/checkout-provider-request.model.js';
 import type { CheckoutClaim } from '../../../../models/checkout/checkout-claim.model.js';
 import type { CheckoutRecoveryTarget } from '../../../../models/checkout/checkout-recovery-target.model.js';
+import type { FirstCheckoutDispatch } from '../../../../models/checkout/first-checkout-dispatch.model.js';
 import type { StartBillingCheckoutInput } from '../../../../use-cases/commands/checkout/start-billing-checkout/start-billing-checkout.input.js';
 
 /** Tenant transaction for a durable checkout reservation and its response. */
@@ -16,12 +17,21 @@ export interface CheckoutUnitOfWork {
   /**
    * Authorizes external I/O under the active lease, after rechecking the committed
    * subscription and the provider idempotency window. Persists the first request
-   * or verifies that all immutable parameters match the existing request.
+   * or verifies that all immutable parameters match the existing request. Only the first
+   * dispatch can be conclusively rejected without a provider session.
    */
   readonly saveRequest: (
     organizationId: string,
     token: string,
     request: CheckoutProviderRequest,
+  ) => Promise<FirstCheckoutDispatch | { readonly status: 'retry' } | null>;
+
+  /** Resolves a conclusively rejected first dispatch only while its exact lease and version hold. */
+  readonly resolveRejected: (
+    organizationId: string,
+    token: string,
+    providerKey: string,
+    dispatch: FirstCheckoutDispatch,
   ) => Promise<boolean>;
 
   /**

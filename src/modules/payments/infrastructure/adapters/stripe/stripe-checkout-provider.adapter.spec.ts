@@ -1,3 +1,4 @@
+import type Stripe from 'stripe';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { CheckoutProviderRequest } from '../../../application/models/checkout/checkout-provider-request.model.js';
@@ -8,29 +9,41 @@ import {
 } from './stripe-checkout-provider.adapter.js';
 
 const sdk = vi.hoisted(() => ({
+  beforeRequest: vi.fn<() => void>(),
   configure: vi.fn<(options: unknown) => void>(),
   create: vi.fn<(input: unknown, options: unknown) => Promise<unknown>>(),
+  fetch: vi.fn<typeof fetch>(),
   list: vi.fn<(input: unknown, options: unknown) => Promise<unknown>>(),
   retrieve: vi.fn<(id: string, input: unknown, options?: unknown) => Promise<unknown>>(),
+  useRealSdk: false,
 }));
 
-vi.mock('stripe', () => ({
-  default: class {
-    // #region Properties
-    /** Exposes the network operations through synthetic responses. */
-    public readonly checkout = {
-      sessions: { create: sdk.create, list: sdk.list, retrieve: sdk.retrieve },
+vi.mock('stripe', async (importOriginal) => {
+  const { default: StripeSdk } = await importOriginal<{ default: typeof Stripe }>();
+
+  function StripeFixture(apiKey: string, options: Stripe.StripeConfig) {
+    sdk.configure(options);
+    if (sdk.useRealSdk) return new StripeSdk(apiKey, options);
+    return {
+      checkout: { sessions: { create: sdk.create, list: sdk.list, retrieve: sdk.retrieve } },
     };
-    // #endregion
+  }
 
-    // #region Constructor
-    /** Observes the transport policies without retaining the credential. */
-    public constructor(_credential: string, options: unknown) {
-      sdk.configure(options);
-    }
-    // #endregion
-  },
-}));
+  function createNodeHttpClient(): Stripe.HttpClient {
+    const transport = StripeSdk.createFetchHttpClient(sdk.fetch);
+    return {
+      getClientName: () => transport.getClientName(),
+      async makeRequest(...args) {
+        sdk.beforeRequest();
+        return transport.makeRequest(...args);
+      },
+    };
+  }
+
+  return {
+    default: Object.assign(StripeFixture, { createNodeHttpClient, errors: StripeSdk.errors }),
+  };
+});
 
 const nowSeconds = Math.floor(Date.now() / 1_000);
 const expiresAt = nowSeconds + 2 * 60 * 60;
@@ -95,12 +108,28 @@ const target: CheckoutRecoveryTarget = {
 };
 const credential = 'test-key-placeholder';
 const unavailable = 'Stripe Checkout evidence is unavailable.';
+const missingPriceError = {
+  type: 'invalid_request_error',
+  code: 'resource_missing',
+  param: 'line_items[0][price]',
+  message: 'Missing Price with private provider details',
+};
+
+function stripeErrorResponse(
+  init: ResponseInit = { status: 400, headers: { 'Request-Id': 'req_fixture' } },
+  error: Record<string, string> = {},
+): Response {
+  return Response.json({ error: { ...missingPriceError, ...error } }, init);
+}
 
 beforeEach(() => {
+  sdk.beforeRequest.mockReset();
   sdk.configure.mockClear();
   sdk.create.mockReset();
+  sdk.fetch.mockReset();
   sdk.list.mockReset();
   sdk.retrieve.mockReset();
+  sdk.useRealSdk = false;
 });
 
 describe('Stripe hosted Checkout creation', () => {
@@ -132,11 +161,64 @@ describe('Stripe hosted Checkout creation', () => {
       [expected, { idempotencyKey: request.providerKey }],
       [expected, { idempotencyKey: request.providerKey }],
     ]);
-    expect(sdk.configure).toHaveBeenCalledWith({
-      timeout: 5_000,
-      maxNetworkRetries: 0,
-      telemetry: false,
+    expect(sdk.configure).toHaveBeenCalledWith(
+      expect.objectContaining({ timeout: 5_000, maxNetworkRetries: 0, telemetry: false }),
+    );
+  });
+
+  it('recognizes Stripe validation of a missing required Checkout price', async () => {
+    sdk.useRealSdk = true;
+    sdk.fetch.mockResolvedValueOnce(stripeErrorResponse());
+    const provider = createStripeCheckoutProvider(credential, false);
+
+    await expect(provider.create(request)).resolves.toEqual({
+      status: 'rejected-before-execution',
     });
+    expect(sdk.beforeRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it.each<{
+    status: number;
+    headers?: Record<string, string>;
+    error?: Record<string, string>;
+  }>([
+    { status: 400, error: { type: 'api_error' } },
+    { status: 400, error: { code: 'parameter_invalid_integer' } },
+    { status: 400, error: { param: 'automatic_tax[enabled]' } },
+    { status: 400, error: { param: 'line_items[1][price]' } },
+    { status: 400, headers: { 'Idempotent-Replayed': 'true' } },
+    { status: 400, headers: { 'Stripe-Should-Retry': 'true' } },
+    { status: 400, headers: { 'Request-Id': '' } },
+    { status: 400, error: { charge: 'ch_fixture' } },
+    { status: 401 },
+    { status: 404 },
+    { status: 409 },
+    { status: 429 },
+    { status: 500 },
+  ])('keeps ambiguous Stripe responses reserved %#', async ({ status, error, headers }) => {
+    sdk.useRealSdk = true;
+    const responseHeaders = new Headers(headers);
+    if (!responseHeaders.has('Request-Id')) responseHeaders.set('Request-Id', 'req_fixture');
+    sdk.fetch.mockResolvedValueOnce(
+      stripeErrorResponse({ status, headers: responseHeaders }, error),
+    );
+    const provider = createStripeCheckoutProvider(credential, false);
+
+    await expect(provider.create(request)).rejects.toThrow(unavailable);
+    expect(sdk.beforeRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['ECONNRESET', 'EPIPE'])('does not repeat a POST after a %s', async (code) => {
+    sdk.useRealSdk = true;
+    sdk.beforeRequest.mockImplementationOnce(() => {
+      throw Object.assign(new Error('The server may have processed the request'), { code });
+    });
+    sdk.fetch.mockResolvedValueOnce(stripeErrorResponse());
+    const provider = createStripeCheckoutProvider(credential, false);
+
+    await expect(provider.create(request)).rejects.toThrow(unavailable);
+    expect(sdk.beforeRequest).toHaveBeenCalledTimes(1);
+    expect(sdk.fetch).not.toHaveBeenCalled();
   });
 
   it.each([
