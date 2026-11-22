@@ -30,7 +30,8 @@ writes verify the current generation pointers under the organization lock before
 organization. The gateway proves that the user is an active owner. The endpoint reads the
 current ready projection when usage ingestion is enabled and a bounded JetStream sample confirms
 continuity against the selected generation's checkpoint. This sample also checks that the terminal
-delivery latch is empty. Otherwise it returns `503 billing.unavailable`.
+delivery latch is empty. It pairs measured usage with the effective plan and both limits from one
+Payments entitlement snapshot. Otherwise it returns `503 billing.unavailable`.
 All responses use `Cache-Control: private, no-store`.
 
 ## Events emitted
@@ -62,16 +63,18 @@ apply versioned observations to the current generations.
 
 `RecordUsageObservation` joins the event receipt transaction when called by a kit consumer. The
 Drizzle unit of work locks the organization before changing observations and totals in the current
-generations and recording an intent. The worker checks delivery continuity after acknowledgements,
-then uses the same tenant lock to confirm the exact active generation and version. It commits the
-outbox event and removes the intent together. A changed generation or a current total below the
-threshold cancels publication. Candidate updates and failed writes do not create an alert.
+generations and recording an intent against the effective Payments limits. The worker checks
+delivery continuity after acknowledgements, then uses the same tenant lock to confirm the exact
+active generation and version and reads the current Payments limits. It commits the outbox event
+and removes the intent together. A changed generation, a changed metric limit or a current total
+below the threshold cancels publication. Candidate updates and failed writes do not create an alert.
 
 The rebuild worker reads signed roster, membership and attachment pages outside transactions.
 An organization lock serializes each page, invalidation and promotion. The persisted generation
-and its version fence replay or concurrent updates. Promotion requires both scans to finish and
-JetStream to confirm continuity for all six consumers. An unavailable source or broker leaves
-the tenant eligible for a later retry.
+and its version fence replay or concurrent updates. Each page uses at most one query to read its
+existing observations and one upsert to write accepted observations before advancing the cursor.
+Promotion requires both scans to finish and JetStream to confirm continuity for all six consumers.
+An unavailable source or broker leaves the tenant eligible for a later retry.
 
 ## Decisions
 

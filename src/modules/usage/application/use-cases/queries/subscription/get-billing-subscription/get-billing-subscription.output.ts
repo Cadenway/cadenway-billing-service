@@ -2,7 +2,7 @@
 export interface GetBillingSubscriptionOutput {
   // #region Properties
   /** Current plan identifier. */
-  readonly plan: 'free';
+  readonly plan: 'free' | 'team';
 
   /** Active billed seats and the plan limit. */
   readonly seats: { readonly used: number; readonly limit: number };

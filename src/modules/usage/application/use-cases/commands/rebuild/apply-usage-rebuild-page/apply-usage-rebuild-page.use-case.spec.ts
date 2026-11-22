@@ -45,8 +45,8 @@ function setup(current: UsageRebuildCandidate | null): {
     lockOrganization: vi.fn().mockResolvedValue(undefined),
     candidate: vi.fn().mockResolvedValue(current),
     startCandidate: vi.fn().mockResolvedValue('generation'),
-    loadObservation: vi.fn().mockResolvedValue(null),
-    saveObservation: vi.fn().mockResolvedValue(undefined),
+    loadObservations: vi.fn().mockResolvedValue([]),
+    saveObservations: vi.fn().mockResolvedValue(undefined),
     savePage: vi.fn().mockResolvedValue(undefined),
     promote: vi.fn().mockResolvedValue(undefined),
     abandon: vi.fn().mockResolvedValue(undefined),
@@ -70,7 +70,12 @@ describe('ApplyUsageRebuildPage', () => {
     const { command, transaction } = setup(candidate);
     await expect(command.execute(input)).resolves.toBe('applied');
     expect(transaction.lockOrganization).toHaveBeenCalledOnce();
-    expect(transaction.saveObservation).toHaveBeenCalledWith('generation', member);
+    expect(transaction.loadObservations).toHaveBeenCalledExactlyOnceWith(
+      'generation',
+      'membership',
+      [member.sourceId],
+    );
+    expect(transaction.saveObservations).toHaveBeenCalledExactlyOnceWith('generation', [member]);
     expect(transaction.savePage).toHaveBeenCalledWith(
       'generation',
       'membership',
@@ -81,12 +86,14 @@ describe('ApplyUsageRebuildPage', () => {
 
   it('retains a newer terminal event when an older source page arrives', async () => {
     const { command, transaction } = setup(candidate);
-    vi.mocked(transaction.loadObservation).mockResolvedValue({
-      ...member,
-      observation: { state: 'absent', version: 2 },
-    });
+    vi.mocked(transaction.loadObservations).mockResolvedValue([
+      {
+        ...member,
+        observation: { state: 'absent', version: 2 },
+      },
+    ]);
     await expect(command.execute({ ...input, nextCursor: null })).resolves.toBe('applied');
-    expect(transaction.saveObservation).not.toHaveBeenCalled();
+    expect(transaction.saveObservations).not.toHaveBeenCalled();
     expect(transaction.savePage).toHaveBeenCalledWith(
       'generation',
       'membership',
@@ -102,7 +109,24 @@ describe('ApplyUsageRebuildPage', () => {
   ])('ignores a fetched page when the candidate or cursor is stale', async (changed) => {
     const { command, transaction } = setup(changed);
     await expect(command.execute(input)).resolves.toBe('stale');
+    expect(transaction.loadObservations).not.toHaveBeenCalled();
+    expect(transaction.saveObservations).not.toHaveBeenCalled();
     expect(transaction.savePage).not.toHaveBeenCalled();
+  });
+
+  it('records an empty terminal page without reading or writing observations', async () => {
+    const { command, transaction } = setup(candidate);
+    await expect(command.execute({ ...input, nextCursor: null, items: [] })).resolves.toBe(
+      'applied',
+    );
+    expect(transaction.loadObservations).not.toHaveBeenCalled();
+    expect(transaction.saveObservations).not.toHaveBeenCalled();
+    expect(transaction.savePage).toHaveBeenCalledExactlyOnceWith(
+      'generation',
+      'membership',
+      candidate.totals,
+      null,
+    );
   });
 
   it('refuses repeated cursors, duplicates and oversized pages before persistence', async () => {

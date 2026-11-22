@@ -1,0 +1,1 @@
+ALTER TABLE "stripe_checkout_attempts" ADD COLUMN "provider_customer_id" text;

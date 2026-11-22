@@ -1,10 +1,8 @@
-import { createApplication, loadConfig, runApplication } from '@cadenway/nest-common';
-import type { NestExpressApplication } from '@nestjs/platform-express';
+import { loadConfig, runApplication } from '@cadenway/nest-common';
 
-import { AppModule } from './app.module.js';
+import { createBillingApplication } from './app.module.js';
 import { appConfigSchema } from './config/app-config.js';
 import type { AppConfig } from './config/app-config.js';
-import { configureBillingSubscriptionCache } from './infrastructure/http/billing-subscription-cache.js';
 
 // Started after the instrumentation hooks and `telemetry.js`, with the heap capped for the 256M
 // container: `node --max-old-space-size=160 --import @cadenway/nest-common/register
@@ -17,16 +15,6 @@ import { configureBillingSubscriptionCache } from './infrastructure/http/billing
 // comes from that token only.
 await runApplication({ service: 'billing-service' }, async (): Promise<void> => {
   const config: Readonly<AppConfig> = loadConfig(appConfigSchema);
-  const app: NestExpressApplication = await createApplication(AppModule, {
-    service: 'billing-service',
-    config,
-    internalToken: {
-      verifier: {
-        audience: config.INTERNAL_TOKEN_AUDIENCE,
-        trustedIssuers: config.INTERNAL_TOKEN_TRUSTED_ISSUERS,
-      },
-    },
-  });
-  configureBillingSubscriptionCache(app);
+  const app = await createBillingApplication(config);
   await app.listen(config.PORT);
 });

@@ -31,6 +31,10 @@ describe('appConfigSchema', () => {
       NATS_USER: 'billing',
       NATS_PASSWORD: 'billing',
       BILLING_USAGE_ENABLED: false,
+      BILLING_STRIPE_WEBHOOK_MODE: 'test',
+      BILLING_STRIPE_SETTLEMENT_ENABLED: false,
+      BILLING_STRIPE_FREE_RETURN_ENABLED: false,
+      BILLING_STRIPE_WEBHOOK_INBOX_ENABLED: false,
       INTERNAL_TOKEN_AUDIENCE: 'billing-service',
       INTERNAL_TOKEN_TRUSTED_ISSUERS: {
         'api-gateway': [
@@ -54,12 +58,115 @@ describe('appConfigSchema', () => {
     expect(() => loadConfig(migrationConfigSchema, example)).not.toThrow();
   });
 
+  it('loads a mode and two overlapping webhook keys for rotation', () => {
+    expect(
+      loadConfig(appConfigSchema, {
+        ...complete,
+        BILLING_STRIPE_WEBHOOK_MODE: 'live',
+        BILLING_STRIPE_WEBHOOK_SECRETS: JSON.stringify(['whsec_current', 'whsec_previous']),
+      }),
+    ).toMatchObject({
+      BILLING_STRIPE_WEBHOOK_MODE: 'live',
+      BILLING_STRIPE_WEBHOOK_SECRETS: ['whsec_current', 'whsec_previous'],
+    });
+  });
+
+  it('reports malformed webhook key configuration without printing the keys', () => {
+    const malformed = {
+      ...complete,
+      BILLING_STRIPE_WEBHOOK_SECRETS: '["whsec_placeholder", broken]',
+    };
+    expect(() => loadConfig(appConfigSchema, malformed)).toThrow(/BILLING_STRIPE_WEBHOOK_SECRETS/u);
+    expect(() => loadConfig(appConfigSchema, malformed)).not.toThrow(/whsec_placeholder/u);
+  });
+
+  it('requires a mode-matched API key, endpoint keys and prices before enabling settlement', () => {
+    const config = {
+      ...complete,
+      BILLING_STRIPE_SETTLEMENT_ENABLED: 'true',
+      BILLING_STRIPE_API_KEY: 'rk_live_fixture',
+    };
+    expect(() => loadConfig(appConfigSchema, config)).toThrow(
+      /BILLING_STRIPE_API_KEY[\s\S]*BILLING_STRIPE_WEBHOOK_SECRETS[\s\S]*BILLING_STRIPE_TEAM_PRICE_IDS/u,
+    );
+    expect(() => loadConfig(appConfigSchema, config)).not.toThrow(/rk_live_fixture/u);
+    expect(
+      loadConfig(appConfigSchema, {
+        ...config,
+        BILLING_STRIPE_API_KEY: 'rk_test_fixture',
+        BILLING_STRIPE_WEBHOOK_SECRETS: '["whsec_fixture"]',
+        BILLING_STRIPE_TEAM_PRICE_IDS: '["price_fixture"]',
+      }),
+    ).toMatchObject({ BILLING_STRIPE_SETTLEMENT_ENABLED: true });
+  });
+
+  it('requires settlement before admitting Stripe deliveries into the inbox', () => {
+    const enabled = { ...complete, BILLING_STRIPE_WEBHOOK_INBOX_ENABLED: 'true' };
+    expect(() => loadConfig(appConfigSchema, enabled)).toThrow(
+      /BILLING_STRIPE_WEBHOOK_INBOX_ENABLED/u,
+    );
+    expect(
+      loadConfig(appConfigSchema, {
+        ...enabled,
+        BILLING_STRIPE_SETTLEMENT_ENABLED: 'true',
+        BILLING_STRIPE_API_KEY: 'rk_test_fixture',
+        BILLING_STRIPE_WEBHOOK_SECRETS: '["whsec_fixture"]',
+        BILLING_STRIPE_TEAM_PRICE_IDS: '["price_fixture"]',
+      }),
+    ).toMatchObject({ BILLING_STRIPE_WEBHOOK_INBOX_ENABLED: true });
+  });
+
   it('requires both source origins and the signing key when usage is enabled', () => {
     const enabled = { ...complete, BILLING_USAGE_ENABLED: 'true' };
 
     expect(() => loadConfig(appConfigSchema, enabled)).toThrow(
       /ORGANIZATION_SERVICE_URL[\s\S]*STORAGE_SERVICE_URL[\s\S]*INTERNAL_TOKEN_PRIVATE_JWK/u,
     );
+  });
+
+  it('requires settlement before enabling a verified return to Free', () => {
+    const enabled = { ...complete, BILLING_STRIPE_FREE_RETURN_ENABLED: 'true' };
+    expect(() => loadConfig(appConfigSchema, enabled)).toThrow(
+      /BILLING_STRIPE_FREE_RETURN_ENABLED/u,
+    );
+    expect(
+      loadConfig(appConfigSchema, {
+        ...enabled,
+        BILLING_STRIPE_SETTLEMENT_ENABLED: 'true',
+        BILLING_STRIPE_API_KEY: 'rk_test_fixture',
+        BILLING_STRIPE_WEBHOOK_SECRETS: '["whsec_fixture"]',
+        BILLING_STRIPE_TEAM_PRICE_IDS: '["price_fixture"]',
+      }),
+    ).toMatchObject({ BILLING_STRIPE_FREE_RETURN_ENABLED: true });
+  });
+
+  it('requires configured settlement, a Team price and the initial Checkout authorities', () => {
+    const config = {
+      ...complete,
+      BILLING_STRIPE_CHECKOUT_PRICE_ID: 'price_checkout',
+      BILLING_STRIPE_TEAM_PRICE_IDS: '["price_different"]',
+    };
+    const result = appConfigSchema.safeParse(config);
+    if (result.success) throw new Error('Incomplete Checkout configuration was accepted.');
+    expect(result.error.issues.map(({ path }) => path[0])).toEqual([
+      'BILLING_STRIPE_CHECKOUT_PRICE_ID',
+      'BILLING_STRIPE_CHECKOUT_SUCCESS_URL',
+      'BILLING_STRIPE_CHECKOUT_CANCEL_URL',
+      'ORGANIZATION_SERVICE_URL',
+      'INTERNAL_TOKEN_PRIVATE_JWK',
+    ]);
+  });
+
+  it('requires a mode-matched Stripe key to enable linked invoice reads', () => {
+    const cursorKey = Buffer.alloc(32, 7).toString('base64url');
+    const linkedInvoices = { ...complete, BILLING_STRIPE_INVOICE_CURSOR_KEY: cursorKey };
+    expect(() => loadConfig(appConfigSchema, linkedInvoices)).toThrow(/BILLING_STRIPE_API_KEY/u);
+    expect(() =>
+      loadConfig(appConfigSchema, { ...linkedInvoices, BILLING_STRIPE_API_KEY: 'rk_live_fixture' }),
+    ).toThrow(/BILLING_STRIPE_API_KEY/u);
+    expect(
+      loadConfig(appConfigSchema, { ...linkedInvoices, BILLING_STRIPE_API_KEY: 'rk_test_fixture' }),
+    ).toMatchObject({ BILLING_STRIPE_INVOICE_CURSOR_KEY: cursorKey });
   });
 
   it('refuses credentials and paths in the internal source origins without echoing them', () => {

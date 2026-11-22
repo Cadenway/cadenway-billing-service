@@ -5,7 +5,7 @@ import { EventConsumers } from '@cadenway/nest-messaging';
 import type { FactoryProvider } from '@nestjs/common';
 
 import type { AppConfig } from '../../../../../../config/app-config.js';
-import { GetFreePlan } from '../../../../../plans/public/limits/get-free-plan.js';
+import { GetBillingEntitlement } from '../../../../../payments/public/subscriptions/get-billing-entitlement.js';
 import { RecordUsageObservation } from '../../../../application/use-cases/commands/observations/record-usage-observation/record-usage-observation.use-case.js';
 import { DrizzleUsageObservationUnitOfWork } from '../../../../infrastructure/persistence/drizzle/transactions/observations/drizzle-usage-observation.unit-of-work.js';
 import { DrizzleUsageRebuildUnitOfWork } from '../../../../infrastructure/persistence/drizzle/transactions/rebuild/drizzle-usage-rebuild.unit-of-work.js';
@@ -14,14 +14,16 @@ import { UsageOrganizationCreatedHandler } from '../../../../presentation/messag
 
 const observationsProvider: FactoryProvider<UsageObservationEventsHandler> = {
   provide: UsageObservationEventsHandler,
-  inject: [EventConsumers, TenantTransactionRunner, GetFreePlan, CONFIG],
+  inject: [EventConsumers, TenantTransactionRunner, GetBillingEntitlement, CONFIG],
   useFactory: (
     consumers: EventConsumers,
     runner: TenantTransactionRunner<DatabaseSchema>,
-    freePlan: GetFreePlan,
+    entitlement: GetBillingEntitlement,
     config: AppConfig,
   ): UsageObservationEventsHandler => {
-    const observations = new DrizzleUsageObservationUnitOfWork(runner, freePlan.execute());
+    const observations = new DrizzleUsageObservationUnitOfWork(runner, (organizationId) =>
+      entitlement.execute({ organizationId }),
+    );
     return new UsageObservationEventsHandler(
       consumers,
       new RecordUsageObservation(observations),

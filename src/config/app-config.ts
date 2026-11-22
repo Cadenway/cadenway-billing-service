@@ -35,6 +35,13 @@ import { z } from 'zod';
  * - `INTERNAL_TOKEN_AUDIENCE` and `INTERNAL_TOKEN_TRUSTED_ISSUERS`: the `aud` this service accepts
  *   and the public keys of the backends allowed to call it.
  * - `BILLING_USAGE_ENABLED` enables the projection worker and retained event consumers.
+ * - `BILLING_STRIPE_WEBHOOK_MODE` and `BILLING_STRIPE_WEBHOOK_SECRETS` select the verified
+ *   delivery mode and active endpoint keys.
+ * - `BILLING_STRIPE_SETTLEMENT_ENABLED`, `BILLING_STRIPE_API_KEY` and
+ *   `BILLING_STRIPE_TEAM_PRICE_IDS` gate and configure canonical provider settlement.
+ * - `BILLING_STRIPE_FREE_RETURN_ENABLED` allows verified cancellation to restore Free limits.
+ * - `BILLING_STRIPE_WEBHOOK_INBOX_ENABLED` admits eligible deliveries before settlement.
+ * - `BILLING_STRIPE_INVOICE_CURSOR_KEY` enables linked invoice reads and seals their cursors.
  * - `ORGANIZATION_SERVICE_URL`, `STORAGE_SERVICE_URL` and `INTERNAL_TOKEN_PRIVATE_JWK`
  *   identify and authenticate the authority reads when the worker is enabled.
  *
@@ -46,6 +53,17 @@ export type AppConfig = BaseConfig &
   MessagingConfig &
   InternalTokenVerifierConfig & {
     readonly BILLING_USAGE_ENABLED: boolean;
+    readonly BILLING_STRIPE_WEBHOOK_MODE: 'test' | 'live';
+    readonly BILLING_STRIPE_WEBHOOK_SECRETS?: readonly string[] | undefined;
+    readonly BILLING_STRIPE_SETTLEMENT_ENABLED: boolean;
+    readonly BILLING_STRIPE_FREE_RETURN_ENABLED: boolean;
+    readonly BILLING_STRIPE_WEBHOOK_INBOX_ENABLED: boolean;
+    readonly BILLING_STRIPE_API_KEY?: string | undefined;
+    readonly BILLING_STRIPE_TEAM_PRICE_IDS?: readonly string[] | undefined;
+    readonly BILLING_STRIPE_INVOICE_CURSOR_KEY?: string | undefined;
+    readonly BILLING_STRIPE_CHECKOUT_PRICE_ID?: string | undefined;
+    readonly BILLING_STRIPE_CHECKOUT_SUCCESS_URL?: string | undefined;
+    readonly BILLING_STRIPE_CHECKOUT_CANCEL_URL?: string | undefined;
     readonly ORGANIZATION_SERVICE_URL?: string | undefined;
     readonly STORAGE_SERVICE_URL?: string | undefined;
     readonly INTERNAL_TOKEN_PRIVATE_JWK?: InternalTokenSignerConfig['INTERNAL_TOKEN_PRIVATE_JWK'];
@@ -62,6 +80,72 @@ function sourceOrigin(service: 'Organization' | 'Storage'): z.ZodType<string> {
         return z.NEVER;
       }
       return url.origin;
+    });
+}
+
+const checkoutReturnUrl = z.url({ protocol: /^https?$/u }).refine((value) => {
+  const url = URL.parse(value);
+  if (url === null) return false;
+  const loopback =
+    ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) ||
+    url.hostname.endsWith('.localhost');
+  return (url.protocol === 'https:' || loopback) && !url.username && !url.password && !url.hash;
+}, 'Expected a trusted HTTPS or local loopback Checkout return URL.');
+
+/** Parses a JSON list without exposing configured values in errors. */
+function stripeList(schema: z.ZodType<string[]>, message: string): z.ZodType<string[]> {
+  return z
+    .string()
+    .max(2_048)
+    .transform((value, context) => {
+      try {
+        const parsed = schema.safeParse(JSON.parse(value));
+        if (parsed.success) return parsed.data;
+      } catch {
+        // Report only the configuration name and expected shape, without the signing keys.
+      }
+      context.addIssue({ code: 'custom', message });
+      return z.NEVER;
+    });
+}
+
+const stripeEndpointSecrets = stripeList(
+  z
+    .array(z.string().regex(/^whsec_[A-Za-z0-9_]{1,255}$/u))
+    .min(1)
+    .max(2),
+  'Expected one or two Stripe endpoint keys as JSON.',
+);
+const stripeTeamPrices = stripeList(
+  z
+    .array(z.string().regex(/^price_[A-Za-z0-9_]{1,249}$/u))
+    .min(1)
+    .max(8),
+  'Expected one to eight Stripe Team price IDs as JSON.',
+);
+
+/** Loads optional public verification keys for one quota owner using the kit's validation. */
+function optionalQuotaIssuer(issuer: 'organization-service' | 'storage-service') {
+  return z
+    .string()
+    .trim()
+    .optional()
+    .transform((input, context): InternalTokenVerifierConfig['INTERNAL_TOKEN_TRUSTED_ISSUERS'] => {
+      if (input === undefined || input === '' || input === 'null') return {};
+      try {
+        const keys: unknown = JSON.parse(`[${input}]`);
+        const parsed = internalTokenVerifierConfigShape.INTERNAL_TOKEN_TRUSTED_ISSUERS.safeParse(
+          JSON.stringify({ [issuer]: keys }),
+        );
+        if (parsed.success) return parsed.data;
+      } catch {
+        // Report the name and shape of the variable only.
+      }
+      context.addIssue({
+        code: 'custom',
+        message: 'Expected comma-separated public Ed25519 JWKs.',
+      });
+      return z.NEVER;
     });
 }
 
@@ -82,6 +166,40 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
     ...databaseConfigShape,
     ...messagingConfigShape,
     ...internalTokenVerifierConfigShape,
+    ORGANIZATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: optionalQuotaIssuer('organization-service'),
+    STORAGE_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: optionalQuotaIssuer('storage-service'),
+    BILLING_STRIPE_WEBHOOK_MODE: z.enum(['test', 'live']).default('test'),
+    BILLING_STRIPE_WEBHOOK_SECRETS: stripeEndpointSecrets.optional(),
+    BILLING_STRIPE_SETTLEMENT_ENABLED: z
+      .enum(['true', 'false'])
+      .default('false')
+      .transform((value) => value === 'true'),
+    BILLING_STRIPE_FREE_RETURN_ENABLED: z
+      .enum(['true', 'false'])
+      .default('false')
+      .transform((value) => value === 'true'),
+    BILLING_STRIPE_WEBHOOK_INBOX_ENABLED: z
+      .enum(['true', 'false'])
+      .default('false')
+      .transform((value) => value === 'true'),
+    BILLING_STRIPE_API_KEY: z
+      .string()
+      .regex(/^(?:sk|rk)_(?:test|live)_[A-Za-z0-9_]{1,255}$/u)
+      .optional(),
+    BILLING_STRIPE_TEAM_PRICE_IDS: stripeTeamPrices.optional(),
+    BILLING_STRIPE_CHECKOUT_PRICE_ID: z
+      .string()
+      .regex(/^price_[A-Za-z0-9_]{1,249}$/u)
+      .optional(),
+    BILLING_STRIPE_CHECKOUT_SUCCESS_URL: checkoutReturnUrl.optional(),
+    BILLING_STRIPE_CHECKOUT_CANCEL_URL: checkoutReturnUrl.optional(),
+    BILLING_STRIPE_INVOICE_CURSOR_KEY: z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{43}$/u)
+      .refine((value) => Buffer.from(value, 'base64url').toString('base64url') === value, {
+        message: 'Expected a canonical base64url-encoded 32-byte invoice cursor key.',
+      })
+      .optional(),
     BILLING_USAGE_ENABLED: z
       .enum(['true', 'false'])
       .default('false')
@@ -92,6 +210,71 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
       internalTokenSignerConfigShape.INTERNAL_TOKEN_PRIVATE_JWK.optional(),
   })
   .superRefine((config, context) => {
+    if (config.BILLING_STRIPE_FREE_RETURN_ENABLED && !config.BILLING_STRIPE_SETTLEMENT_ENABLED) {
+      context.addIssue({
+        code: 'custom',
+        path: ['BILLING_STRIPE_FREE_RETURN_ENABLED'],
+        message: 'Stripe settlement is required to restore the Free allowance after cancellation.',
+      });
+    }
+    if (config.BILLING_STRIPE_WEBHOOK_INBOX_ENABLED && !config.BILLING_STRIPE_SETTLEMENT_ENABLED) {
+      context.addIssue({
+        code: 'custom',
+        path: ['BILLING_STRIPE_WEBHOOK_INBOX_ENABLED'],
+        message: 'Stripe settlement must stay enabled while accepting deliveries into the inbox.',
+      });
+    }
+    const checkoutPrice = config.BILLING_STRIPE_CHECKOUT_PRICE_ID;
+    if (checkoutPrice !== undefined) {
+      if (
+        !config.BILLING_STRIPE_SETTLEMENT_ENABLED ||
+        !config.BILLING_STRIPE_TEAM_PRICE_IDS?.includes(checkoutPrice)
+      ) {
+        context.addIssue({
+          code: 'custom',
+          path: ['BILLING_STRIPE_CHECKOUT_PRICE_ID'],
+          message: 'Checkout requires enabled settlement and an allowed Team price.',
+        });
+      }
+      for (const key of [
+        'BILLING_STRIPE_CHECKOUT_SUCCESS_URL',
+        'BILLING_STRIPE_CHECKOUT_CANCEL_URL',
+        'ORGANIZATION_SERVICE_URL',
+        'INTERNAL_TOKEN_PRIVATE_JWK',
+      ] as const) {
+        if (config[key] === undefined) {
+          context.addIssue({ code: 'custom', path: [key], message: 'Required for Checkout.' });
+        }
+      }
+    }
+    if (config.BILLING_STRIPE_SETTLEMENT_ENABLED || config.BILLING_STRIPE_INVOICE_CURSOR_KEY) {
+      const key = config.BILLING_STRIPE_API_KEY;
+      if (
+        key === undefined ||
+        (!key.startsWith(`sk_${config.BILLING_STRIPE_WEBHOOK_MODE}_`) &&
+          !key.startsWith(`rk_${config.BILLING_STRIPE_WEBHOOK_MODE}_`))
+      ) {
+        context.addIssue({
+          code: 'custom',
+          path: ['BILLING_STRIPE_API_KEY'],
+          message: 'Required in the configured Stripe mode for settlement or linked invoice reads.',
+        });
+      }
+    }
+    if (config.BILLING_STRIPE_SETTLEMENT_ENABLED) {
+      for (const field of [
+        'BILLING_STRIPE_WEBHOOK_SECRETS',
+        'BILLING_STRIPE_TEAM_PRICE_IDS',
+      ] as const) {
+        if (config[field] === undefined) {
+          context.addIssue({
+            code: 'custom',
+            path: [field],
+            message: 'Required when Stripe settlement is enabled.',
+          });
+        }
+      }
+    }
     if (!config.BILLING_USAGE_ENABLED) return;
     for (const key of [
       'ORGANIZATION_SERVICE_URL',
@@ -106,7 +289,21 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
         });
       }
     }
-  });
+  })
+  .transform(
+    ({
+      ORGANIZATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS,
+      STORAGE_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS,
+      ...config
+    }): AppConfig => ({
+      ...config,
+      INTERNAL_TOKEN_TRUSTED_ISSUERS: {
+        ...ORGANIZATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS,
+        ...STORAGE_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS,
+        ...config.INTERNAL_TOKEN_TRUSTED_ISSUERS,
+      },
+    }),
+  );
 
 /**
  * Interface MigrationConfig

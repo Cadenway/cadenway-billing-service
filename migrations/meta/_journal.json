@@ -22,6 +22,62 @@
       "when": 1795255555940,
       "tag": "0002_usage_threshold_intents",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1795269196630,
+      "tag": "0003_stripe_reconciliation",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1795274408342,
+      "tag": "0004_stripe_binding_unique",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1795276317551,
+      "tag": "0005_stripe_receipt_event_unique",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1795281880324,
+      "tag": "0006_stripe_checkout_attempts",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1795284743135,
+      "tag": "0007_stripe_checkout_settlement",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1795292776075,
+      "tag": "0008_stripe_checkout_recovery",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1795300791105,
+      "tag": "0009_stripe_webhook_inbox",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1795337820458,
+      "tag": "0010_stripe_checkout_customer",
+      "breakpoints": true
     }
   ]
 }

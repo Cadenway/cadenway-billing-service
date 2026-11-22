@@ -1,5 +1,13 @@
-import { CONFIG, ConfigModule, HealthModule, postgresIndicator } from '@cadenway/nest-common';
-import type { PostgresProbe } from '@cadenway/nest-common';
+import {
+  CONFIG,
+  ConfigModule,
+  createApplication,
+  HealthModule,
+  postgresIndicator,
+  ProblemException,
+  toProblem,
+} from '@cadenway/nest-common';
+import type { CreateApplicationOptions, PostgresProbe } from '@cadenway/nest-common';
 import { DATABASE_POOL, DatabaseModule } from '@cadenway/nest-common/database';
 import {
   MessagingConnection,
@@ -8,9 +16,14 @@ import {
 } from '@cadenway/nest-messaging';
 import { OutboxModule } from '@cadenway/nest-messaging/outbox';
 import { Module } from '@nestjs/common';
+import type { DynamicModule, Type } from '@nestjs/common';
+import type { NestExpressApplication } from '@nestjs/platform-express';
+import type { NextFunction, Request, Response } from 'express';
 
 import { appConfigSchema } from './config/app-config.js';
 import type { AppConfig } from './config/app-config.js';
+import { configureBillingReadCache } from './infrastructure/http/billing-read-cache.js';
+import { PaymentsModule } from './modules/payments/payments.module.js';
 import { PlansModule } from './modules/plans/plans.module.js';
 import { PlatformModule } from './modules/platform/platform.module.js';
 import { UsageModule } from './modules/usage/usage.module.js';
@@ -83,8 +96,50 @@ import { UsageModule } from './modules/usage/usage.module.js';
       }),
     }),
     PlatformModule,
+    PaymentsModule,
     PlansModule,
     UsageModule,
   ],
 })
 export class AppModule {}
+
+const stripeWebhookPath = '/internal/v1/billing/webhooks/stripe';
+const stripeWebhookRoute = /^\/internal\/v1\/billing\/webhooks\/stripe\/?$/iu;
+
+/** Creates Billing with the shared byte limit and private webhook responses. */
+export async function createBillingApplication(
+  config: Readonly<AppConfig>,
+  applicationModule: Type | DynamicModule = AppModule,
+  logDestination?: CreateApplicationOptions['logDestination'],
+): Promise<NestExpressApplication> {
+  const app = await createApplication(applicationModule, {
+    service: 'billing-service',
+    config,
+    rawJsonPostPaths: [stripeWebhookPath],
+    ...(logDestination === undefined ? {} : { logDestination }),
+    internalToken: {
+      verifier: {
+        audience: config.INTERNAL_TOKEN_AUDIENCE,
+        trustedIssuers: config.INTERNAL_TOKEN_TRUSTED_ISSUERS,
+      },
+    },
+  });
+  configureBillingReadCache(app);
+  app.use(stripeWebhookRoute, (_request: Request, response: Response, next: NextFunction): void => {
+    response.setHeader('Cache-Control', 'private, no-store');
+    next();
+  });
+  app.use(
+    stripeWebhookRoute,
+    (error: unknown, _request: Request, response: Response, next: NextFunction): void => {
+      response.setHeader('Cache-Control', 'private, no-store');
+      const problem = toProblem(error);
+      if (problem.status === 400 && problem.code !== 'request.body-too-large') {
+        next(new ProblemException({ status: 400, code: 'billing.invalid-webhook' }));
+        return;
+      }
+      next(error);
+    },
+  );
+  return app;
+}

@@ -1,11 +1,18 @@
 import { execFileSync } from 'node:child_process';
-import { generateKeyPairSync } from 'node:crypto';
+import { createHmac, generateKeyPairSync } from 'node:crypto';
+import { createServer as createHttpServer } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createServer } from 'node:net';
+import { text } from 'node:stream/consumers';
 import { fileURLToPath } from 'node:url';
 
 import {
-  createApplication,
+  ListBillingInvoicesInternalResponse,
+  StartBillingCheckoutInternalResponse,
+} from '@cadenway/contracts/validators/internal/billing-service';
+import {
   InternalTokenSigner,
+  InternalTokenVerifier,
   loadConfig,
   runWithOrganizationContext,
 } from '@cadenway/nest-common';
@@ -25,12 +32,53 @@ import pg from 'pg';
 import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { AppModule } from '../src/app.module.js';
+import { AppModule, createBillingApplication } from '../src/app.module.js';
 import { appConfigSchema } from '../src/config/app-config.js';
-import { configureBillingSubscriptionCache } from '../src/infrastructure/http/billing-subscription-cache.js';
+import type { StripeInvoiceProvider } from '../src/modules/payments/application/ports/outbound/providers/invoices/stripe-invoice-provider.port.js';
+import type { StripeSubscriptionProvider } from '../src/modules/payments/application/ports/outbound/providers/subscriptions/stripe-subscription-provider.port.js';
+import { GetBillingEntitlement } from '../src/modules/payments/public/subscriptions/get-billing-entitlement.js';
 import { RecordUsageObservation } from '../src/modules/usage/application/use-cases/commands/observations/record-usage-observation/record-usage-observation.use-case.js';
 import { DrizzleActiveUsageReader } from '../src/modules/usage/infrastructure/persistence/drizzle/repositories/usage/drizzle-active-usage.repository.js';
 import { DrizzleUsageObservationUnitOfWork } from '../src/modules/usage/infrastructure/persistence/drizzle/transactions/observations/drizzle-usage-observation.unit-of-work.js';
+
+const retrieveStripeSubscription = vi.hoisted(() =>
+  vi.fn<StripeSubscriptionProvider['retrieve']>(),
+);
+const listStripeInvoices = vi.hoisted(() => vi.fn<StripeInvoiceProvider['list']>());
+const stripeTransport = vi.hoisted(() => ({ port: 0 }));
+vi.mock('stripe', async (importOriginal) => {
+  const { default: Stripe } = await importOriginal<typeof import('stripe')>();
+  return {
+    default: class LocalStripe extends Stripe {
+      // #region Constructor
+      /** Retains the Stripe SDK behavior and forces its HTTP transport onto loopback. */
+      public constructor(...[key, options]: ConstructorParameters<typeof Stripe>) {
+        if (stripeTransport.port === 0) throw new Error('The Stripe test transport is offline.');
+        super(key, {
+          ...options,
+          host: '127.0.0.1',
+          port: stripeTransport.port,
+          protocol: 'http',
+        });
+      }
+      // #endregion
+    },
+  };
+});
+vi.mock(
+  '../src/modules/payments/infrastructure/adapters/stripe/stripe-invoice-provider.adapter.js',
+  () => ({
+    createStripeInvoiceProvider: (): StripeInvoiceProvider => ({ list: listStripeInvoices }),
+  }),
+);
+vi.mock(
+  '../src/modules/payments/infrastructure/adapters/stripe/stripe-subscription-provider.adapter.js',
+  () => ({
+    createStripeSubscriptionProvider: (): StripeSubscriptionProvider => ({
+      retrieve: retrieveStripeSubscription,
+    }),
+  }),
+);
 
 // The service as main.ts assembles it, on a disposable PostgreSQL and NATS. `@cadenway/nest-testing`
 // does not export its container fixtures yet and a service never depends on `testcontainers` itself,
@@ -78,6 +126,272 @@ const usageTables = [
   'usage_organizations',
   'usage_threshold_intents',
 ] as const;
+
+/** Tenant-scoped tables of the payments module. */
+const paymentsTables = [
+  'stripe_bindings',
+  'stripe_checkout_attempts',
+  'stripe_checkout_receipts',
+  'stripe_reconciliation_receipts',
+  'stripe_subscription_snapshots',
+  'stripe_webhook_inbox',
+] as const;
+
+/** Migrations applied on a clean or upgraded database. */
+const migrationCount = 11;
+const stripeFixtureKey = 'whsec_fixture';
+const stripeTeamPrice = 'price_team_fixture';
+
+/** Signs the isolated Stripe fixture bytes without calling any external system. */
+function signStripeFixture(payload: string): string {
+  const timestamp = String(Math.floor(Date.now() / 1_000));
+  const digest = createHmac('sha256', stripeFixtureKey)
+    .update(`${timestamp}.${payload}`)
+    .digest('hex');
+  return `t=${timestamp},v1=${digest}`;
+}
+
+/** Verifies the billed tenant on a complete Organization membership snapshot request. */
+async function checkoutMembershipSnapshot(
+  request: IncomingMessage,
+  response: ServerResponse,
+  verifier: InternalTokenVerifier,
+  organizationReads: string[],
+  quantities: ReadonlyMap<string, number>,
+): Promise<void> {
+  const [scheme, token] = request.headers.authorization?.split(' ') ?? [];
+  if (scheme !== 'Bearer' || token === undefined) throw new Error('Missing fixture token.');
+  const caller = await verifier.verify(token);
+  if (caller.actor.type !== 'system' || caller.actor.id !== 'billing-service') {
+    throw new Error('Unexpected Organization actor.');
+  }
+  if (caller.organizationId === null) throw new Error('Missing Checkout organization.');
+  organizationReads.push(caller.organizationId);
+  response.setHeader('Cache-Control', 'private, no-store');
+  response.end(
+    JSON.stringify({
+      items: Array.from({ length: quantities.get(caller.organizationId) ?? 5 }, (_, index) => ({
+        memberId: `01938f6e-0000-7000-8000-${String(index + 1).padStart(12, '0')}`,
+        state: 'active',
+        role: index === 0 ? 'owner' : 'member',
+        version: 1,
+      })),
+      nextCursor: null,
+    }),
+  );
+}
+
+interface StripeFixtureSession {
+  readonly id: string;
+  readonly key: string;
+  readonly quantity: number;
+  readonly created: number;
+  readonly expiresAt: number;
+}
+
+function failStripeRequest(response: ServerResponse, status: 500 | 503): void {
+  response.statusCode = status;
+  response.setHeader('Stripe-Should-Retry', 'false');
+  response.end(JSON.stringify({ error: { type: 'api_error', message: 'Fixture unavailable' } }));
+}
+
+/** Provides local-only HTTP authority and Stripe endpoints while retaining real SDK encoding. */
+async function startCheckoutUpstream(verifier: InternalTokenVerifier) {
+  const organizationReads: string[] = [];
+  const quantities = new Map<string, number>();
+  const creates: { readonly key: string; readonly body: URLSearchParams }[] = [];
+  const reads: string[] = [];
+  const lists: URLSearchParams[] = [];
+  const sessions = new Map<string, StripeFixtureSession>();
+  const sessionsByKey = new Map<
+    string,
+    { readonly session: StripeFixtureSession; readonly body: string; readonly failed: boolean }
+  >();
+  const paid = new Set<string>();
+  const expired = new Set<string>();
+  const controls = {
+    failNextRequest: false,
+    failNextResponse: false,
+    rejectNextPrice: false,
+    listUnavailable: false,
+  };
+  const path = '/v1/checkout/sessions';
+  const canonicalSession = (session: StripeFixtureSession) =>
+    stripeCheckoutFixture(
+      session,
+      paid.has(session.id) ? 'paid' : expired.has(session.id) ? 'expired' : 'open',
+    );
+  const handle = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
+    response.setHeader('Content-Type', 'application/json');
+    const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+    if (request.method === 'GET' && request.url === '/internal/v1/billing-memberships?limit=100') {
+      await checkoutMembershipSnapshot(request, response, verifier, organizationReads, quantities);
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === path) {
+      const body = new URLSearchParams(await text(request));
+      const key = request.headers['idempotency-key'];
+      if (typeof key !== 'string') throw new Error('Missing Stripe idempotency fixture key.');
+      creates.push({ key, body });
+      if (controls.failNextRequest) {
+        controls.failNextRequest = false;
+        failStripeRequest(response, 503);
+        return;
+      }
+      if (controls.rejectNextPrice) {
+        controls.rejectNextPrice = false;
+        response.statusCode = 400;
+        response.setHeader('Request-Id', 'req_checkout_rejected_fixture');
+        response.end(
+          JSON.stringify({
+            error: {
+              type: 'invalid_request_error',
+              code: 'resource_missing',
+              param: 'line_items[0][price]',
+              message: 'No such price',
+            },
+          }),
+        );
+        return;
+      }
+      const previous = sessionsByKey.get(key);
+      if (previous !== undefined) {
+        if (previous.body !== body.toString()) throw new Error('Stripe request changed.');
+        if (previous.failed) failStripeRequest(response, 500);
+        else response.end(JSON.stringify(stripeCheckoutFixture(previous.session, 'open')));
+        return;
+      }
+      const session = {
+        id: `cs_test_local_${String(sessions.size + 1)}`,
+        key,
+        quantity: Number(body.get('line_items[0][quantity]')),
+        created: Math.floor(Date.now() / 1000),
+        expiresAt: Number(body.get('expires_at')),
+      };
+      sessions.set(session.id, session);
+      sessionsByKey.set(key, { session, body: body.toString(), failed: controls.failNextResponse });
+      if (controls.failNextResponse) {
+        controls.failNextResponse = false;
+        failStripeRequest(response, 500);
+        return;
+      }
+      response.end(JSON.stringify(stripeCheckoutFixture(session, 'open')));
+      return;
+    }
+    if (request.method === 'GET' && url.pathname === path) {
+      lists.push(url.searchParams);
+      if (controls.listUnavailable) {
+        failStripeRequest(response, 503);
+        return;
+      }
+      const earliest = Number(url.searchParams.get('created[gte]'));
+      const latest = Number(url.searchParams.get('created[lte]') ?? Infinity);
+      const limit = Number(url.searchParams.get('limit') ?? 10);
+      const candidates = [...sessions.values()]
+        .reverse()
+        .filter((session) => session.created >= earliest && session.created <= latest);
+      const cursor = url.searchParams.get('starting_after');
+      const offset = cursor === null ? 0 : candidates.findIndex(({ id }) => id === cursor) + 1;
+      const data = candidates.slice(offset, offset + limit).map(canonicalSession);
+      response.end(
+        JSON.stringify({
+          object: 'list',
+          url: path,
+          data,
+          has_more: offset + data.length < candidates.length,
+        }),
+      );
+      return;
+    }
+    const id = url.pathname.slice(path.length + 1);
+    const session = sessions.get(id);
+    if (request.method === 'GET' && url.pathname.startsWith(`${path}/`) && session !== undefined) {
+      reads.push(session.id);
+      response.end(JSON.stringify(canonicalSession(session)));
+      return;
+    }
+    response.statusCode = 404;
+    response.end('{}');
+  };
+  const server = createHttpServer((request, response) => {
+    void handle(request, response).catch(() => {
+      response.statusCode = 500;
+      response.end('{}');
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (address === null || typeof address === 'string') {
+    throw new Error('The Checkout fixture has no TCP address.');
+  }
+  stripeTransport.port = address.port;
+  return {
+    origin: `http://127.0.0.1:${String(address.port)}`,
+    organizationReads,
+    quantities,
+    creates,
+    reads,
+    lists,
+    sessions,
+    paid,
+    expired,
+    controls,
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        stripeTransport.port = 0;
+        server.close((error) => {
+          if (error === undefined) resolve();
+          else reject(error);
+        });
+      }),
+  };
+}
+
+/** Returns an opened Checkout or the canonical Stripe state of the same completed session. */
+function stripeCheckoutFixture(
+  { id, key, quantity, created, expiresAt }: StripeFixtureSession,
+  state: 'open' | 'paid' | 'expired',
+) {
+  return {
+    object: 'checkout.session',
+    id,
+    livemode: false,
+    mode: 'subscription',
+    status: state === 'paid' ? 'complete' : state,
+    payment_status: state === 'paid' ? 'paid' : 'unpaid',
+    currency: 'eur',
+    customer: state === 'paid' ? `cus_${id}` : null,
+    subscription: state === 'paid' ? `sub_${id}` : null,
+    created,
+    expires_at: expiresAt,
+    recovered_from: null,
+    client_reference_id: key,
+    metadata: { cadenway_checkout_key: key },
+    url: state === 'open' ? `https://checkout.stripe.com/c/pay/${id}` : null,
+    line_items: {
+      object: 'list',
+      has_more: false,
+      data: [
+        {
+          object: 'item',
+          currency: 'eur',
+          quantity,
+          price: {
+            object: 'price',
+            id: stripeTeamPrice,
+            livemode: false,
+            currency: 'eur',
+            type: 'recurring',
+            recurring: { usage_type: 'licensed' },
+          },
+        },
+      ],
+    },
+  };
+}
 
 /**
  * Runs `docker compose` on the throwaway project.
@@ -223,9 +537,12 @@ class WiringProbeController {
 
 describe('billing-service wiring', () => {
   const gateway = keyPair();
+  const organization = keyPair();
+  const storage = keyPair();
   let app: NestExpressApplication | undefined;
   let signer: InternalTokenSigner;
   let migrator: pg.Pool;
+  let checkoutUpstream: Awaited<ReturnType<typeof startCheckoutUpstream>> | undefined;
 
   /**
    * The running application.
@@ -239,11 +556,58 @@ describe('billing-service wiring', () => {
     return app;
   }
 
+  function checkoutFixture() {
+    if (checkoutUpstream === undefined) throw new Error('Checkout upstream did not start.');
+    return checkoutUpstream;
+  }
+
+  async function checkoutRequest(organizationId: string, actorId = camilleMartinId) {
+    const token = await signer.sign('billing-service', {
+      actor: { type: 'user', id: actorId },
+      organizationId,
+    });
+    const api = request(service().getHttpServer());
+    return (key: string) =>
+      api
+        .post('/internal/v1/billing/checkout')
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', key)
+        .send({ plan: 'team' });
+  }
+
+  function latestStripeSession(): StripeFixtureSession {
+    const session = [...checkoutFixture().sessions.values()].at(-1);
+    if (session === undefined) throw new Error('Stripe did not open a fixture session.');
+    return session;
+  }
+
+  async function stripeDelivery(id: string, type: string, data: Readonly<Record<string, unknown>>) {
+    const token = await signer.sign('billing-service', {
+      actor: { type: 'system', id: 'api-gateway' },
+      organizationId: null,
+    });
+    const payload = JSON.stringify({
+      id,
+      object: 'event',
+      type,
+      livemode: false,
+      data: { object: data },
+    });
+    return request(service().getHttpServer())
+      .post('/internal/v1/billing/webhooks/stripe')
+      .set('Authorization', `Bearer ${token}`)
+      .set('Content-Type', 'application/json')
+      .set('Stripe-Signature', signStripeFixture(payload))
+      .send(payload);
+  }
+
   beforeAll(async () => {
     natsHostPort = await freePort();
     compose(
       'up',
       '--detach',
+      '--pull',
+      'never',
       '--wait',
       '--wait-timeout',
       '120',
@@ -277,6 +641,29 @@ describe('billing-service wiring', () => {
     vi.stubEnv('NATS_URL', `nats://127.0.0.1:${natsHostPort}`);
     vi.stubEnv('NATS_USER', 'billing');
     vi.stubEnv('NATS_PASSWORD', 'billing');
+    vi.stubEnv('BILLING_STRIPE_WEBHOOK_MODE', 'test');
+    vi.stubEnv('BILLING_STRIPE_WEBHOOK_SECRETS', JSON.stringify([stripeFixtureKey]));
+    vi.stubEnv('BILLING_STRIPE_SETTLEMENT_ENABLED', 'true');
+    vi.stubEnv('BILLING_STRIPE_API_KEY', 'rk_test_local_fixture');
+    vi.stubEnv('BILLING_STRIPE_TEAM_PRICE_IDS', JSON.stringify([stripeTeamPrice]));
+    const billing = keyPair();
+    checkoutUpstream = await startCheckoutUpstream(
+      await InternalTokenVerifier.create({
+        audience: 'organization-service',
+        trustedIssuers: { 'billing-service': [billing.publicJwk] },
+      }),
+    );
+    vi.stubEnv('ORGANIZATION_SERVICE_URL', checkoutUpstream.origin);
+    vi.stubEnv('INTERNAL_TOKEN_PRIVATE_JWK', JSON.stringify(billing.privateJwk));
+    vi.stubEnv('BILLING_STRIPE_CHECKOUT_PRICE_ID', stripeTeamPrice);
+    vi.stubEnv('BILLING_STRIPE_CHECKOUT_SUCCESS_URL', 'https://app.example.test/billing?success');
+    vi.stubEnv('BILLING_STRIPE_CHECKOUT_CANCEL_URL', 'https://app.example.test/billing?cancel');
+    vi.stubEnv('BILLING_STRIPE_INVOICE_CURSOR_KEY', Buffer.alloc(32, 9).toString('base64url'));
+    vi.stubEnv(
+      'ORGANIZATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS',
+      JSON.stringify(organization.publicJwk),
+    );
+    vi.stubEnv('STORAGE_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS', JSON.stringify(storage.publicJwk));
     vi.stubEnv('INTERNAL_TOKEN_AUDIENCE', 'billing-service');
     vi.stubEnv(
       'INTERNAL_TOKEN_TRUSTED_ISSUERS',
@@ -292,18 +679,9 @@ describe('billing-service wiring', () => {
 
     // As main.ts: the configuration is read inside the start-up, never when a module is imported.
     const config = loadConfig(appConfigSchema);
-    app = await createApplication(ProbedApplicationModule, {
-      service: 'billing-service',
-      config,
-      internalToken: {
-        verifier: {
-          audience: config.INTERNAL_TOKEN_AUDIENCE,
-          trustedIssuers: config.INTERNAL_TOKEN_TRUSTED_ISSUERS,
-        },
-      },
-      logDestination: { write: (): void => undefined },
+    app = await createBillingApplication(config, ProbedApplicationModule, {
+      write: (): void => undefined,
     });
-    configureBillingSubscriptionCache(app);
     await app.init();
     signer = await InternalTokenSigner.create({
       issuer: 'api-gateway',
@@ -315,6 +693,7 @@ describe('billing-service wiring', () => {
     try {
       releaseShutdown();
       await app?.close();
+      await checkoutUpstream?.close();
       await migrator.end();
     } finally {
       vi.unstubAllEnvs();
@@ -331,12 +710,12 @@ describe('billing-service wiring', () => {
     );
 
     expect(tables.rows).toEqual(
-      [...platformTables, ...usageTables].map((tablename) => ({
+      [...platformTables, ...paymentsTables, ...usageTables].map((tablename) => ({
         tablename,
         tableowner: 'billing_migrator',
       })),
     );
-    expect(journal.rows).toEqual([{ applied: 3 }]);
+    expect(journal.rows).toEqual([{ applied: migrationCount }]);
   });
 
   it('applies nothing when the migrator runs again', async () => {
@@ -345,78 +724,145 @@ describe('billing-service wiring', () => {
     const journal = await migrator.query<{ applied: number }>(
       'select count(*)::int as applied from drizzle.__drizzle_migrations',
     );
-    expect(journal.rows).toEqual([{ applied: 3 }]);
+    expect(journal.rows).toEqual([{ applied: migrationCount }]);
   });
 
-  it('upgrades the previous platform schema without losing its rows or application privileges', async () => {
-    const port = hostPort('postgres', '5432');
-    const administrator = new pg.Pool({
-      connectionString: `postgres://postgres:postgres@127.0.0.1:${port}/billing`,
-    });
-    const previous = readMigrationFiles({ migrationsFolder })[0];
-    if (previous === undefined) throw new Error('The platform migration is missing.');
+  it.each([1, 3, 4, 6, 7, 8, 9, 10])(
+    'upgrades from %i applied migrations without losing rows or application privileges',
+    async (previousCount) => {
+      const port = hostPort('postgres', '5432');
+      const administrator = new pg.Pool({
+        connectionString: `postgres://postgres:postgres@127.0.0.1:${port}/billing`,
+      });
+      const previous = readMigrationFiles({ migrationsFolder }).slice(0, previousCount);
+      expect(previous).toHaveLength(previousCount);
+      const database = `billing_upgrade_${String(previousCount)}`;
 
-    await administrator.query('create database billing_upgrade owner billing_migrator');
-    const upgrade = new pg.Pool({
-      connectionString: `postgres://billing_migrator:billing_migrator@127.0.0.1:${port}/billing_upgrade`,
-      max: 1,
-    });
-    const application = new pg.Pool({
-      connectionString: `postgres://billing_app:billing_app@127.0.0.1:${port}/billing_upgrade`,
-      max: 1,
-    });
-    try {
-      await upgrade.query('revoke create on schema public from public');
-      await upgrade.query('grant usage on schema public to billing_app');
-      await upgrade.query(
-        'alter default privileges in schema public grant select, insert, update, delete on tables to billing_app',
-      );
-      await upgrade.query('begin');
-      await upgrade.query('create schema drizzle');
-      await upgrade.query(
-        'create table drizzle.__drizzle_migrations (id serial primary key, hash text not null, created_at bigint)',
-      );
-      for (const statement of previous.sql) await upgrade.query(statement);
-      await upgrade.query(
-        'insert into drizzle.__drizzle_migrations (hash, created_at) values ($1, $2)',
-        [previous.hash, previous.folderMillis],
-      );
-      await upgrade.query(
-        `insert into processed_events (consumer, event_id)
+      await administrator.query(`create database ${database} owner billing_migrator`);
+      const upgrade = new pg.Pool({
+        connectionString: `postgres://billing_migrator:billing_migrator@127.0.0.1:${port}/${database}`,
+        max: 1,
+      });
+      const application = new pg.Pool({
+        connectionString: `postgres://billing_app:billing_app@127.0.0.1:${port}/${database}`,
+        max: 1,
+      });
+      try {
+        await upgrade.query('revoke create on schema public from public');
+        await upgrade.query('grant usage on schema public to billing_app');
+        await upgrade.query(
+          'alter default privileges in schema public grant select, insert, update, delete on tables to billing_app',
+        );
+        await upgrade.query('begin');
+        await upgrade.query('create schema drizzle');
+        await upgrade.query(
+          'create table drizzle.__drizzle_migrations (id serial primary key, hash text not null, created_at bigint)',
+        );
+        for (const migration of previous) {
+          for (const statement of migration.sql) await upgrade.query(statement);
+          await upgrade.query(
+            'insert into drizzle.__drizzle_migrations (hash, created_at) values ($1, $2)',
+            [migration.hash, migration.folderMillis],
+          );
+        }
+        await upgrade.query(
+          `insert into processed_events (consumer, event_id)
          values ('billing-service__upgrade', $1)`,
-        [camilleMartinId],
-      );
-      await upgrade.query('commit');
+          [camilleMartinId],
+        );
+        if (previousCount >= 4) {
+          await upgrade.query("set local app.system_access = 'on'");
+          await upgrade.query(
+            'insert into stripe_bindings (organization_id, customer_id, subscription_id) values ($1, $2, $3)',
+            [camilleMartinId, 'cus_upgrade', 'sub_upgrade'],
+          );
+        }
+        if (previousCount >= 7) {
+          await upgrade.query("select set_config('app.organization_id', $1, true)", [
+            camilleMartinId,
+          ]);
+          await upgrade.query(
+            `insert into stripe_checkout_attempts
+               (organization_id, actor_id, key_digest, plan, provider_key,
+                provider_started_at, price_id, quantity, success_url, cancel_url)
+             values ($1, $2, repeat('a', 64), 'team', 'checkout_upgrade',
+                     now(), 'price_team_fixture', 3, 'https://app.example.test/ok', 'https://app.example.test/cancel')`,
+            [camilleMartinId, camilleMartinId],
+          );
+        }
+        await upgrade.query('commit');
 
-      await migrate(drizzle({ client: upgrade }), { migrationsFolder });
-      expect(
-        (await application.query('select consumer, event_id from processed_events')).rows,
-      ).toEqual([{ consumer: 'billing-service__upgrade', event_id: camilleMartinId }]);
-      expect(
-        (
-          await application.query(`
+        await migrate(drizzle({ client: upgrade }), { migrationsFolder });
+        expect(
+          (await application.query('select consumer, event_id from processed_events')).rows,
+        ).toEqual([{ consumer: 'billing-service__upgrade', event_id: camilleMartinId }]);
+        if (previousCount >= 4) {
+          const system = new SystemTransactionRunner(application);
+          const binding = await system.run(
+            ({ client }) =>
+              client.query(
+                'select customer_id, subscription_id from stripe_bindings where organization_id = $1',
+                [camilleMartinId],
+              ),
+            { readOnly: true },
+          );
+          expect(binding.rows).toEqual([
+            { customer_id: 'cus_upgrade', subscription_id: 'sub_upgrade' },
+          ]);
+        }
+        if (previousCount >= 7) {
+          const system = new SystemTransactionRunner(application);
+          const row = await system.run(async ({ client }) => {
+            await client.query(
+              "select set_config('app.stripe_checkout_provider_key', 'checkout_upgrade', true)",
+            );
+            return client.query(
+              `select organization_id, price_id, quantity, provider_session_id,
+                      provider_expires_at, provider_dispatch_key_digest, provider_customer_id
+               from stripe_checkout_attempts where provider_key = 'checkout_upgrade'`,
+            );
+          });
+          expect(row.rows).toEqual([
+            {
+              organization_id: camilleMartinId,
+              price_id: stripeTeamPrice,
+              quantity: '3',
+              provider_session_id: null,
+              provider_expires_at: null,
+              provider_dispatch_key_digest: null,
+              provider_customer_id: null,
+            },
+          ]);
+        }
+        expect(
+          (
+            await application.query(
+              `
             select count(*)::int as allowed
-              from (values ('usage_organizations'), ('usage_generations'), ('usage_observations'), ('usage_threshold_intents')) as tables(name)
+              from unnest($1::text[]) as tables(name)
               cross join (values ('select'), ('insert'), ('update'), ('delete')) as privileges(name)
              where has_table_privilege(current_user, tables.name, privileges.name)
-          `)
-        ).rows,
-      ).toEqual([{ allowed: 16 }]);
-      await expect(
-        application.query('create table upgrade_probe (id integer)'),
-      ).rejects.toMatchObject({
-        code: '42501',
-      });
-      expect(
-        (await upgrade.query('select count(*)::int as applied from drizzle.__drizzle_migrations'))
-          .rows,
-      ).toEqual([{ applied: 3 }]);
-    } finally {
-      await application.end();
-      await upgrade.end();
-      await administrator.end();
-    }
-  });
+          `,
+              [[...usageTables, ...paymentsTables]],
+            )
+          ).rows,
+        ).toEqual([{ allowed: 4 * (usageTables.length + paymentsTables.length) }]);
+        await expect(
+          application.query('create table upgrade_probe (id integer)'),
+        ).rejects.toMatchObject({
+          code: '42501',
+        });
+        expect(
+          (await upgrade.query('select count(*)::int as applied from drizzle.__drizzle_migrations'))
+            .rows,
+        ).toEqual([{ applied: migrationCount }]);
+      } finally {
+        await application.end();
+        await upgrade.end();
+        await administrator.end();
+      }
+    },
+  );
 
   it('forces row-level security on the tables that carry an organization', async () => {
     const tables = await migrator.query<{
@@ -438,15 +884,40 @@ describe('billing-service wiring', () => {
       { relname: 'idempotency_keys', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'outbox_events', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'processed_events', relrowsecurity: false, relforcerowsecurity: false },
+      ...paymentsTables.map((relname) => ({
+        relname,
+        relrowsecurity: true,
+        relforcerowsecurity: true,
+      })),
       { relname: 'usage_generations', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'usage_observations', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'usage_organizations', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'usage_threshold_intents', relrowsecurity: true, relforcerowsecurity: true },
     ]);
-    expect(policies.rows).toEqual([
+    const expectedPolicies = [
       { tablename: 'event_versions', policyname: 'event_versions_organization_isolation' },
       { tablename: 'idempotency_keys', policyname: 'idempotency_keys_organization_isolation' },
       { tablename: 'outbox_events', policyname: 'outbox_events_organization_isolation' },
+      ...paymentsTables.map((tablename) => ({
+        tablename,
+        policyname: `${tablename}_tenant_isolation`,
+      })),
+      {
+        tablename: 'stripe_checkout_attempts',
+        policyname: 'stripe_checkout_attempts_exact_system_lookup',
+      },
+      {
+        tablename: 'stripe_checkout_receipts',
+        policyname: 'stripe_checkout_receipts_exact_system_lookup',
+      },
+      {
+        tablename: 'stripe_webhook_inbox',
+        policyname: 'stripe_webhook_inbox_worker_select',
+      },
+      {
+        tablename: 'stripe_webhook_inbox',
+        policyname: 'stripe_webhook_inbox_worker_update',
+      },
       { tablename: 'usage_generations', policyname: 'usage_generations_tenant_isolation' },
       { tablename: 'usage_observations', policyname: 'usage_observations_tenant_isolation' },
       { tablename: 'usage_organizations', policyname: 'usage_organizations_tenant_isolation' },
@@ -454,7 +925,9 @@ describe('billing-service wiring', () => {
         tablename: 'usage_threshold_intents',
         policyname: 'usage_threshold_intents_tenant_isolation',
       },
-    ]);
+    ];
+    expect(policies.rows).toHaveLength(expectedPolicies.length);
+    expect(policies.rows).toEqual(expect.arrayContaining(expectedPolicies));
   });
 
   it('isolates usage generations and observations between organizations', async () => {
@@ -593,10 +1066,9 @@ describe('billing-service wiring', () => {
     const failure = new Error('threshold intent was not recorded');
     let rejectThreshold = true;
     const readUsage = new DrizzleActiveUsageReader(tenant);
-    const unitOfWork = new DrizzleUsageObservationUnitOfWork(tenant, {
-      seats: 5,
-      storageBytes: 2_000_000_000,
-    });
+    const unitOfWork = new DrizzleUsageObservationUnitOfWork(tenant, () =>
+      Promise.resolve({ plan: 'free', seatLimit: 5, storageByteLimit: 2_000_000_000 }),
+    );
     const projection = new RecordUsageObservation({
       run: (selectedOrganization, work) =>
         unitOfWork.run(selectedOrganization, (transaction) =>
@@ -781,6 +1253,784 @@ describe('billing-service wiring', () => {
     });
   });
 
+  it('returns private invoices for the signed tenant and rejects a cursor from another tenant', async () => {
+    const organizationId = '01938f6e-0000-7000-8000-000000000098';
+    const customerId = 'cus_invoice_fixture';
+    const path = '/internal/v1/billing/invoices';
+    const api = request(service().getHttpServer());
+    const system = service().get(SystemTransactionRunner);
+    await system.run(({ client }) =>
+      client.query(
+        'insert into stripe_bindings (organization_id, customer_id, subscription_id) values ($1, $2, $3)',
+        [organizationId, customerId, 'sub_invoice_fixture'],
+      ),
+    );
+    const actor = { type: 'user', id: camilleMartinId } as const;
+    const scoped = await signer.sign('billing-service', { actor, organizationId });
+    const unlinked = await signer.sign('billing-service', {
+      actor,
+      organizationId: otherOrganizationId,
+    });
+    const invoice = {
+      number: 'FAC-001',
+      periodStart: '2026-11-01T00:00:00Z',
+      periodEnd: '2026-12-01T00:00:00Z',
+      currency: 'EUR',
+      totalMinorUnits: 1200,
+      status: 'paid' as const,
+      pdfUrl: null,
+    };
+    listStripeInvoices.mockReset().mockResolvedValue({
+      invoices: [{ customerId, liveMode: false, issued: true, invoice }],
+      next: 'in_invoice_fixture',
+    });
+    const missing = await api.get(path);
+    const first = await api.get(path).query({ limit: 1 }).set('Authorization', `Bearer ${scoped}`);
+    expect(first.status).toBe(200);
+    const page = ListBillingInvoicesInternalResponse.parse(first.body);
+    expect(page.items).toEqual([invoice]);
+    expect(page.nextCursor).toBeTruthy();
+    const empty = await api.get(path).set('Authorization', `Bearer ${unlinked}`);
+    const refused = await api
+      .get(path)
+      .query({ cursor: page.nextCursor })
+      .set('Authorization', `Bearer ${unlinked}`);
+    expect([missing.status, empty.status, refused.status]).toEqual([401, 200, 400]);
+    expect(empty.body).toEqual({ items: [], nextCursor: null });
+    expect(refused.body).toMatchObject({ code: 'billing.invalid-cursor' });
+    expect(listStripeInvoices).toHaveBeenCalledExactlyOnceWith({
+      customerId,
+      liveMode: false,
+      limit: 1,
+      after: null,
+    });
+    for (const result of [missing, first, empty, refused]) {
+      expect(result.headers['cache-control']).toBe('private, no-store');
+    }
+  });
+
+  it('authenticates Stripe bytes from the global gateway, and does not acknowledge a deferred event', async () => {
+    const api = request(service().getHttpServer());
+    const path = '/internal/v1/billing/webhooks/stripe';
+    const actor = { type: 'system', id: 'api-gateway' } as const;
+    const caller = await signer.sign('billing-service', { actor, organizationId: null });
+    const wrongIdentity = await signer.sign('billing-service', {
+      actor: { type: 'system', id: 'other' },
+      organizationId: null,
+    });
+    const scoped = await signer.sign('billing-service', { actor, organizationId: atelierNordId });
+    const ignored =
+      '{ "id": "evt_invoice", "object": "event", "type": "invoice.created", "livemode": false, "data": { "object": {} } }';
+    const supported = JSON.stringify({
+      id: 'evt_subscription',
+      object: 'event',
+      type: 'customer.subscription.updated',
+      livemode: false,
+      data: { object: { object: 'subscription', id: 'sub_atelier', customer: 'cus_atelier' } },
+    });
+    const signature = signStripeFixture;
+    const post = (token: string) =>
+      api
+        .post(path)
+        .set('Authorization', `Bearer ${token}`)
+        .set('Content-Type', 'application/json');
+    const denied = [
+      [await api.post(path), 401, 'auth.token-missing'],
+      [await post(wrongIdentity).send(ignored), 403, 'auth.actor-not-allowed'],
+      [await post(scoped).send(ignored), 403, 'auth.organization-not-allowed'],
+      [await post(caller).send(ignored), 400, 'billing.invalid-webhook-signature'],
+      [
+        await post(caller).set('Stripe-Signature', signature(ignored)).send(`${ignored} `),
+        400,
+        'billing.invalid-webhook-signature',
+      ],
+      [
+        await post(caller).set('Stripe-Signature', signature(supported)).send(supported),
+        503,
+        'billing.unavailable',
+      ],
+      [
+        await post(caller).set('Stripe-Signature', signature('{secret')).send('{secret'),
+        400,
+        'billing.invalid-webhook',
+      ],
+      [await post(caller).send('a'.repeat(1_048_577)), 400, 'request.body-too-large'],
+    ] as const;
+    for (const [response, status, code] of denied) {
+      expect(response.status).toBe(status);
+      expect(response.headers['cache-control']).toBe('private, no-store');
+      expect(response.body).toMatchObject({ code });
+      expect(response.text).not.toContain('{secret');
+    }
+    const acknowledged = await post(caller)
+      .set('Stripe-Signature', signature(ignored))
+      .send(ignored);
+    expect(acknowledged.status).toBe(204);
+    expect(acknowledged.text).toBe('');
+    expect(acknowledged.headers['cache-control']).toBe('private, no-store');
+
+    const system = service().get(SystemTransactionRunner);
+    await system.run(async ({ client }) => {
+      await client.query(
+        'insert into stripe_bindings (organization_id, customer_id, subscription_id) values ($1, $2, $3)',
+        [atelierNordId, 'cus_replacement', 'sub_replacement'],
+      );
+      await client.query(
+        'insert into stripe_reconciliation_receipts (organization_id, event_id) values ($1, $2)',
+        [atelierNordId, 'evt_subscription'],
+      );
+    });
+    const replay = await post(caller).set('Stripe-Signature', signature(supported)).send(supported);
+    expect(replay.status).toBe(204);
+    expect(replay.text).toBe('');
+    expect(replay.headers['cache-control']).toBe('private, no-store');
+  });
+
+  it('bills two active seats and keeps five admission places across recurring Stripe updates', async () => {
+    if (checkoutUpstream === undefined) throw new Error('Checkout upstream did not start.');
+    const organizationId = '01938f6e-0000-7000-8000-000000000096';
+    const otherId = '01938f6e-0000-7000-8000-000000000095';
+    const sessionId = 'cs_test_local_1';
+    checkoutUpstream.quantities.set(organizationId, 2);
+    const eventId = 'evt_checkout_local_complete';
+    const api = request(service().getHttpServer());
+    const user = { type: 'user', id: camilleMartinId } as const;
+    const [ownerToken, otherToken, webhookToken] = await Promise.all([
+      signer.sign('billing-service', { actor: user, organizationId }),
+      signer.sign('billing-service', { actor: user, organizationId: otherId }),
+      signer.sign('billing-service', {
+        actor: { type: 'system', id: 'api-gateway' },
+        organizationId: null,
+      }),
+    ]);
+    const key = 'checkout-local-integration';
+    const start = (token: string, idempotencyKey = key) =>
+      api
+        .post('/internal/v1/billing/checkout')
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', idempotencyKey)
+        .send({ plan: 'team' });
+
+    const first = await start(ownerToken).expect(200);
+    expect(first.headers['cache-control']).toBe('private, no-store');
+    const opened = StartBillingCheckoutInternalResponse.parse(first.body);
+    expect(opened.url).toBe(`https://checkout.stripe.com/c/pay/${sessionId}`);
+    expect((await start(ownerToken).expect(200)).body).toEqual(opened);
+    expect((await start(ownerToken, 'checkout-local-second').expect(409)).body).toMatchObject({
+      code: 'billing.checkout-in-progress',
+    });
+    expect((await start(otherToken).expect(200)).body).not.toEqual(opened);
+    expect(checkoutUpstream.organizationReads).toEqual([organizationId, otherId]);
+    expect(checkoutUpstream.creates).toHaveLength(2);
+    const [creation, otherCreation] = checkoutUpstream.creates;
+    expect(creation?.key).toMatch(/^checkout_/u);
+    expect(otherCreation?.key).not.toBe(creation?.key);
+    expect(Object.fromEntries(creation?.body ?? [])).toMatchObject({
+      'line_items[0][price]': stripeTeamPrice,
+      'line_items[0][quantity]': '2',
+      client_reference_id: creation?.key,
+      'metadata[cadenway_checkout_key]': creation?.key,
+      success_url: 'https://app.example.test/billing?success',
+      cancel_url: 'https://app.example.test/billing?cancel',
+    });
+    expect(Number(creation?.body.get('expires_at'))).toBeGreaterThan(Math.floor(Date.now() / 1000));
+
+    const payload = JSON.stringify({
+      id: eventId,
+      object: 'event',
+      type: 'checkout.session.completed',
+      livemode: false,
+      data: { object: { object: 'checkout.session', id: sessionId, payment_status: 'paid' } },
+    });
+    const submit = (signature: string) =>
+      api
+        .post('/internal/v1/billing/webhooks/stripe')
+        .set('Authorization', `Bearer ${webhookToken}`)
+        .set('Content-Type', 'application/json')
+        .set('Stripe-Signature', signature)
+        .send(payload);
+    const entitlement = (id: string) =>
+      runWithOrganizationContext(memberOf(id), () =>
+        service().get(GetBillingEntitlement).execute({ organizationId: id }),
+      );
+    const free = { plan: 'free', seatLimit: 5, storageByteLimit: 2_000_000_000, version: 0 };
+    const team = { plan: 'team', seatLimit: 5, storageByteLimit: 100_000_000_000, version: 1 };
+    const readsBeforeWebhook = checkoutUpstream.reads.length;
+    await submit('invalid signature').expect(400);
+    expect(checkoutUpstream.reads).toHaveLength(readsBeforeWebhook);
+    await submit(signStripeFixture(payload)).expect(503);
+    expect(await entitlement(organizationId)).toEqual(free);
+
+    checkoutUpstream.paid.add(sessionId);
+    retrieveStripeSubscription.mockClear().mockResolvedValue({
+      customerId: `cus_${sessionId}`,
+      subscriptionId: `sub_${sessionId}`,
+      liveMode: false,
+      status: 'active',
+      scheduledCancellation: false,
+      collectionPaused: false,
+      hasMoreItems: false,
+      items: [{ priceId: stripeTeamPrice, quantity: 2 }],
+    });
+    await submit(signStripeFixture(payload)).expect(204);
+    await submit(signStripeFixture(payload)).expect(204);
+    expect(checkoutUpstream.reads.slice(readsBeforeWebhook)).toEqual([sessionId, sessionId]);
+    expect(retrieveStripeSubscription).toHaveBeenCalledExactlyOnceWith(`sub_${sessionId}`);
+    expect(await entitlement(organizationId)).toEqual(team);
+    expect(await entitlement(otherId)).toEqual(free);
+    const recurring = await stripeDelivery(
+      'evt_checkout_two_seats_recurring',
+      'customer.subscription.updated',
+      { object: 'subscription', id: `sub_${sessionId}`, customer: `cus_${sessionId}` },
+    );
+    expect(recurring.status).toBe(204);
+    expect(await entitlement(organizationId)).toEqual(team);
+    expect((await start(ownerToken).expect(200)).body).toEqual(opened);
+    expect((await start(ownerToken, 'checkout-local-third').expect(409)).body).toMatchObject({
+      code: 'billing.subscription-active',
+    });
+
+    const tenant = service().get(TenantTransactionRunner);
+    const receipts = (id: string) =>
+      runWithOrganizationContext(memberOf(id), () =>
+        tenant.run(({ client }) =>
+          client.query(
+            'select event_id, session_id, terminal_status from stripe_checkout_receipts',
+          ),
+        ),
+      );
+    expect((await receipts(organizationId)).rows).toEqual([
+      { event_id: eventId, session_id: sessionId, terminal_status: 'complete' },
+    ]);
+    expect((await receipts(otherId)).rows).toEqual([]);
+    const system = service().get(SystemTransactionRunner);
+    expect(
+      (
+        await system.run(({ client }) =>
+          client.query('select event_id from stripe_checkout_receipts'),
+        )
+      ).rows,
+    ).toEqual([]);
+    const outbox = await runWithOrganizationContext(memberOf(organizationId), () =>
+      tenant.run(({ client }) =>
+        client.query(
+          'select payload from outbox_events where event_name = $1 and organization_id = $2',
+          ['subscription.changed.v1', organizationId],
+        ),
+      ),
+    );
+    expect(outbox.rows).toHaveLength(1);
+    const [event] = outbox.rows as readonly { payload: unknown }[];
+    expect(event?.payload).toMatchObject({
+      ...team,
+      organizationId,
+      actor: { type: 'system', id: 'billing-service' },
+    });
+  });
+
+  it('releases a first Checkout rejected before execution and admits only one replacement', async () => {
+    const organizationId = '01938f6e-0000-7000-8000-000000000150';
+    const start = await checkoutRequest(organizationId);
+    const upstream = checkoutFixture();
+    const sessionsBefore = upstream.sessions.size;
+    const postsBefore = upstream.creates.length;
+    upstream.quantities.set(organizationId, 2);
+    upstream.controls.rejectNextPrice = true;
+
+    await start('invalid-first-price-fixture').expect(503);
+    expect(upstream.sessions.size).toBe(sessionsBefore);
+
+    const tenant = service().get(TenantTransactionRunner);
+    const persisted = await runWithOrganizationContext(memberOf(organizationId), () =>
+      tenant.run(async ({ client }) => {
+        const attempts = await client.query(
+          `select resolved_at is not null as resolved, provider_session_id, response_url
+           from stripe_checkout_attempts where organization_id = $1`,
+          [organizationId],
+        );
+        const receipts = await client.query(
+          'select count(*)::int as count from stripe_checkout_receipts where organization_id = $1',
+          [organizationId],
+        );
+        return { attempts: attempts.rows, receipts: receipts.rows };
+      }),
+    );
+    expect(persisted).toEqual({
+      attempts: [{ resolved: true, provider_session_id: null, response_url: null }],
+      receipts: [{ count: 0 }],
+    });
+
+    await start('invalid-first-price-fixture').expect(503);
+    expect(upstream.creates).toHaveLength(postsBefore + 1);
+
+    const replacements = await Promise.all([
+      start('replacement-after-invalid-price-a'),
+      start('replacement-after-invalid-price-b'),
+    ]);
+    expect(replacements.map(({ status }) => status).sort((left, right) => left - right)).toEqual([
+      200, 409,
+    ]);
+    expect(upstream.sessions.size).toBe(sessionsBefore + 1);
+    expect(upstream.creates).toHaveLength(postsBefore + 2);
+    const winner =
+      replacements[0].status === 200
+        ? { response: replacements[0], key: 'replacement-after-invalid-price-a' }
+        : { response: replacements[1], key: 'replacement-after-invalid-price-b' };
+    expect(winner.response.body).toEqual({
+      url: `https://checkout.stripe.com/c/pay/${latestStripeSession().id}`,
+    });
+    expect((await start(winner.key).expect(200)).body).toEqual(winner.response.body);
+    expect(upstream.creates).toHaveLength(postsBefore + 2);
+  });
+
+  it('keeps Checkout reserved when a later rejected retry follows an uncertain provider call', async () => {
+    const organizationId = '01938f6e-0000-7000-8000-000000000151';
+    const start = await checkoutRequest(organizationId);
+    const upstream = checkoutFixture();
+    const sessionsBefore = upstream.sessions.size;
+    const postsBefore = upstream.creates.length;
+    upstream.controls.failNextRequest = true;
+
+    await start('uncertain-before-price-rejection').expect(503);
+    upstream.controls.rejectNextPrice = true;
+    await start('uncertain-before-price-rejection').expect(503);
+    await start('replacement-after-uncertainty').expect(409);
+    expect(upstream.sessions.size).toBe(sessionsBefore);
+    expect(upstream.creates).toHaveLength(postsBefore + 2);
+
+    const tenant = service().get(TenantTransactionRunner);
+    const persisted = await runWithOrganizationContext(memberOf(organizationId), () =>
+      tenant.run(({ client }) =>
+        client.query(
+          `select resolved_at, provider_session_id, response_url
+           from stripe_checkout_attempts where organization_id = $1`,
+          [organizationId],
+        ),
+      ),
+    );
+    expect(persisted.rows).toEqual([
+      { resolved_at: null, provider_session_id: null, response_url: null },
+    ]);
+  });
+
+  it('recovers the same hosted URL after Stripe created a session and its response was lost', async () => {
+    const organizationId = '01938f6e-0000-7000-8000-000000000091';
+    const start = await checkoutRequest(organizationId);
+    const upstream = checkoutFixture();
+    upstream.quantities.set(organizationId, 3);
+    const postsBefore = upstream.creates.length;
+    const listsBefore = upstream.lists.length;
+    upstream.controls.failNextResponse = true;
+    await start('lost-open-response-fixture').expect(503);
+    const session = latestStripeSession();
+    expect(session.quantity).toBe(3);
+
+    await start('new-key-while-open-fixture').expect(409);
+    const anotherOwner = await checkoutRequest(
+      organizationId,
+      '01938f6e-0000-7000-8000-000000000090',
+    );
+    await anotherOwner('lost-open-response-fixture').expect(409);
+    const recovered = await start('lost-open-response-fixture').expect(200);
+    const { url } = StartBillingCheckoutInternalResponse.parse(recovered.body);
+    expect(url).toBe(`https://checkout.stripe.com/c/pay/${session.id}`);
+    expect((await start('lost-open-response-fixture').expect(200)).body).toEqual({ url });
+    expect(upstream.creates).toHaveLength(postsBefore + 1);
+    expect(upstream.lists.length).toBeGreaterThan(listsBefore);
+    expect(Number(upstream.lists.at(-1)?.get('created[gte]'))).toBeLessThanOrEqual(session.created);
+
+    const tenant = service().get(TenantTransactionRunner);
+    const stored = await runWithOrganizationContext(memberOf(organizationId), () =>
+      tenant.run(({ client }) =>
+        client.query(
+          'select provider_session_id, response_url from stripe_checkout_attempts where organization_id = $1',
+          [organizationId],
+        ),
+      ),
+    );
+    expect(stored.rows).toEqual([{ provider_session_id: session.id, response_url: url }]);
+  });
+
+  it('settles a confirmed payment before its webhook arrives and emits the entitlement once', async () => {
+    const organizationId = '01938f6e-0000-7000-8000-000000000092';
+    const start = await checkoutRequest(organizationId);
+    const upstream = checkoutFixture();
+    upstream.quantities.set(organizationId, 1);
+    const postsBefore = upstream.creates.length;
+    upstream.controls.failNextResponse = true;
+    await start('lost-paid-response-fixture').expect(503);
+    const session = latestStripeSession();
+    expect(session.quantity).toBe(1);
+    upstream.paid.add(session.id);
+    retrieveStripeSubscription.mockResolvedValue({
+      customerId: `cus_${session.id}`,
+      subscriptionId: `sub_${session.id}`,
+      liveMode: false,
+      status: 'active',
+      scheduledCancellation: false,
+      collectionPaused: false,
+      hasMoreItems: false,
+      items: [{ priceId: stripeTeamPrice, quantity: session.quantity }],
+    });
+
+    const paid = await start('new-key-after-payment-fixture').expect(409);
+    expect(paid.body).toMatchObject({ code: 'billing.subscription-active' });
+    const delivered = await stripeDelivery(
+      'evt_checkout_paid_after_poll',
+      'checkout.session.completed',
+      { object: 'checkout.session', id: session.id, payment_status: 'paid' },
+    );
+    expect(delivered.status).toBe(204);
+    expect(upstream.creates).toHaveLength(postsBefore + 1);
+
+    const tenant = service().get(TenantTransactionRunner);
+    const entitlement = service().get(GetBillingEntitlement);
+    await runWithOrganizationContext(memberOf(organizationId), async () => {
+      await expect(entitlement.execute({ organizationId })).resolves.toEqual({
+        plan: 'team',
+        seatLimit: 5,
+        storageByteLimit: 100_000_000_000,
+        version: 1,
+      });
+      const persisted = await tenant.run(async ({ client }) => {
+        const events = await client.query(
+          "select count(*)::int as count from outbox_events where organization_id = $1 and event_name = 'subscription.changed.v1'",
+          [organizationId],
+        );
+        const receipts = await client.query(
+          'select event_id from stripe_checkout_receipts where organization_id = $1 order by event_id',
+          [organizationId],
+        );
+        return {
+          events: events.rows as readonly { count: number }[],
+          receipts: receipts.rows as readonly { event_id: string }[],
+        };
+      });
+      expect(persisted).toEqual({
+        events: [{ count: 1 }],
+        receipts: [
+          { event_id: `checkout-poll:${session.id}` },
+          { event_id: 'evt_checkout_paid_after_poll' },
+        ],
+      });
+    });
+  });
+
+  it('opens just one replacement for concurrent keys after Stripe confirms expiration', async () => {
+    const organizationId = '01938f6e-0000-7000-8000-000000000093';
+    const start = await checkoutRequest(organizationId);
+    const upstream = checkoutFixture();
+    upstream.quantities.set(organizationId, 4);
+    await start('known-expired-response-fixture').expect(200);
+    const session = latestStripeSession();
+    expect(session.quantity).toBe(4);
+    upstream.expired.add(session.id);
+    const postsBefore = upstream.creates.length;
+
+    const responses = await Promise.all([
+      start('first-replacement-key-fixture'),
+      start('second-replacement-key-fixture'),
+    ]);
+    expect(responses.map(({ status }) => status).sort((left, right) => left - right)).toEqual([
+      200, 409,
+    ]);
+    expect(upstream.creates).toHaveLength(postsBefore + 1);
+    expect(latestStripeSession().key).not.toBe(session.key);
+    expect(upstream.reads).toContain(session.id);
+  });
+
+  it.each([false, true])(
+    'keeps an older reservation fenced without Stripe proof (legacy=%s)',
+    async (legacy) => {
+      const organizationId = legacy
+        ? '01938f6e-0000-7000-8000-000000000094'
+        : '01938f6e-0000-7000-8000-000000000097';
+      const start = await checkoutRequest(organizationId);
+      const upstream = checkoutFixture();
+      upstream.controls.failNextRequest = true;
+      await start('unconfirmed-old-response-fixture').expect(503);
+      const postsBefore = upstream.creates.length;
+      const tenant = service().get(TenantTransactionRunner);
+      await runWithOrganizationContext(memberOf(organizationId), () =>
+        tenant.run(({ client }) =>
+          client.query(
+            `update stripe_checkout_attempts
+           set provider_started_at = now() - interval '3 days',
+               provider_expires_at = case when $2 then null
+                 else extract(epoch from (now() - interval '70 hours'))::bigint end,
+               provider_dispatch_key_digest = case when $2 then null else provider_dispatch_key_digest end
+           where organization_id = $1`,
+            [organizationId, legacy],
+          ),
+        ),
+      );
+
+      const listsBefore = upstream.lists.length;
+      await start('unconfirmed-old-response-fixture').expect(503);
+      await start('replacement-without-evidence-fixture').expect(409);
+      upstream.controls.listUnavailable = true;
+      try {
+        await start('unconfirmed-old-response-fixture').expect(503);
+        await start('replacement-when-stripe-down-fixture').expect(409);
+      } finally {
+        upstream.controls.listUnavailable = false;
+      }
+      expect(upstream.creates).toHaveLength(postsBefore);
+      expect(upstream.lists.length).toBeGreaterThan(listsBefore);
+      const stored = await runWithOrganizationContext(memberOf(organizationId), () =>
+        tenant.run(({ client }) =>
+          client.query(
+            'select provider_session_id, resolved_at from stripe_checkout_attempts where organization_id = $1',
+            [organizationId],
+          ),
+        ),
+      );
+      expect(stored.rows).toEqual([{ provider_session_id: null, resolved_at: null }]);
+    },
+  );
+
+  it('allows only the signed quota owners to read the entitlement for their token tenant', async () => {
+    const api = request(service().getHttpServer());
+    const path = '/internal/v1/billing/entitlement';
+    const issuer = await InternalTokenSigner.create({
+      issuer: 'organization-service',
+      privateJwk: organization.privateJwk,
+    });
+    const [token, anotherActor, anotherIssuer, noOrganization] = await Promise.all([
+      issuer.sign('billing-service', {
+        actor: { type: 'system', id: 'organization-service' },
+        organizationId: otherOrganizationId,
+      }),
+      issuer.sign('billing-service', {
+        actor: { type: 'system', id: 'storage-service' },
+        organizationId: otherOrganizationId,
+      }),
+      signer.sign('billing-service', {
+        actor: { type: 'system', id: 'api-gateway' },
+        organizationId: otherOrganizationId,
+      }),
+      issuer.sign('billing-service', {
+        actor: { type: 'system', id: 'organization-service' },
+        organizationId: null,
+      }),
+    ]);
+    const [missing, wrongActor, wrongIssuer, missingOrganization, query, success] =
+      await Promise.all([
+        api.get(path),
+        api.get(path).set('Authorization', `Bearer ${anotherActor}`),
+        api.get(path).set('Authorization', `Bearer ${anotherIssuer}`),
+        api.get(path).set('Authorization', `Bearer ${noOrganization}`),
+        api
+          .get(path)
+          .query({ organizationId: atelierNordId })
+          .set('Authorization', `Bearer ${token}`),
+        api.get(path).set('Authorization', `Bearer ${token}`),
+      ]);
+    expect([
+      missing.status,
+      wrongActor.status,
+      wrongIssuer.status,
+      missingOrganization.status,
+      query.status,
+    ]).toEqual([401, 403, 403, 403, 400]);
+    expect(query.body).toMatchObject({ code: 'request.invalid' });
+    expect(success.status).toBe(200);
+    expect(success.body).toEqual({
+      plan: 'free',
+      seatLimit: 5,
+      storageByteLimit: 2_000_000_000,
+      version: 0,
+    });
+    for (const result of [missing, wrongActor, wrongIssuer, missingOrganization, query, success]) {
+      expect(result.headers['cache-control']).toBe('private, no-store');
+    }
+  });
+
+  it('commits signed Stripe increases once and leaves reductions retryable', async () => {
+    const organizationId = '01938f6e-0000-7000-8000-000000000099';
+    const customerId = 'cus_paid_fixture';
+    const subscriptionId = 'sub_paid_fixture';
+    const api = request(service().getHttpServer());
+    const tenant = service().get(TenantTransactionRunner);
+    const system = service().get(SystemTransactionRunner);
+    await system.run(({ client }) =>
+      client.query(
+        'insert into stripe_bindings (organization_id, customer_id, subscription_id) values ($1, $2, $3)',
+        [organizationId, customerId, subscriptionId],
+      ),
+    );
+
+    const callers = await Promise.all([
+      InternalTokenSigner.create({
+        issuer: 'organization-service',
+        privateJwk: organization.privateJwk,
+      }),
+      InternalTokenSigner.create({ issuer: 'storage-service', privateJwk: storage.privateJwk }),
+    ]);
+    const quotaTokens = await Promise.all(
+      callers.map((caller, index) =>
+        caller.sign('billing-service', {
+          actor: { type: 'system', id: index === 0 ? 'organization-service' : 'storage-service' },
+          organizationId,
+        }),
+      ),
+    );
+    const gatewayToken = await signer.sign('billing-service', {
+      actor: { type: 'system', id: 'api-gateway' },
+      organizationId: null,
+    });
+    const submit = (eventId: string) => {
+      const payload = JSON.stringify({
+        id: eventId,
+        object: 'event',
+        type: 'customer.subscription.updated',
+        livemode: false,
+        data: { object: { object: 'subscription', id: subscriptionId, customer: customerId } },
+      });
+      return api
+        .post('/internal/v1/billing/webhooks/stripe')
+        .set('Authorization', `Bearer ${gatewayToken}`)
+        .set('Content-Type', 'application/json')
+        .set('Stripe-Signature', signStripeFixture(payload))
+        .send(payload);
+    };
+    const entitlement = (token: string) =>
+      api.get('/internal/v1/billing/entitlement').set('Authorization', `Bearer ${token}`);
+    const providerState = (quantity: number, scheduledCancellation = false) =>
+      retrieveStripeSubscription.mockResolvedValue({
+        customerId,
+        subscriptionId,
+        liveMode: false,
+        status: 'active',
+        scheduledCancellation,
+        collectionPaused: false,
+        hasMoreItems: false,
+        items: [{ priceId: 'price_team_fixture', quantity }],
+      });
+    const persisted = () =>
+      runWithOrganizationContext(memberOf(organizationId), () =>
+        tenant.run(async ({ client }) => {
+          const events = await client.query(
+            `select payload from outbox_events
+             where organization_id = $1 and event_name = 'subscription.changed.v1'
+             order by (payload->>'version')::bigint`,
+            [organizationId],
+          );
+          const receipts = await client.query(
+            'select event_id from stripe_reconciliation_receipts where organization_id = $1 order by event_id',
+            [organizationId],
+          );
+          const snapshot = await client.query(
+            'select scheduled_cancellation from stripe_subscription_snapshots where organization_id = $1',
+            [organizationId],
+          );
+          return {
+            events: (events.rows as readonly { payload: unknown }[]).map(({ payload }) => payload),
+            receipts: (receipts.rows as readonly { event_id: string }[]).map(
+              ({ event_id }) => event_id,
+            ),
+            scheduledCancellation: (
+              snapshot.rows[0] as { scheduled_cancellation: boolean } | undefined
+            )?.scheduled_cancellation,
+          };
+        }),
+      );
+    const team = { plan: 'team', seatLimit: 18, storageByteLimit: 100_000_000_000, version: 1 };
+    const event = { actor: { type: 'system', id: 'billing-service' }, organizationId, ...team };
+
+    providerState(18);
+    // Simulate a Usage transaction holding the version-zero read until its writes commit.
+    const reader = service().get(GetBillingEntitlement);
+    let releaseReader: () => void = () => undefined;
+    const release = new Promise<void>((resolve) => {
+      releaseReader = resolve;
+    });
+    let reportSnapshot: (snapshot: unknown) => void = () => undefined;
+    const read = new Promise<unknown>((resolve) => {
+      reportSnapshot = resolve;
+    });
+    let readerPid = 0;
+    const holding = runWithOrganizationContext(memberOf(organizationId), () =>
+      tenant.run(async ({ client }) => {
+        const backend = await client.query('select pg_backend_pid() as pid');
+        readerPid = (backend.rows[0] as { pid: number }).pid;
+        reportSnapshot(await reader.execute({ organizationId }));
+        await release;
+      }),
+    );
+    const initialSettlement = read.then(() =>
+      Promise.all([submit('evt_team_start'), submit('evt_team_start')]),
+    );
+    try {
+      await expect(Promise.race([read, holding])).resolves.toEqual({
+        plan: 'free',
+        seatLimit: 5,
+        storageByteLimit: 2_000_000_000,
+        version: 0,
+      });
+      await vi.waitFor(async () => {
+        const waiting = await migrator.query<{ count: number }>(
+          `select count(*)::int as count from pg_locks
+           where locktype = 'advisory' and not granted
+           and $1 = any(pg_blocking_pids(pid))`,
+          [readerPid],
+        );
+        expect(waiting.rows[0]?.count).toBeGreaterThan(0);
+      });
+    } finally {
+      releaseReader();
+      await holding;
+    }
+    const initial = await initialSettlement;
+    expect(initial.map(({ status }) => status)).toEqual([204, 204]);
+    for (const token of quotaTokens) {
+      const result = await entitlement(token);
+      expect(result.status).toBe(200);
+      expect(result.body).toEqual(team);
+    }
+
+    providerState(18, true);
+    expect((await submit('evt_team_schedule')).status).toBe(204);
+    providerState(17);
+    const deferred = await submit('evt_team_resize');
+    expect(deferred.status).toBe(503);
+    expect(deferred.body).toMatchObject({ code: 'billing.unavailable' });
+    expect(await persisted()).toEqual({
+      events: [expect.objectContaining(event)],
+      receipts: ['evt_team_schedule', 'evt_team_start'],
+      scheduledCancellation: true,
+    });
+
+    // Settlement writes the receipt last. Force that write to fail after the snapshot and outbox.
+    await migrator.query(`
+      alter table stripe_reconciliation_receipts add constraint fixture_reject_resize
+      check (event_id <> 'evt_team_resize') not valid
+    `);
+    try {
+      providerState(21);
+      expect((await submit('evt_team_resize')).status).toBe(503);
+      expect(await persisted()).toEqual({
+        events: [expect.objectContaining(event)],
+        receipts: ['evt_team_schedule', 'evt_team_start'],
+        scheduledCancellation: true,
+      });
+    } finally {
+      await migrator.query(
+        'alter table stripe_reconciliation_receipts drop constraint fixture_reject_resize',
+      );
+    }
+
+    expect((await submit('evt_team_resize')).status).toBe(204);
+    expect(await persisted()).toEqual({
+      events: [
+        expect.objectContaining(event),
+        expect.objectContaining({ ...event, seatLimit: 21, version: 2 }),
+      ],
+      receipts: ['evt_team_resize', 'evt_team_schedule', 'evt_team_start'],
+      scheduledCancellation: false,
+    });
+  });
+
   it('answers the liveness probe without a token', async () => {
     const response = await request(service().getHttpServer()).get('/health/live');
 
@@ -948,7 +2198,7 @@ describe('billing-service wiring', () => {
     const journal = await migrator.query<{ applied: number }>(
       'select count(*)::int as applied from drizzle.__drizzle_migrations',
     );
-    expect(journal.rows).toEqual([{ applied: 3 }]);
+    expect(journal.rows).toEqual([{ applied: migrationCount }]);
   });
 
   it('publishes a pending event through the outbox relay', async () => {
@@ -1044,6 +2294,20 @@ describe('billing-service wiring', () => {
       status: 'error',
       error: { postgres: { status: 'down' } },
     });
+    const issuer = await InternalTokenSigner.create({
+      issuer: 'storage-service',
+      privateJwk: storage.privateJwk,
+    });
+    const token = await issuer.sign('billing-service', {
+      actor: { type: 'system', id: 'storage-service' },
+      organizationId: otherOrganizationId,
+    });
+    const entitlement = await request(service().getHttpServer())
+      .get('/internal/v1/billing/entitlement')
+      .set('Authorization', `Bearer ${token}`);
+    expect(entitlement.status).toBe(503);
+    expect(entitlement.body).toMatchObject({ code: 'billing.unavailable' });
+    expect(entitlement.headers['cache-control']).toBe('private, no-store');
   });
 
   it('answers 503 on readiness and 200 on liveness as soon as it shuts down', async () => {
