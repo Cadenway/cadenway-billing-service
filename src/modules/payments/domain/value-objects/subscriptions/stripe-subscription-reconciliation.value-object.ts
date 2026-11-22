@@ -12,6 +12,7 @@ export interface StripeSubscriptionReconciliation {
     readonly liveMode: boolean;
     readonly teamPriceIds: readonly string[];
     readonly freePlanLimits: { readonly seats: number; readonly storageBytes: number };
+    readonly freeReturnEnabled?: boolean;
   };
 
   /** A normalized subscription retrieved with Billing's Stripe credentials during reconciliation. */
@@ -25,8 +26,5 @@ export interface StripeSubscriptionReconciliation {
     readonly hasMoreItems: boolean;
     readonly items: readonly { readonly priceId: string; readonly quantity: number | null }[];
   };
-
-  /** Current seat and attachment usage. Null means the downgrade cannot be evaluated. */
-  readonly confirmedUsage: { readonly seats: number; readonly storageBytes: number } | null;
   // #endregion
 }

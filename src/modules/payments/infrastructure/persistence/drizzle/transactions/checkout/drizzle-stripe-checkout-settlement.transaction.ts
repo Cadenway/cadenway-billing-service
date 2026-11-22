@@ -11,6 +11,11 @@ const reservation = z.object({
   id: z.uuid(),
   provider_started_at: z.date().nullable(),
   provider_session_id: z.string().nullable(),
+  provider_customer_id: z
+    .string()
+    .max(255)
+    .regex(/^cus_[A-Za-z0-9_]+$/u)
+    .nullable(),
   price_id: z.string().nullable(),
   quantity: z.coerce.number().int().nullable(),
   resolved_at: z.date().nullable(),
@@ -29,12 +34,13 @@ const stripeBinding = z.object({ customer_id: z.string(), subscription_id: z.str
 /** Commits a verified terminal Checkout and its entitlement in one tenant transaction. */
 export class DrizzleStripeCheckoutSettlement implements StripeCheckoutSettlement {
   // #region Constructor
-  /** Supplies tenant isolation, the shared quota fence, Stripe mode and the Free seat allowance. */
+  /** Supplies tenant isolation, the shared quota fence, Stripe mode and the Free allowances. */
   public constructor(
     private readonly runner: TenantTransactionRunner<DatabaseSchema>,
     private readonly fence: StripeEntitlementFence,
     private readonly liveMode: boolean,
     private readonly freeSeatLimit: number,
+    private readonly freeStorageByteLimit?: number,
   ) {}
   // #endregion
 
@@ -68,7 +74,8 @@ export class DrizzleStripeCheckoutSettlement implements StripeCheckoutSettlement
       if (settled.rows.length !== 0) return 'duplicate';
 
       const attempts = await scope.client.query(
-        `select id, provider_started_at, provider_session_id, price_id, quantity, resolved_at
+        `select id, provider_started_at, provider_session_id, provider_customer_id,
+                price_id, quantity, resolved_at
          from stripe_checkout_attempts
          where organization_id = $1 and provider_key = $2
          limit 1 for update`,
@@ -78,7 +85,10 @@ export class DrizzleStripeCheckoutSettlement implements StripeCheckoutSettlement
       const attempt = reservation.parse(attempts.rows[0]);
       if (
         attempt.provider_started_at === null ||
-        (attempt.provider_session_id !== null && attempt.provider_session_id !== session.sessionId)
+        (attempt.provider_session_id !== null &&
+          attempt.provider_session_id !== session.sessionId) ||
+        (attempt.provider_customer_id !== null &&
+          attempt.provider_customer_id !== session.customerId)
       )
         return 'retry';
 
@@ -121,19 +131,28 @@ export class DrizzleStripeCheckoutSettlement implements StripeCheckoutSettlement
         );
         const binding =
           bindings.rows[0] === undefined ? undefined : stripeBinding.parse(bindings.rows[0]);
-        if (
-          binding !== undefined &&
-          (binding.customer_id !== session.customerId ||
-            binding.subscription_id !== session.subscriptionId)
-        )
-          return 'retry';
-
         const snapshots = await scope.client.query(
           `select plan, seats, storage_bytes, scheduled_cancellation, version
            from stripe_subscription_snapshots where organization_id = $1 limit 1 for update`,
           [organizationId],
         );
         const current = snapshots.rows[0] === undefined ? null : snapshot.parse(snapshots.rows[0]);
+        if (attempt.provider_customer_id !== null) {
+          if (
+            binding?.customer_id !== attempt.provider_customer_id ||
+            binding.subscription_id === session.subscriptionId ||
+            current?.plan !== 'free' ||
+            current.seats !== this.freeSeatLimit ||
+            current.storage_bytes !== this.freeStorageByteLimit
+          )
+            return 'retry';
+        } else if (
+          binding !== undefined &&
+          (binding.customer_id !== session.customerId ||
+            binding.subscription_id !== session.subscriptionId)
+        ) {
+          return 'retry';
+        }
         const previous: Extract<StripeSubscriptionDecision, { readonly kind: 'apply' }> | null =
           current === null
             ? null
@@ -173,6 +192,13 @@ export class DrizzleStripeCheckoutSettlement implements StripeCheckoutSettlement
           await scope.client.query(
             'insert into stripe_bindings (organization_id, customer_id, subscription_id) values ($1, $2, $3)',
             [organizationId, session.customerId, session.subscriptionId],
+          );
+        } else if (attempt.provider_customer_id !== null) {
+          await scope.client.query(
+            `update stripe_bindings
+             set subscription_id = $2, version = version + 1, updated_at = now()
+             where organization_id = $1`,
+            [organizationId, session.subscriptionId],
           );
         }
         if (changed) {

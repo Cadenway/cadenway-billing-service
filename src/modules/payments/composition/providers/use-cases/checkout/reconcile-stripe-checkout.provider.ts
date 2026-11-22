@@ -15,7 +15,7 @@ import { createStripeSubscriptionProvider } from '../../../../infrastructure/ada
 import { StripeEntitlementOutbox } from '../../../../infrastructure/messaging/outbox/subscriptions/stripe-entitlement-outbox.adapter.js';
 import { DrizzleStripeCheckoutAttemptReader } from '../../../../infrastructure/persistence/drizzle/repositories/checkout/drizzle-stripe-checkout-attempt-reader.repository.js';
 import { DrizzleStripeCheckoutSettlement } from '../../../../infrastructure/persistence/drizzle/transactions/checkout/drizzle-stripe-checkout-settlement.transaction.js';
-import { MonotonicStripeEntitlementFence } from '../../../../infrastructure/persistence/drizzle/transactions/subscriptions/monotonic-stripe-entitlement-fence.transaction.js';
+import { StripeEntitlementOutboxFence } from '../../../../infrastructure/persistence/drizzle/transactions/subscriptions/stripe-entitlement-outbox-fence.transaction.js';
 
 /** Reconciles Stripe Checkout using canonical reads and tenant-owned settlement. */
 export const reconcileStripeCheckoutProvider: FactoryProvider<ReconcileStripeCheckout | null> = {
@@ -35,11 +35,17 @@ export const reconcileStripeCheckoutProvider: FactoryProvider<ReconcileStripeChe
     }
     const liveMode = config.BILLING_STRIPE_WEBHOOK_MODE === 'live';
     const { seats, storageBytes } = plans.execute();
-    const fence = new MonotonicStripeEntitlementFence(
+    const fence = new StripeEntitlementOutboxFence(
       { seatLimit: seats, storageByteLimit: storageBytes },
       new StripeEntitlementOutbox(writer),
     );
-    const settlement = new DrizzleStripeCheckoutSettlement(tenant, fence, liveMode, seats);
+    const settlement = new DrizzleStripeCheckoutSettlement(
+      tenant,
+      fence,
+      liveMode,
+      seats,
+      storageBytes,
+    );
     return new ReconcileStripeCheckout(
       new DrizzleStripeCheckoutAttemptReader(system),
       createStripeCheckoutSessionReader(key, liveMode),

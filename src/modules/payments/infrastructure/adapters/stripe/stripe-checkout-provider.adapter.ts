@@ -59,6 +59,7 @@ const createdSession = checkoutSession.extend({
   status: z.literal('open'),
   url: hostedUrl,
   expires_at: timestampSeconds,
+  customer: customerId.nullish(),
 });
 
 const currentSession = checkoutSession.extend({
@@ -120,6 +121,7 @@ export function createStripeCheckoutProvider(apiKey: string, liveMode: boolean):
         !checkoutKey.safeParse(request.providerKey).success ||
         !priceId.safeParse(request.priceId).success ||
         !quantity.safeParse(request.quantity).success ||
+        (request.customerId !== undefined && !customerId.safeParse(request.customerId).success) ||
         expiresAt === undefined ||
         !canCreateBeforeExpiry(expiresAt)
       ) {
@@ -136,6 +138,7 @@ export function createStripeCheckoutProvider(apiKey: string, liveMode: boolean):
             after_expiration: { recovery: { enabled: false } },
             allowed_payment_method_types: ['card'],
             ui_mode: 'hosted_page',
+            ...(request.customerId === undefined ? {} : { customer: request.customerId }),
             line_items: [{ price: request.priceId, quantity: request.quantity }],
             client_reference_id: request.providerKey,
             metadata: { cadenway_checkout_key: request.providerKey },
@@ -157,7 +160,8 @@ export function createStripeCheckoutProvider(apiKey: string, liveMode: boolean):
         created.data.livemode !== liveMode ||
         created.data.client_reference_id !== request.providerKey ||
         created.data.metadata.cadenway_checkout_key !== request.providerKey ||
-        created.data.expires_at !== expiresAt
+        created.data.expires_at !== expiresAt ||
+        (request.customerId !== undefined && created.data.customer !== request.customerId)
       ) {
         throw unavailable();
       }
@@ -278,7 +282,11 @@ async function recoverSession(
     { timeout: recoveryTimeout(deadline) },
   );
   const session = decodeSession(response, id, liveMode);
-  if (session.client_reference_id !== target.providerKey) return { status: 'unknown' };
+  if (
+    session.client_reference_id !== target.providerKey ||
+    (target.customerId !== undefined && session.customer !== target.customerId)
+  )
+    return { status: 'unknown' };
 
   const terminal = mapSession(session);
   if (terminal.status === 'expired') return { status: 'terminal', sessionId: id };
@@ -387,7 +395,11 @@ function mapSession(session: z.output<typeof currentSession>): StripeCheckoutSes
   };
   if (session.status === 'expired') {
     if (session.payment_status !== 'unpaid' || session.subscription !== null) throw unavailable();
-    return { status: 'expired', ...reference };
+    return {
+      status: 'expired',
+      ...reference,
+      ...(session.customer === null ? {} : { customerId: session.customer }),
+    };
   }
   if (session.status !== 'complete' || session.payment_status !== 'paid') {
     return { status: 'pending' };

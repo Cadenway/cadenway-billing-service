@@ -10,9 +10,9 @@ import { createStripeSubscriptionProvider } from '../../../../infrastructure/ada
 import { StripeEntitlementOutbox } from '../../../../infrastructure/messaging/outbox/subscriptions/stripe-entitlement-outbox.adapter.js';
 import { DrizzleStripeBindingReader } from '../../../../infrastructure/persistence/drizzle/repositories/subscriptions/drizzle-stripe-binding.repository.js';
 import { DrizzleStripeReconciliationUnitOfWork } from '../../../../infrastructure/persistence/drizzle/transactions/subscriptions/drizzle-stripe-reconciliation.unit-of-work.js';
-import { MonotonicStripeEntitlementFence } from '../../../../infrastructure/persistence/drizzle/transactions/subscriptions/monotonic-stripe-entitlement-fence.transaction.js';
+import { StripeEntitlementOutboxFence } from '../../../../infrastructure/persistence/drizzle/transactions/subscriptions/stripe-entitlement-outbox-fence.transaction.js';
 
-/** Binds the real monotonic settlement only when payment admission is explicitly enabled. */
+/** Binds Stripe settlement and the explicit gate for publishing a return to Free. */
 export const reconcileStripeSubscriptionProvider: FactoryProvider<ReconcileStripeSubscription | null> =
   {
     provide: ReconcileStripeSubscription,
@@ -31,15 +31,22 @@ export const reconcileStripeSubscriptionProvider: FactoryProvider<ReconcileStrip
 
       const liveMode = config.BILLING_STRIPE_WEBHOOK_MODE === 'live';
       const { seats, storageBytes } = plans.execute();
-      const fence = new MonotonicStripeEntitlementFence(
+      const freeReturnEnabled = config.BILLING_STRIPE_FREE_RETURN_ENABLED;
+      const fence = new StripeEntitlementOutboxFence(
         { seatLimit: seats, storageByteLimit: storageBytes },
         new StripeEntitlementOutbox(writer),
+        freeReturnEnabled,
       );
       return new ReconcileStripeSubscription(
         new DrizzleStripeBindingReader(tenant),
         createStripeSubscriptionProvider(key, liveMode),
         new DrizzleStripeReconciliationUnitOfWork(tenant, fence),
-        { liveMode, teamPriceIds: prices, freePlanLimits: { seats, storageBytes } },
+        {
+          liveMode,
+          teamPriceIds: prices,
+          freePlanLimits: { seats, storageBytes },
+          freeReturnEnabled,
+        },
       );
     },
   };

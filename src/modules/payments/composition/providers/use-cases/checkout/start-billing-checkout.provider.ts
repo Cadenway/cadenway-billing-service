@@ -55,12 +55,17 @@ export const startBillingCheckoutProvider: FactoryProvider<StartBillingCheckout 
       baseUrl: organizationUrl,
       signer,
     });
+    const limits = freePlan.execute();
     return new StartBillingCheckout(
-      new DrizzleCheckoutUnitOfWork(runner, createHash('sha256').update(key).digest('hex')),
+      new DrizzleCheckoutUnitOfWork(
+        runner,
+        createHash('sha256').update(key).digest('hex'),
+        config.BILLING_STRIPE_FREE_RETURN_ENABLED ? limits : undefined,
+      ),
       createOrganizationCheckoutAuthority(
         client,
         (organizationId) => entitlement.execute({ organizationId }),
-        { priceId, successUrl, cancelUrl, freeSeatLimit: freePlan.execute().seats },
+        { priceId, successUrl, cancelUrl, freeSeatLimit: limits.seats },
       ),
       createStripeCheckoutProvider(key, config.BILLING_STRIPE_WEBHOOK_MODE === 'live'),
       (organizationId, providerKey, sessionId) =>

@@ -45,6 +45,7 @@ const migrationsFolder = fileURLToPath(new URL('../migrations', import.meta.url)
 const project = `billing-webhook-inbox-test-${String(process.pid)}`;
 const organizationId = '01938f6e-6d1a-7c3e-9a51-2f0c4b8d7e10';
 const otherOrganizationId = '01938f6e-0000-7000-8000-000000000002';
+const cancellationOrganizationId = '01938f6e-0000-7000-8000-000000000004';
 const signatureKey = 'whsec_fixture';
 const priceId = 'price_team_fixture';
 const customerId = 'cus_atelier_inbox';
@@ -105,7 +106,12 @@ describe('durable Stripe subscription deliveries', () => {
     return app;
   }
 
-  async function submit(eventId: string, customer = customerId, subscription = subscriptionId) {
+  async function submit(
+    eventId: string,
+    customer = customerId,
+    subscription = subscriptionId,
+    type = 'customer.subscription.updated',
+  ) {
     const token = await signer.sign('billing-service', {
       actor: { type: 'system', id: 'api-gateway' },
       organizationId: null,
@@ -113,7 +119,7 @@ describe('durable Stripe subscription deliveries', () => {
     const payload = JSON.stringify({
       id: eventId,
       object: 'event',
-      type: 'customer.subscription.updated',
+      type,
       livemode: false,
       data: { object: { object: 'subscription', id: subscription, customer } },
     });
@@ -184,6 +190,7 @@ describe('durable Stripe subscription deliveries', () => {
     vi.stubEnv('BILLING_STRIPE_WEBHOOK_MODE', 'test');
     vi.stubEnv('BILLING_STRIPE_WEBHOOK_SECRETS', JSON.stringify([signatureKey]));
     vi.stubEnv('BILLING_STRIPE_SETTLEMENT_ENABLED', 'true');
+    vi.stubEnv('BILLING_STRIPE_FREE_RETURN_ENABLED', 'true');
     vi.stubEnv('BILLING_STRIPE_WEBHOOK_INBOX_ENABLED', 'true');
     vi.stubEnv('BILLING_STRIPE_API_KEY', 'rk_test_local_fixture');
     vi.stubEnv('BILLING_STRIPE_TEAM_PRICE_IDS', JSON.stringify([priceId]));
@@ -204,6 +211,213 @@ describe('durable Stripe subscription deliveries', () => {
         [organizationId, customerId, subscriptionId],
       );
     });
+  });
+
+  it('returns a canceled Team subscription to Free only after Stripe confirms the terminal state', async () => {
+    const cancelCustomer = 'cus_atelier_cancel';
+    const cancelSubscription = 'sub_atelier_cancel';
+    const system = service().get(SystemTransactionRunner);
+    await system.run(async ({ client }) => {
+      await client.query(
+        'insert into stripe_bindings (organization_id, customer_id, subscription_id) values ($1, $2, $3)',
+        [cancellationOrganizationId, cancelCustomer, cancelSubscription],
+      );
+    });
+    const tenant = service().get(TenantTransactionRunner);
+    const read = () =>
+      runWithOrganizationContext(
+        {
+          organizationId: cancellationOrganizationId,
+          actor: { type: 'system', id: 'billing-service' },
+          role: null,
+          scopes: [],
+        },
+        () =>
+          tenant.run(async ({ client }) => {
+            const snapshot = await client.query(
+              `select plan, seats::int, storage_bytes, version::int, scheduled_cancellation
+               from stripe_subscription_snapshots where organization_id = $1`,
+              [cancellationOrganizationId],
+            );
+            const events = await client.query(
+              `select payload from outbox_events
+               where organization_id = $1 and event_name = 'subscription.changed.v1'
+               order by payload->>'version'`,
+              [cancellationOrganizationId],
+            );
+            const receipts = await client.query(
+              'select event_id from stripe_reconciliation_receipts where organization_id = $1 order by event_id',
+              [cancellationOrganizationId],
+            );
+            return { snapshot: snapshot.rows, events: events.rows, receipts: receipts.rows };
+          }),
+      );
+
+    const active = {
+      customerId: cancelCustomer,
+      subscriptionId: cancelSubscription,
+      liveMode: false,
+      status: 'active',
+      scheduledCancellation: false,
+      collectionPaused: false,
+      hasMoreItems: false,
+      items: [{ priceId, quantity: 8 }],
+    };
+    retrieveSubscription.mockResolvedValue(active);
+    expect((await submit('evt_cancel_team', cancelCustomer, cancelSubscription)).status).toBe(204);
+    await vi.waitFor(
+      async () => {
+        const result = await read();
+        expect(result.snapshot).toMatchObject([
+          { plan: 'team', seats: 8, version: 1, scheduled_cancellation: false },
+        ]);
+        expect(result.events).toHaveLength(1);
+      },
+      { timeout: 30_000 },
+    );
+
+    retrieveSubscription.mockResolvedValue({ ...active, scheduledCancellation: true });
+    expect((await submit('evt_cancel_scheduled', cancelCustomer, cancelSubscription)).status).toBe(
+      204,
+    );
+    await vi.waitFor(
+      async () => {
+        const result = await read();
+        expect(result.snapshot).toMatchObject([
+          { plan: 'team', seats: 8, version: 1, scheduled_cancellation: true },
+        ]);
+        expect(result.receipts).toContainEqual({ event_id: 'evt_cancel_scheduled' });
+        expect(result.events).toHaveLength(1);
+      },
+      { timeout: 30_000 },
+    );
+
+    expect(
+      (
+        await submit(
+          'evt_cancel_stale_deleted',
+          cancelCustomer,
+          cancelSubscription,
+          'customer.subscription.deleted',
+        )
+      ).status,
+    ).toBe(204);
+    await vi.waitFor(
+      async () => {
+        const result = await read();
+        expect(result.receipts).toContainEqual({ event_id: 'evt_cancel_stale_deleted' });
+        expect(result.snapshot).toMatchObject([{ plan: 'team', seats: 8, version: 1 }]);
+        expect(result.events).toHaveLength(1);
+      },
+      { timeout: 30_000 },
+    );
+
+    retrieveSubscription.mockResolvedValue({ ...active, status: 'canceled' });
+    const canceledId = 'evt_cancel_confirmed';
+    const canceled = await submit(
+      canceledId,
+      cancelCustomer,
+      cancelSubscription,
+      'customer.subscription.deleted',
+    );
+    expect(canceled.status).toBe(204);
+    expect(canceled.headers['cache-control']).toBe('private, no-store');
+    await vi.waitFor(
+      async () => {
+        const result = await read();
+        expect(result.snapshot).toMatchObject([
+          {
+            plan: 'free',
+            seats: 5,
+            storage_bytes: '2000000000',
+            version: 2,
+            scheduled_cancellation: false,
+          },
+        ]);
+        expect(result.receipts).toContainEqual({ event_id: canceledId });
+        expect(result.events).toHaveLength(2);
+        expect(result.events[1]).toMatchObject({
+          payload: { plan: 'free', seatLimit: 5, storageByteLimit: 2_000_000_000, version: 2 },
+        });
+      },
+      { timeout: 30_000 },
+    );
+    expect(
+      (
+        await submit(
+          canceledId,
+          cancelCustomer,
+          cancelSubscription,
+          'customer.subscription.deleted',
+        )
+      ).status,
+    ).toBe(204);
+    expect((await read()).events).toHaveLength(2);
+
+    const supersededId = 'evt_subscription_pending_before_replacement';
+    const stripeReadsBeforeReplacement = retrieveSubscription.mock.calls.length;
+    await runWithOrganizationContext(
+      {
+        organizationId: cancellationOrganizationId,
+        actor: { type: 'system', id: 'billing-service' },
+        role: null,
+        scopes: [],
+      },
+      () =>
+        tenant.run(async ({ client }) => {
+          // Seed work already admitted for the old pair before the replacement committed.
+          await client.query(
+            `insert into stripe_webhook_inbox (organization_id, event_id, kind, customer_id, subscription_id)
+             values ($1, $2, 'subscription', $3, $4)`,
+            [cancellationOrganizationId, supersededId, cancelCustomer, cancelSubscription],
+          );
+          await client.query(
+            `update stripe_bindings set subscription_id = $2, version = version + 1
+             where organization_id = $1`,
+            [cancellationOrganizationId, 'sub_atelier_replaced'],
+          );
+        }),
+    );
+    await vi.waitFor(
+      async () => {
+        const rows = await runWithOrganizationContext(
+          {
+            organizationId: cancellationOrganizationId,
+            actor: { type: 'system', id: 'billing-service' },
+            role: null,
+            scopes: [],
+          },
+          () =>
+            tenant.run(({ client }) =>
+              client.query(
+                'select finished_at is not null as finished from stripe_webhook_inbox where organization_id = $1 and event_id = $2',
+                [cancellationOrganizationId, supersededId],
+              ),
+            ),
+        );
+        expect(rows.rows).toEqual([{ finished: true }]);
+      },
+      { timeout: 30_000 },
+    );
+    expect(retrieveSubscription).toHaveBeenCalledTimes(stripeReadsBeforeReplacement);
+    expect(
+      (
+        await submit(
+          canceledId,
+          cancelCustomer,
+          cancelSubscription,
+          'customer.subscription.deleted',
+        )
+      ).status,
+    ).toBe(204);
+    const stale = await submit(
+      'evt_cancel_old_binding',
+      cancelCustomer,
+      cancelSubscription,
+      'customer.subscription.deleted',
+    );
+    expect(stale.status).toBe(503);
+    expect((await read()).events).toHaveLength(2);
   });
 
   afterAll(async () => {

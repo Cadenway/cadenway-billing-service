@@ -2,22 +2,19 @@ import type { BillingEntitlement } from '../../../../../application/models/subsc
 import type { StripeEntitlementOutbox } from '../../../../messaging/outbox/subscriptions/stripe-entitlement-outbox.adapter.js';
 import type { StripeEntitlementFence } from './stripe-entitlement-fence.transaction.js';
 
-/** Authorizes only changes that cannot lower a seat or storage admission limit. */
-export class MonotonicStripeEntitlementFence implements StripeEntitlementFence {
+/** Appends versioned limits for monotonic changes and explicitly enabled cancellation returns. */
+export class StripeEntitlementOutboxFence implements StripeEntitlementFence {
   // #region Constructor
   /** Supplies the effective Free baseline and the transaction-bound event writer. */
   public constructor(
     private readonly baseline: Pick<BillingEntitlement, 'seatLimit' | 'storageByteLimit'>,
     private readonly outbox: Pick<StripeEntitlementOutbox, 'append'>,
+    private readonly freeReturnEnabled: boolean = false,
   ) {}
   // #endregion
 
   // #region Properties
-  /** Quota owners have no coordinated proof authorizing a decrease in this rollout. */
-  public readonly confirmedUsage: StripeEntitlementFence['confirmedUsage'] = () =>
-    Promise.resolve(null);
-
-  /** Appends complete limits only when neither admission limit decreases. */
+  /** Checkout uses the default monotonic fence. Only cancellation settlement enables a lower cap. */
   public readonly authorizeChange: StripeEntitlementFence['authorizeChange'] = async (
     scope,
     organizationId,
@@ -28,7 +25,18 @@ export class MonotonicStripeEntitlementFence implements StripeEntitlementFence {
     const { seats, storageBytes } = next.limits;
     const currentSeats = previous?.limits.seats ?? this.baseline.seatLimit;
     const currentStorage = previous?.limits.storageBytes ?? this.baseline.storageByteLimit;
-    if (seats < currentSeats || storageBytes < currentStorage) return false;
+    if (next.plan === 'free') {
+      if (
+        !this.freeReturnEnabled ||
+        previous?.plan !== 'team' ||
+        seats !== this.baseline.seatLimit ||
+        storageBytes !== this.baseline.storageByteLimit
+      ) {
+        return false;
+      }
+    } else if (seats < currentSeats || storageBytes < currentStorage) {
+      return false;
+    }
 
     await this.outbox.append(scope, organizationId, {
       plan: next.plan,

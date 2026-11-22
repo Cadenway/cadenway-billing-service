@@ -15,5 +15,6 @@ export type StripeCheckoutSession =
       readonly sessionId: string;
       readonly providerKey: string;
       readonly liveMode: boolean;
+      readonly customerId?: string;
     }
   | { readonly status: 'pending' };

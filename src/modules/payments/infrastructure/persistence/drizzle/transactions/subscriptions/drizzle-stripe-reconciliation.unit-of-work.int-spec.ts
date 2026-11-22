@@ -12,10 +12,12 @@ import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
+import type { StripeReconciliationTransaction } from '../../../../../application/ports/outbound/transactions/subscriptions/stripe-reconciliation-transaction.port.js';
 import { ReconcileStripeSubscription } from '../../../../../application/use-cases/commands/subscriptions/reconcile-stripe-subscription/reconcile-stripe-subscription.use-case.js';
 import { DrizzleStripeBindingReader } from '../../repositories/subscriptions/drizzle-stripe-binding.repository.js';
 import { DrizzleStripeWebhookBindingReader } from '../../repositories/subscriptions/drizzle-stripe-webhook-binding.repository.js';
 import { DrizzleStripeReconciliationUnitOfWork } from './drizzle-stripe-reconciliation.unit-of-work.js';
+import { StripeEntitlementOutboxFence } from './stripe-entitlement-outbox-fence.transaction.js';
 import type { StripeEntitlementFence } from './stripe-entitlement-fence.transaction.js';
 
 const project = `cadenway-billing-stripe-test-${String(process.pid)}`;
@@ -109,7 +111,6 @@ describe('Stripe reconciliation PostgreSQL transactions', () => {
 
   it('rolls back the entitlement and receipt together, then settles once under a tenant lock', async () => {
     const fence: StripeEntitlementFence = {
-      confirmedUsage: vi.fn().mockResolvedValue(null),
       authorizeChange: vi.fn().mockResolvedValue(true),
     };
     const unit = new DrizzleStripeReconciliationUnitOfWork(runner, fence);
@@ -181,7 +182,6 @@ describe('Stripe reconciliation PostgreSQL transactions', () => {
 
   it('does not settle a change without the admission fence', async () => {
     const unit = new DrizzleStripeReconciliationUnitOfWork(runner, {
-      confirmedUsage: () => Promise.resolve(null),
       authorizeChange: () => Promise.resolve(false),
     });
     const result = await inTenant(organizationId, () =>
@@ -245,7 +245,6 @@ describe('Stripe reconciliation PostgreSQL transactions', () => {
 
   it('rolls back a receipt collision across tenants even if their bindings are distinct', async () => {
     const unit = new DrizzleStripeReconciliationUnitOfWork(runner, {
-      confirmedUsage: () => Promise.resolve(null),
       authorizeChange: () => Promise.resolve(true),
     });
     await expect(
@@ -272,5 +271,68 @@ describe('Stripe reconciliation PostgreSQL transactions', () => {
       ),
     );
     expect(snapshots.rows).toEqual([]);
+  });
+
+  it('returns to canonical Free once and keeps that snapshot for the canceled binding', async () => {
+    const organization = '01938f6e-6d1a-7c3e-9a51-2f0c4b8d7e13';
+    await inTenant(organization, () =>
+      runner.run(({ client }) =>
+        client.query(
+          'insert into stripe_bindings (organization_id, customer_id, subscription_id) values ($1, $2, $3)',
+          [organization, 'cus_canceled', 'sub_canceled'],
+        ),
+      ),
+    );
+    const append = vi.fn().mockResolvedValue(undefined);
+    const baseline = { seatLimit: 5, storageByteLimit: 2_000_000_000 };
+    const unit = new DrizzleStripeReconciliationUnitOfWork(
+      runner,
+      new StripeEntitlementOutboxFence(baseline, { append }, true),
+    );
+    const free = {
+      kind: 'apply' as const,
+      plan: 'free' as const,
+      limits: { seats: 5, storageBytes: 2_000_000_000 },
+    };
+    const apply = (
+      decision: Parameters<StripeReconciliationTransaction['apply']>[0],
+      eventId: string,
+    ) =>
+      inTenant(organization, () =>
+        unit.run(organization, async (tx) => {
+          expect(await tx.lockBinding()).not.toBeNull();
+          const result = await tx.apply(decision);
+          if (result !== 'deferred') await tx.settle(eventId);
+          return result;
+        }),
+      );
+
+    await expect(apply(team, 'evt_paid_team')).resolves.toBe('applied');
+    await expect(
+      apply({ ...team, limits: { ...team.limits, seats: 7 } }, 'evt_lower_team'),
+    ).resolves.toBe('deferred');
+    await expect(
+      apply({ ...free, limits: { ...free.limits, seats: 6 } }, 'evt_noncanonical_free'),
+    ).resolves.toBe('deferred');
+    await expect(apply(free, 'evt_cancel_team')).resolves.toBe('applied');
+    await expect(apply(free, 'evt_unchanged_cancel')).resolves.toBe('unchanged');
+    await expect(apply(team, 'evt_stale_team')).resolves.toBe('unchanged');
+    expect(append).toHaveBeenCalledTimes(2);
+    expect(append).toHaveBeenLastCalledWith(expect.anything(), organization, {
+      plan: 'free',
+      ...baseline,
+      version: 2,
+    });
+    const snapshots = await inTenant(organization, () =>
+      runner.run(({ client }) =>
+        client.query(
+          'select plan, seats::text, storage_bytes::text, version::text from stripe_subscription_snapshots where organization_id = $1',
+          [organization],
+        ),
+      ),
+    );
+    expect(snapshots.rows).toEqual([
+      { plan: 'free', seats: '5', storage_bytes: '2000000000', version: '2' },
+    ]);
   });
 });

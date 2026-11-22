@@ -7,6 +7,7 @@ export type CheckoutClaim =
       readonly status: 'claimed';
       readonly token: string;
       readonly providerKey: string;
+      readonly customerId?: string;
       readonly request: CheckoutProviderRequest | null;
     }
   | {

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { StripeWebhookDelivery } from '../../../../models/webhooks/stripe-webhook-delivery.model.js';
+import type { StripeBindingReader } from '../../../../ports/outbound/persistence/subscriptions/stripe-binding-reader.port.js';
 import type { StripeWebhookBindingReader } from '../../../../ports/outbound/persistence/subscriptions/stripe-webhook-binding-reader.port.js';
 import type { ReconcileStripeSubscription } from '../reconcile-stripe-subscription/reconcile-stripe-subscription.use-case.js';
 import type { ReconcileStripeCheckout } from '../../checkout/reconcile-stripe-checkout/reconcile-stripe-checkout.use-case.js';
@@ -19,15 +20,18 @@ function setup() {
     .fn<StripeWebhookBindingReader['hasSettlement']>()
     .mockResolvedValue(false);
   const resolve = vi.fn<StripeWebhookBindingReader['resolve']>();
+  const readTenantBinding = vi.fn<StripeBindingReader['read']>().mockResolvedValue(null);
   const subscription = vi.fn<ReconcileStripeSubscription['execute']>();
   const checkout = vi.fn<ReconcileStripeCheckout['execute']>();
   return {
     hasSettlement,
     resolve,
+    readTenantBinding,
     subscription,
     checkout,
     reconcile: new ReconcileStripeWebhookDelivery(
       { hasSettlement, resolve },
+      readTenantBinding,
       subscription,
       checkout,
     ),
@@ -72,6 +76,31 @@ describe('ReconcileStripeWebhookDelivery', () => {
 
     await expect(reconcile.execute(delivery)).resolves.toBe('settled');
     expect(resolve).not.toHaveBeenCalled();
+    expect(subscription).not.toHaveBeenCalled();
+  });
+
+  it('ends pending work when the admitted subscription has been replaced for the same customer', async () => {
+    const { resolve, readTenantBinding, subscription, reconcile } = setup();
+    resolve.mockResolvedValue(null);
+    readTenantBinding.mockResolvedValue({
+      revision: 7,
+      binding: { customerId: delivery.customerId, subscriptionId: 'sub_replacement' },
+    });
+
+    await expect(reconcile.execute(delivery)).resolves.toBe('settled');
+    expect(readTenantBinding).toHaveBeenCalledExactlyOnceWith(delivery.organizationId);
+    expect(subscription).not.toHaveBeenCalled();
+  });
+
+  it('keeps work pending without proof that the same customer replaced the subscription', async () => {
+    const { resolve, readTenantBinding, subscription, reconcile } = setup();
+    resolve.mockResolvedValue(null);
+    readTenantBinding.mockResolvedValue({
+      revision: 7,
+      binding: { customerId: 'cus_unknown', subscriptionId: 'sub_replacement' },
+    });
+
+    await expect(reconcile.execute(delivery)).resolves.toBe('retry');
     expect(subscription).not.toHaveBeenCalled();
   });
 

@@ -19,17 +19,14 @@ const currentSubscription = {
   hasMoreItems: false,
   items: [{ priceId: 'price_team_fixture', quantity: 18 }],
 };
-const atTheFreeLimit = { seats: 5, storageBytes: 2_000_000_000 };
-
 function reconcile(
   subscription: Partial<StripeSubscriptionReconciliation['subscription']> = {},
-  confirmedUsage: StripeSubscriptionReconciliation['confirmedUsage'] = null,
+  overrides: Partial<StripeSubscriptionReconciliation['settings']> = {},
 ) {
   return resolveStripeSubscription({
     binding,
-    settings,
+    settings: { ...settings, ...overrides },
     subscription: { ...currentSubscription, ...subscription },
-    confirmedUsage,
   });
 }
 
@@ -44,7 +41,7 @@ describe('Stripe subscription reconciliation', () => {
   });
 
   it('retains Team until a scheduled cancellation is reflected in the current status', () => {
-    expect(reconcile({ scheduledCancellation: true })).toEqual({
+    expect(reconcile({ scheduledCancellation: true }, { freeReturnEnabled: true })).toEqual({
       kind: 'apply',
       plan: 'team',
       limits: { seats: 18, storageBytes: 100_000_000_000 },
@@ -74,41 +71,34 @@ describe('Stripe subscription reconciliation', () => {
           liveMode: true,
           items: [{ priceId: 'price_annual', quantity: 1 }],
         },
-        confirmedUsage: null,
       }),
     ).toMatchObject({ kind: 'apply', plan: 'team', limits: { seats: 5 } });
   });
 
-  it.each(['canceled', 'incomplete_expired'])(
-    'selects the documented Free allowance after %s only when usage fits',
-    (status) => {
-      expect(reconcile({ status }, atTheFreeLimit)).toEqual({
-        kind: 'apply',
-        plan: 'free',
-        limits: { seats: 5, storageBytes: 2_000_000_000 },
-      });
-    },
-  );
-
-  it.each([
-    { seats: 6, storageBytes: 2_000_000_000 },
-    { seats: 5, storageBytes: 2_000_000_001 },
-  ])('defers a Free downgrade when current usage exceeds either Free limit', (usage) => {
-    expect(reconcile({ status: 'canceled' }, usage)).toEqual({
-      kind: 'reconcile',
-      reason: 'free-quota-exceeded',
+  it('selects the canonical Free allowance for a confirmed cancellation when enabled', () => {
+    expect(reconcile({ status: 'canceled' }, { freeReturnEnabled: true })).toEqual({
+      kind: 'apply',
+      plan: 'free',
+      limits: { seats: 5, storageBytes: 2_000_000_000 },
     });
   });
 
-  it.each([null, { seats: -1, storageBytes: 0 }, { seats: 1, storageBytes: Number.NaN }])(
-    'requires complete valid usage before applying Free (%s)',
-    (usage) => {
-      expect(reconcile({ status: 'canceled' }, usage)).toEqual({
-        kind: 'reconcile',
-        reason: 'free-quota-unverified',
-      });
-    },
-  );
+  it('defers a confirmed cancellation until returns to Free are enabled', () => {
+    expect(reconcile({ status: 'canceled' })).toEqual({
+      kind: 'reconcile',
+      reason: 'free-return-disabled',
+    });
+  });
+
+  it.each([
+    { seats: 0, storageBytes: 2_000_000_000 },
+    { seats: 5, storageBytes: Number.NaN },
+  ])('requires a valid Free allowance before applying a cancellation (%s)', (freePlanLimits) => {
+    expect(reconcile({ status: 'canceled' }, { freeReturnEnabled: true, freePlanLimits })).toEqual({
+      kind: 'reconcile',
+      reason: 'invalid-free-allowance',
+    });
+  });
 
   it.each([
     { customerId: 'cus_other' },
@@ -125,7 +115,6 @@ describe('Stripe subscription reconciliation', () => {
         binding: missingBinding,
         settings,
         subscription: { ...currentSubscription, ...missingBinding },
-        confirmedUsage: null,
       }),
     ).toEqual({ kind: 'ignore', reason: 'binding-mismatch' });
   });
@@ -137,10 +126,13 @@ describe('Stripe subscription reconciliation', () => {
     });
   });
 
-  it.each(['past_due', 'unpaid', 'paused', 'future-status'])(
+  it.each(['incomplete_expired', 'past_due', 'unpaid', 'paused', 'future-status'])(
     'defers entitlement changes for %s',
     (status) => {
-      expect(reconcile({ status })).toEqual({ kind: 'reconcile', reason: 'unresolved-status' });
+      expect(reconcile({ status }, { freeReturnEnabled: true })).toEqual({
+        kind: 'reconcile',
+        reason: 'unresolved-status',
+      });
     },
   );
 
@@ -174,7 +166,7 @@ describe('Stripe subscription reconciliation', () => {
     expect(
       reconcile(
         { status: 'canceled', items: [{ priceId: 'price_other', quantity: 1 }] },
-        atTheFreeLimit,
+        { freeReturnEnabled: true },
       ),
     ).toEqual({ kind: 'reconcile', reason: 'unexpected-team-items' });
   });

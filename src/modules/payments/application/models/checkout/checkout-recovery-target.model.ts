@@ -13,6 +13,9 @@ export interface CheckoutRecoveryTarget {
   /** Stripe session ID, when its response was committed by Billing. */
   readonly sessionId: string | null;
 
+  /** Existing Stripe customer submitted with the original request, if any. */
+  readonly customerId?: string;
+
   /** Expected provider price. */
   readonly priceId: string;
 

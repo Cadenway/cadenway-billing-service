@@ -146,7 +146,6 @@ describe('Stripe subscription provider', () => {
           teamPriceIds: [price.id],
           freePlanLimits: { seats: 5, storageBytes: 2_000_000_000 },
         },
-        confirmedUsage: null,
       }),
     ).toEqual({ kind: 'reconcile', reason: 'unexpected-team-items' });
   });

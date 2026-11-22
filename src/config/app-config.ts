@@ -39,6 +39,7 @@ import { z } from 'zod';
  *   delivery mode and active endpoint keys.
  * - `BILLING_STRIPE_SETTLEMENT_ENABLED`, `BILLING_STRIPE_API_KEY` and
  *   `BILLING_STRIPE_TEAM_PRICE_IDS` gate and configure canonical provider settlement.
+ * - `BILLING_STRIPE_FREE_RETURN_ENABLED` allows verified cancellation to restore Free limits.
  * - `BILLING_STRIPE_WEBHOOK_INBOX_ENABLED` admits eligible deliveries before settlement.
  * - `BILLING_STRIPE_INVOICE_CURSOR_KEY` enables linked invoice reads and seals their cursors.
  * - `ORGANIZATION_SERVICE_URL`, `STORAGE_SERVICE_URL` and `INTERNAL_TOKEN_PRIVATE_JWK`
@@ -55,6 +56,7 @@ export type AppConfig = BaseConfig &
     readonly BILLING_STRIPE_WEBHOOK_MODE: 'test' | 'live';
     readonly BILLING_STRIPE_WEBHOOK_SECRETS?: readonly string[] | undefined;
     readonly BILLING_STRIPE_SETTLEMENT_ENABLED: boolean;
+    readonly BILLING_STRIPE_FREE_RETURN_ENABLED: boolean;
     readonly BILLING_STRIPE_WEBHOOK_INBOX_ENABLED: boolean;
     readonly BILLING_STRIPE_API_KEY?: string | undefined;
     readonly BILLING_STRIPE_TEAM_PRICE_IDS?: readonly string[] | undefined;
@@ -172,6 +174,10 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
       .enum(['true', 'false'])
       .default('false')
       .transform((value) => value === 'true'),
+    BILLING_STRIPE_FREE_RETURN_ENABLED: z
+      .enum(['true', 'false'])
+      .default('false')
+      .transform((value) => value === 'true'),
     BILLING_STRIPE_WEBHOOK_INBOX_ENABLED: z
       .enum(['true', 'false'])
       .default('false')
@@ -204,6 +210,13 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
       internalTokenSignerConfigShape.INTERNAL_TOKEN_PRIVATE_JWK.optional(),
   })
   .superRefine((config, context) => {
+    if (config.BILLING_STRIPE_FREE_RETURN_ENABLED && !config.BILLING_STRIPE_SETTLEMENT_ENABLED) {
+      context.addIssue({
+        code: 'custom',
+        path: ['BILLING_STRIPE_FREE_RETURN_ENABLED'],
+        message: 'Stripe settlement is required to restore the Free allowance after cancellation.',
+      });
+    }
     if (config.BILLING_STRIPE_WEBHOOK_INBOX_ENABLED && !config.BILLING_STRIPE_SETTLEMENT_ENABLED) {
       context.addIssue({
         code: 'custom',

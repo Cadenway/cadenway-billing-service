@@ -46,6 +46,8 @@ expiration deadline and a digest of the dispatch credential. These fields are nu
 for attempts submitted by the earlier binary.
 Migration `0009_stripe_webhook_inbox.sql` adds the inbox with forced RLS and a due-delivery
 index. A worker-only system scope can claim pending rows. Other writes use the resolved tenant.
+Migration `0010_stripe_checkout_customer.sql` adds the customer ID to the immutable Checkout
+request. The value is nullable for earlier reservations and initial purchases.
 
 ## API
 
@@ -94,11 +96,13 @@ None.
   exact customer and subscription pair through the system transaction runner. Missing or
   conflicting pairs and events carrying a connected account or separate authentication
   context have no match. Ordinary billing reads continue to use the tenant transaction runner.
-- The initial quota fence permits only transitions that preserve or increase each committed
-  limit, using the Free baseline when no snapshot exists. A decrease needs a coordinated
-  preparation protocol with Organization and Storage. A deferred event has no committed receipt
-  and can be retried. A scheduled cancellation update alone preserves the entitlement version
-  and produces no quota event.
+- The quota fence permits monotonic changes and the explicitly enabled return from Team to the
+  canonical Free allowance of five seats and 2,000,000,000 bytes. Billing requires the bound
+  subscription to be canceled on a current Stripe read. A scheduled cancellation alone records
+  its marker and keeps the current Team entitlement version. A deferred event has no committed
+  receipt and can be retried.
+- A committed Free snapshot is terminal for the old binding. Only a new paid Checkout can
+  replace the bound subscription and restore Team.
 
 ## Transactions
 
@@ -117,6 +121,8 @@ canonical synchronous path. A worker claims one due event at a time, with a 60-s
 and releases the database transaction before Stripe reads. At each attempt, it re-resolves
 the binding or reservation and reconciles only within the admitted tenant. The existing
 settlement receipt makes a replay safe after a crash between settlement and inbox completion.
+When a Checkout replaces a subscription, pending work for the old subscription finishes
+without modifying the entitlement once the tenant's current binding proves the same customer.
 A tenant-scoped lease check guards status changes. Pending work survives failures and retries
 at bounded intervals up to 15 minutes without discarding work. Warnings report failed stages,
 attempt counts, age and a digest for correlation. The endpoint never stores raw provider deliveries.
@@ -129,6 +135,10 @@ attempt counts, age and a digest for correlation. The endpoint never stores raw 
   production readiness of both quota owners and configured Stripe credentials and Team prices.
   The local mode defaults to `test`. Two endpoint signing keys can coexist during rotation.
   Subscription deliveries never create bindings.
+- `BILLING_STRIPE_FREE_RETURN_ENABLED` defaults to false and requires Stripe settlement. Enable
+  it after all Organization and Storage consumers can apply the lower versioned limits under
+  their respective admission locks. Existing members and verified attachments are retained.
+  New admissions use the Free limits once each service has applied the event.
 - `BILLING_STRIPE_WEBHOOK_INBOX_ENABLED` defaults to false. Apply the additive migration and use
   a worker-capable binary before enabling admission. To return to synchronous admission,
   disable the inbox flag and keep settlement enabled so the worker drains acknowledged work.
@@ -149,9 +159,12 @@ attempt counts, age and a digest for correlation. The endpoint never stores raw 
   Creation refuses a lower effective quota than the committed quota. A paid session matching
   its reservation records the initial binding, entitlement, receipt and outbox fact in one
   tenant transaction.
-- Start refuses creation for an organization with an existing Stripe binding. Before sending
-  any new request, Billing commits its exact Stripe parameters, including an absolute two-hour
-  expiration. Every POST uses that same deadline and idempotency key. The database and adapter
+- With returns to Free enabled, an organization with a committed Free snapshot can start a new
+  Checkout on its bound Stripe customer, preserving invoice history. Settlement updates the
+  subscription and binding revision together with the entitlement and retains previous receipts.
+  Before sending any new request, Billing commits its exact Stripe parameters, including an
+  absolute two-hour expiration and the bound customer when applicable. Every POST uses those
+  same parameters and idempotency key. The database and adapter
   stop sending POSTs before the expiration gets too close to Stripe's minimum lifetime. A
   changed Stripe credential allows only read-only recovery for existing reservations.
 - A retry can read the saved Stripe session ID or locate a unique matching provider reference
@@ -163,3 +176,8 @@ attempt counts, age and a digest for correlation. The endpoint never stores raw 
 - Older Checkout dispatchers predate the immutable deadline. Stop them before enabling the
   new path. The additive schema remains readable by the previous binary. Keep Checkout
   creation disabled if reverting to that binary while newer reservations remain open.
+- Before reverting to a binary that predates the persisted Checkout customer, disable new
+  returns and new Checkout creation, then resolve every outstanding Checkout that reuses a
+  customer with the current settlement worker. The earlier binary cannot settle these
+  reservations. Keep consumers that support the Free snapshot in place for in-flight
+  entitlement events.

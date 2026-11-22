@@ -17,7 +17,7 @@ type Entitlement = Extract<StripeSubscriptionDecision, { readonly kind: 'apply' 
 /** Serializes provider receipts and entitlement changes within a tenant transaction. */
 export class DrizzleStripeReconciliationUnitOfWork implements StripeReconciliationUnitOfWork {
   // #region Constructor
-  /** Requires local transactional quota fencing and fact publication before any change. */
+  /** Authorizes and records changes in the same transaction as the committed snapshot. */
   public constructor(
     private readonly runner: TenantTransactionRunner<DatabaseSchema>,
     private readonly fence: StripeEntitlementFence,
@@ -80,10 +80,6 @@ export class DrizzleStripeReconciliationUnitOfWork implements StripeReconciliati
             .limit(1);
           return row !== undefined;
         },
-        confirmedUsage: async () => {
-          requireLock();
-          return await this.fence.confirmedUsage(scope, organizationId);
-        },
         apply: async (decision) => {
           requireLock();
           const [row] = await scope.db
@@ -92,6 +88,9 @@ export class DrizzleStripeReconciliationUnitOfWork implements StripeReconciliati
             .where(eq(stripeSubscriptionSnapshots.organizationId, organizationId))
             .limit(1)
             .for('update');
+          // A settled cancellation is terminal for this binding. Only a paid Checkout can
+          // replace it and restore Team.
+          if (row?.plan === 'free' && decision.plan === 'team') return 'unchanged';
           const previous: Entitlement | null =
             row === undefined
               ? null

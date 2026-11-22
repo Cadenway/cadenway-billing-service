@@ -177,6 +177,24 @@ describe('Stripe hosted Checkout creation', () => {
     expect(sdk.beforeRequest).toHaveBeenCalledTimes(1);
   });
 
+  it('reuses the retained customer across provider attempts and verifies the created session', async () => {
+    const resumed = { ...request, customerId: 'cus_retained' };
+    sdk.create.mockResolvedValueOnce({ ...opened, customer: 'cus_unrelated' });
+    sdk.create.mockResolvedValueOnce({ ...opened, customer: resumed.customerId });
+    const provider = createStripeCheckoutProvider(credential, false);
+
+    await expect(provider.create(resumed)).rejects.toThrow(unavailable);
+    await expect(provider.create(resumed)).resolves.toEqual({
+      url: opened.url,
+      sessionId: opened.id,
+    });
+    expect(sdk.create).toHaveBeenCalledWith(
+      expect.objectContaining({ customer: resumed.customerId }),
+      { idempotencyKey: resumed.providerKey },
+    );
+    expect(sdk.create.mock.calls[0]).toEqual(sdk.create.mock.calls[1]);
+  });
+
   it.each<{
     status: number;
     headers?: Record<string, string>;
@@ -261,6 +279,20 @@ describe('Stripe hosted Checkout creation', () => {
 });
 
 describe('Stripe Checkout read-only recovery', () => {
+  it('requires the retained customer when recovering a provider session', async () => {
+    const resumed = { ...target, customerId: 'cus_retained' };
+    sdk.retrieve.mockResolvedValueOnce({ ...currentOpen, customer: 'cus_unrelated' });
+    sdk.retrieve.mockResolvedValueOnce({ ...currentOpen, customer: resumed.customerId });
+    const provider = createStripeCheckoutProvider(credential, false);
+
+    await expect(provider.recover(resumed)).resolves.toEqual({ status: 'unknown' });
+    await expect(provider.recover(resumed)).resolves.toEqual({
+      status: 'open',
+      sessionId: opened.id,
+      url: opened.url,
+    });
+  });
+
   it('reads the saved session directly and returns its original hosted URL when open', async () => {
     sdk.retrieve.mockResolvedValueOnce(currentOpen);
     const provider = createStripeCheckoutProvider(credential, false);
@@ -470,6 +502,7 @@ describe('Stripe canonical Checkout session retrieval', () => {
       sessionId: opened.id,
       providerKey: request.providerKey,
       liveMode: false,
+      customerId: paid.customer,
     });
     await expect(reader.retrieve(opened.id)).resolves.toEqual({ status: 'pending' });
     await expect(reader.retrieve(opened.id)).resolves.toEqual({ status: 'pending' });

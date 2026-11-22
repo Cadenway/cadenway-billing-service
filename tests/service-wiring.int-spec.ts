@@ -138,7 +138,7 @@ const paymentsTables = [
 ] as const;
 
 /** Migrations applied on a clean or upgraded database. */
-const migrationCount = 10;
+const migrationCount = 11;
 const stripeFixtureKey = 'whsec_fixture';
 const stripeTeamPrice = 'price_team_fixture';
 
@@ -727,7 +727,7 @@ describe('billing-service wiring', () => {
     expect(journal.rows).toEqual([{ applied: migrationCount }]);
   });
 
-  it.each([1, 3, 4, 6, 7, 8, 9])(
+  it.each([1, 3, 4, 6, 7, 8, 9, 10])(
     'upgrades from %i applied migrations without losing rows or application privileges',
     async (previousCount) => {
       const port = hostPort('postgres', '5432');
@@ -818,7 +818,7 @@ describe('billing-service wiring', () => {
             );
             return client.query(
               `select organization_id, price_id, quantity, provider_session_id,
-                      provider_expires_at, provider_dispatch_key_digest
+                      provider_expires_at, provider_dispatch_key_digest, provider_customer_id
                from stripe_checkout_attempts where provider_key = 'checkout_upgrade'`,
             );
           });
@@ -830,6 +830,7 @@ describe('billing-service wiring', () => {
               provider_session_id: null,
               provider_expires_at: null,
               provider_dispatch_key_digest: null,
+              provider_customer_id: null,
             },
           ]);
         }

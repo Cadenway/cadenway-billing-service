@@ -88,6 +88,7 @@ export class StartBillingCheckout {
       if (prepared !== null) {
         request = {
           ...prepared,
+          ...(claim.customerId === undefined ? {} : { customerId: claim.customerId }),
           expiresAt: Math.floor(Date.now() / 1000) + checkoutLifetimeSeconds,
         };
       }

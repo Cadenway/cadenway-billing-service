@@ -61,7 +61,6 @@ export class ReconcileStripeSubscription {
         binding: current.binding,
         settings: this.settings,
         subscription,
-        confirmedUsage: await transaction.confirmedUsage(),
       });
       if (decision.kind === 'reconcile') return { status: 'retry' };
       if (decision.kind === 'ignore') {

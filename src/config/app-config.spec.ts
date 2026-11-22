@@ -33,6 +33,7 @@ describe('appConfigSchema', () => {
       BILLING_USAGE_ENABLED: false,
       BILLING_STRIPE_WEBHOOK_MODE: 'test',
       BILLING_STRIPE_SETTLEMENT_ENABLED: false,
+      BILLING_STRIPE_FREE_RETURN_ENABLED: false,
       BILLING_STRIPE_WEBHOOK_INBOX_ENABLED: false,
       INTERNAL_TOKEN_AUDIENCE: 'billing-service',
       INTERNAL_TOKEN_TRUSTED_ISSUERS: {
@@ -121,6 +122,22 @@ describe('appConfigSchema', () => {
     expect(() => loadConfig(appConfigSchema, enabled)).toThrow(
       /ORGANIZATION_SERVICE_URL[\s\S]*STORAGE_SERVICE_URL[\s\S]*INTERNAL_TOKEN_PRIVATE_JWK/u,
     );
+  });
+
+  it('requires settlement before enabling a verified return to Free', () => {
+    const enabled = { ...complete, BILLING_STRIPE_FREE_RETURN_ENABLED: 'true' };
+    expect(() => loadConfig(appConfigSchema, enabled)).toThrow(
+      /BILLING_STRIPE_FREE_RETURN_ENABLED/u,
+    );
+    expect(
+      loadConfig(appConfigSchema, {
+        ...enabled,
+        BILLING_STRIPE_SETTLEMENT_ENABLED: 'true',
+        BILLING_STRIPE_API_KEY: 'rk_test_fixture',
+        BILLING_STRIPE_WEBHOOK_SECRETS: '["whsec_fixture"]',
+        BILLING_STRIPE_TEAM_PRICE_IDS: '["price_fixture"]',
+      }),
+    ).toMatchObject({ BILLING_STRIPE_FREE_RETURN_ENABLED: true });
   });
 
   it('requires configured settlement, a Team price and the initial Checkout authorities', () => {

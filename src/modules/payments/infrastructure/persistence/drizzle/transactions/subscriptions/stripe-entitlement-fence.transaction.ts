@@ -1,18 +1,11 @@
 import type { DatabaseSchema, TransactionScope } from '@cadenway/nest-common/database';
 
 import type { StripeSubscriptionDecision } from '../../../../../domain/value-objects/subscriptions/stripe-subscription-decision.value-object.js';
-import type { StripeSubscriptionReconciliation } from '../../../../../domain/value-objects/subscriptions/stripe-subscription-reconciliation.value-object.js';
 
-/** Local, transaction-bound quota proof and outbox coordination for entitlement changes. */
+/** Authorizes and records entitlement changes within the Billing transaction. */
 export interface StripeEntitlementFence {
   // #region Properties
-  /** Returns a current usage proof from local, fenced evidence, or null when unavailable. */
-  readonly confirmedUsage: (
-    scope: TransactionScope<DatabaseSchema>,
-    organizationId: string,
-  ) => Promise<StripeSubscriptionReconciliation['confirmedUsage']>;
-
-  /** Fences admissions and appends the change fact in this same transaction, or defers. */
+  /** Appends the change fact in the same transaction when the transition is allowed. */
   readonly authorizeChange: (
     scope: TransactionScope<DatabaseSchema>,
     organizationId: string,

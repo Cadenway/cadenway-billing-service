@@ -14,15 +14,14 @@ export function effectiveTeamSeatLimit(paidQuantity: number, freeSeatLimit: numb
  * [Stripe lifecycle](https://docs.stripe.com/api/subscriptions/object#subscription_object-status)
  * keeps a subscription active or trialing until a scheduled cancellation takes effect. Billing
  * reads the current Stripe subscription for each reconciliation because webhook order is arbitrary.
- * Organisation › Facturation sets Team storage at 100 GB and only allows a downgrade when the
- * organization fits in the new plan. The application must revalidate the binding and any reduced
- * allowance before persisting this decision. A webhook payload alone provides none of that proof.
+ * Organisation › Facturation sets Team storage at 100 GB. A provider-confirmed cancellation
+ * returns a previously paid subscription to the Free limits once both quota owners support that
+ * transition. The quota owners keep existing resources and check new admissions against the limit.
  */
 export function resolveStripeSubscription({
   binding,
   settings,
   subscription,
-  confirmedUsage,
 }: StripeSubscriptionReconciliation): StripeSubscriptionDecision {
   if (
     subscription.liveMode !== settings.liveMode ||
@@ -39,7 +38,7 @@ export function resolveStripeSubscription({
     return { kind: 'ignore', reason: 'initial-payment-pending' };
   }
   const entitled = status === 'active' || status === 'trialing';
-  const ended = status === 'canceled' || status === 'incomplete_expired';
+  const ended = status === 'canceled';
   if ((!entitled && !ended) || (entitled && subscription.collectionPaused)) {
     return { kind: 'reconcile', reason: 'unresolved-status' };
   }
@@ -69,28 +68,13 @@ export function resolveStripeSubscription({
   }
 
   const { freePlanLimits } = settings;
-  if (
-    confirmedUsage === null ||
-    !isCounter(confirmedUsage.seats) ||
-    !isCounter(confirmedUsage.storageBytes) ||
-    !isPositiveInteger(freePlanLimits.seats) ||
-    !isPositiveInteger(freePlanLimits.storageBytes)
-  ) {
-    return { kind: 'reconcile', reason: 'free-quota-unverified' };
-  }
-  if (
-    confirmedUsage.seats > freePlanLimits.seats ||
-    confirmedUsage.storageBytes > freePlanLimits.storageBytes
-  ) {
-    return { kind: 'reconcile', reason: 'free-quota-exceeded' };
+  if (!settings.freeReturnEnabled) return { kind: 'reconcile', reason: 'free-return-disabled' };
+  if (!isPositiveInteger(freePlanLimits.seats) || !isPositiveInteger(freePlanLimits.storageBytes)) {
+    return { kind: 'reconcile', reason: 'invalid-free-allowance' };
   }
   return { kind: 'apply', plan: 'free', limits: { ...freePlanLimits } };
 }
 
 function isPositiveInteger(value: number | null): value is number {
   return value !== null && Number.isSafeInteger(value) && value > 0;
-}
-
-function isCounter(value: number): boolean {
-  return Number.isSafeInteger(value) && value >= 0;
 }

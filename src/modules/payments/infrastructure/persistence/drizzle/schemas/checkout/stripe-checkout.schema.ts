@@ -30,6 +30,7 @@ export const stripeCheckoutAttempts = pgTable(
     providerStartedAt: timestamp('provider_started_at', { withTimezone: true }),
     providerExpiresAt: bigint('provider_expires_at', { mode: 'number' }),
     providerSessionId: text('provider_session_id'),
+    providerCustomerId: text('provider_customer_id'),
     providerDispatchKeyDigest: text('provider_dispatch_key_digest'),
     responseUrl: text('response_url'),
     completedAt: timestamp('completed_at', { withTimezone: true }),

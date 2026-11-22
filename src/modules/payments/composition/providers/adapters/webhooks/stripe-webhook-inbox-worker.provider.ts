@@ -12,6 +12,7 @@ import { ReconcileStripeSubscription } from '../../../../application/use-cases/c
 import { ReconcileStripeWebhookDelivery } from '../../../../application/use-cases/commands/subscriptions/reconcile-stripe-webhook-delivery/reconcile-stripe-webhook-delivery.use-case.js';
 import { runStripeBillingScope } from '../../../../infrastructure/adapters/stripe/run-stripe-billing-scope.adapter.js';
 import { StripeWebhookInboxWorker } from '../../../../infrastructure/adapters/stripe/stripe-webhook-inbox-worker.adapter.js';
+import { DrizzleStripeBindingReader } from '../../../../infrastructure/persistence/drizzle/repositories/subscriptions/drizzle-stripe-binding.repository.js';
 import { DrizzleStripeWebhookBindingReader } from '../../../../infrastructure/persistence/drizzle/repositories/subscriptions/drizzle-stripe-webhook-binding.repository.js';
 import { DrizzleStripeWebhookInboxClaim } from '../../../../infrastructure/persistence/drizzle/repositories/webhooks/drizzle-stripe-webhook-inbox-claim.repository.js';
 import { DrizzleStripeWebhookInboxWrites } from '../../../../infrastructure/persistence/drizzle/repositories/webhooks/drizzle-stripe-webhook-inbox-writes.repository.js';
@@ -38,8 +39,11 @@ export const stripeWebhookInboxWorkerProvider: FactoryProvider<StripeWebhookInbo
     if (subscription === null || checkout === null) return null;
     const reader = new DrizzleStripeWebhookInboxClaim(system);
     const writes = new DrizzleStripeWebhookInboxWrites(tenant);
+    const tenantBindings = new DrizzleStripeBindingReader(tenant);
     const reconcile = new ReconcileStripeWebhookDelivery(
       new DrizzleStripeWebhookBindingReader(system),
+      (organizationId) =>
+        runStripeBillingScope(organizationId, () => tenantBindings.read(organizationId)),
       (delivery) =>
         runStripeBillingScope(delivery.organizationId, () => subscription.execute(delivery)),
       (delivery) => checkout.execute(delivery),

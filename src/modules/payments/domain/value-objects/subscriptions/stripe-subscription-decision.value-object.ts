@@ -23,6 +23,6 @@ export type StripeSubscriptionDecision =
       readonly reason:
         | 'unresolved-status'
         | 'unexpected-team-items'
-        | 'free-quota-unverified'
-        | 'free-quota-exceeded';
+        | 'free-return-disabled'
+        | 'invalid-free-allowance';
     };

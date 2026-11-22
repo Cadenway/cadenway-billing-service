@@ -16,10 +16,16 @@ import type { CheckoutUnitOfWork } from '../../../../../application/ports/outbou
 import type { StartBillingCheckoutInput } from '../../../../../application/use-cases/commands/checkout/start-billing-checkout/start-billing-checkout.input.js';
 import { lockBillingEntitlement } from '../subscriptions/lock-billing-entitlement.transaction.js';
 
+const stripeCustomerId = z
+  .string()
+  .max(255)
+  .regex(/^cus_[A-Za-z0-9_]+$/u);
+
 const checkoutRowSchema = z.object({
   id: z.uuid(),
   plan: z.string(),
   provider_key: z.string(),
+  provider_customer_id: stripeCustomerId.nullable(),
   price_id: z.string().nullable(),
   quantity: z.string().nullable(),
   success_url: z.string().nullable(),
@@ -34,6 +40,7 @@ const checkoutRowSchema = z.object({
 
 const recoveryRowSchema = z.object({
   provider_key: z.string(),
+  provider_customer_id: checkoutRowSchema.shape.provider_customer_id,
   provider_started_at: z.date(),
   provider_session_id: z.string().nullable(),
   price_id: z.string(),
@@ -45,8 +52,17 @@ const dispatchRowSchema = z.object({
   first_dispatch: z.boolean(),
   version: z.string().transform(Number).pipe(z.number().int().positive()),
 });
+const stripeCheckoutBinding = z.object({
+  customer_id: z.string(),
+  plan: z.string().nullable(),
+  seats: z.string().nullable(),
+  storage_bytes: z.string().nullable(),
+});
 
 type CheckoutRow = z.infer<typeof checkoutRowSchema>;
+type CheckoutBinding =
+  | { readonly status: 'eligible'; readonly customerId?: string }
+  | { readonly status: 'subscription-active' | 'unavailable' };
 
 /** Serializes durable checkout leases without holding a transaction over provider I/O. */
 export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
@@ -55,6 +71,7 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
   public constructor(
     private readonly runner: TenantTransactionRunner<DatabaseSchema>,
     private readonly dispatchKeyDigest: string,
+    private readonly freeReturnLimits?: { readonly seats: number; readonly storageBytes: number },
   ) {
     if (!/^[a-f0-9]{64}$/u.test(dispatchKeyDigest)) {
       throw new Error('Checkout dispatch requires a valid credential digest.');
@@ -73,7 +90,7 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
       await this.lockCheckout(scope, input.organizationId);
       const found = await scope.client.query(
         `select id, plan, provider_key, price_id, quantity, success_url, cancel_url, response_url,
-           provider_expires_at,
+           provider_expires_at, provider_customer_id,
            provider_started_at is not null as provider_started,
            completed_at > clock_timestamp() - interval '24 hours' as replayable,
            lease_expires_at > clock_timestamp() as leased,
@@ -94,27 +111,18 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
         }
       }
 
-      const subscription = await scope.client.query(
-        `select binding.organization_id, snapshot.plan
-         from stripe_bindings binding
-         left join stripe_subscription_snapshots snapshot using (organization_id)
-         where binding.organization_id = $1 limit 1`,
-        [input.organizationId],
-      );
-      if (subscription.rows[0] !== undefined) {
-        const { plan } = z.object({ plan: z.string().nullable() }).parse(subscription.rows[0]);
-        return { status: plan === 'team' ? 'subscription-active' : 'unavailable' };
-      }
+      const binding = await this.checkoutBinding(scope, input.organizationId);
+      if (binding.status !== 'eligible') return binding;
 
       if (existing) {
         if (existing.resolved) return { status: 'unavailable' };
         if (existing.leased) return { status: 'request-in-progress' };
-        return this.claimRow(scope, input.organizationId, existing);
+        return this.claimRow(scope, input.organizationId, existing, binding.customerId);
       }
 
       const active = await scope.client.query(
         `select id, plan, provider_key, price_id, quantity, success_url, cancel_url, response_url,
-           provider_expires_at,
+           provider_expires_at, provider_customer_id,
            provider_started_at is not null as provider_started,
            completed_at > clock_timestamp() - interval '24 hours' as replayable,
            lease_expires_at > clock_timestamp() as leased,
@@ -138,13 +146,18 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
          insert into stripe_checkout_attempts (id, organization_id, actor_id, key_digest, plan, provider_key)
          select id, $1, $2, $3, $4, 'checkout_' || id::text from generated
          returning id, plan, provider_key, price_id, quantity, success_url, cancel_url, response_url,
-           provider_expires_at, false as provider_started, false as replayable,
+           provider_expires_at, provider_customer_id, false as provider_started, false as replayable,
            false as leased, false as resolved`,
         [input.organizationId, input.actorId, digest, input.plan],
       );
       const row = inserted.rows[0];
       if (!row) throw new Error('Checkout reservation was not inserted.');
-      return this.claimRow(scope, input.organizationId, checkoutRowSchema.parse(row));
+      return this.claimRow(
+        scope,
+        input.organizationId,
+        checkoutRowSchema.parse(row),
+        binding.customerId,
+      );
     });
   }
 
@@ -169,19 +182,19 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
       this.assertTenant(scope, organizationId);
       await lockBillingEntitlement(scope, organizationId, 'shared');
       await this.lockCheckout(scope, organizationId);
+      const binding = await this.checkoutBinding(scope, organizationId);
+      if (binding.status !== 'eligible' || binding.customerId !== request.customerId) return null;
       const result = await scope.client.query(
         `update stripe_checkout_attempts
          set price_id = coalesce(price_id, $4), quantity = coalesce(quantity, $5),
              success_url = coalesce(success_url, $6), cancel_url = coalesce(cancel_url, $7),
              provider_expires_at = coalesce(provider_expires_at, $8::bigint),
              provider_dispatch_key_digest = coalesce(provider_dispatch_key_digest, $9),
+             provider_customer_id = coalesce(provider_customer_id, $10::text),
              provider_started_at = coalesce(provider_started_at, clock_timestamp()),
              updated_at = clock_timestamp(), version = version + 1
          where organization_id = $1 and lease_token = $2 and provider_key = $3
            and lease_expires_at > clock_timestamp() and response_url is null and resolved_at is null
-           and not exists (
-             select 1 from stripe_bindings where organization_id = $1
-           )
            and $8::bigint > extract(epoch from clock_timestamp() + interval '31 minutes')
            and ((provider_started_at is null and
              $8::bigint <= extract(epoch from clock_timestamp() + interval '2 hours 5 minutes'))
@@ -190,6 +203,7 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
              and price_id = $4 and quantity = $5 and success_url = $6 and cancel_url = $7
              and provider_expires_at = $8::bigint
              and provider_dispatch_key_digest = $9
+             and provider_customer_id is not distinct from $10::text
            ))
          returning old.provider_started_at is null as first_dispatch, new.version`,
         [
@@ -202,6 +216,7 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
           request.cancelUrl,
           expiresAt,
           this.dispatchKeyDigest,
+          request.customerId ?? null,
         ],
       );
       const row = result.rows[0];
@@ -248,7 +263,8 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
       async (scope) => {
         this.assertTenant(scope, organizationId);
         const result = await scope.client.query(
-          `select provider_key, provider_started_at, provider_session_id, price_id, quantity, provider_expires_at
+          `select provider_key, provider_started_at, provider_session_id, price_id, quantity,
+                  provider_expires_at, provider_customer_id
            from stripe_checkout_attempts
            where organization_id = $1 and resolved_at is null and provider_started_at is not null
            limit 1`,
@@ -265,6 +281,7 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
           priceId: row.price_id,
           quantity: row.quantity,
           expiresAt: row.provider_expires_at ?? undefined,
+          ...(row.provider_customer_id === null ? {} : { customerId: row.provider_customer_id }),
         };
       },
       { readOnly: true },
@@ -329,12 +346,49 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
     ]);
   }
 
+  /** Resolves the retained customer only while the canonical Free entitlement is committed. */
+  private async checkoutBinding(
+    scope: TransactionScope<DatabaseSchema>,
+    organizationId: string,
+  ): Promise<CheckoutBinding> {
+    const result = await scope.client.query(
+      `select binding.customer_id, snapshot.plan, snapshot.seats, snapshot.storage_bytes
+       from stripe_bindings binding
+       left join stripe_subscription_snapshots snapshot using (organization_id)
+       where binding.organization_id = $1 limit 1`,
+      [organizationId],
+    );
+    const raw = result.rows[0];
+    if (raw === undefined) return { status: 'eligible' };
+    const {
+      customer_id: customerId,
+      plan,
+      seats,
+      storage_bytes: storageBytes,
+    } = stripeCheckoutBinding.parse(raw);
+    if (plan === 'team') return { status: 'subscription-active' };
+    const limits = this.freeReturnLimits;
+    if (
+      plan === 'free' &&
+      limits !== undefined &&
+      stripeCustomerId.safeParse(customerId).success &&
+      Number(seats) === limits.seats &&
+      Number(storageBytes) === limits.storageBytes
+    )
+      return { status: 'eligible', customerId };
+    return { status: 'unavailable' };
+  }
+
   /** Sets a new lease token while preserving any immutable provider parameters. */
   private async claimRow(
     scope: TransactionScope<DatabaseSchema>,
     organizationId: string,
     row: CheckoutRow,
+    customerId: string | undefined,
   ): Promise<CheckoutClaim> {
+    if (row.provider_started && (row.provider_customer_id ?? undefined) !== customerId) {
+      return { status: 'unavailable' };
+    }
     const token = randomBytes(32).toString('hex');
     const result = await scope.client.query(
       `update stripe_checkout_attempts set lease_token = $3,
@@ -364,9 +418,16 @@ export class DrizzleCheckoutUnitOfWork implements CheckoutUnitOfWork {
         successUrl: row.success_url,
         cancelUrl: row.cancel_url,
         ...(row.provider_expires_at === null ? {} : { expiresAt: row.provider_expires_at }),
+        ...(row.provider_customer_id === null ? {} : { customerId: row.provider_customer_id }),
       };
     }
-    return { status: 'claimed', token, providerKey: row.provider_key, request };
+    return {
+      status: 'claimed',
+      token,
+      providerKey: row.provider_key,
+      request,
+      ...(customerId === undefined ? {} : { customerId }),
+    };
   }
   // #endregion
 }

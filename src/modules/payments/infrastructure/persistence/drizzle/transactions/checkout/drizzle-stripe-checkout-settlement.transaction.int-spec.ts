@@ -10,8 +10,8 @@ import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { DrizzleStripeReconciliationUnitOfWork } from '../subscriptions/drizzle-stripe-reconciliation.unit-of-work.js';
-import { MonotonicStripeEntitlementFence } from '../subscriptions/monotonic-stripe-entitlement-fence.transaction.js';
 import type { StripeEntitlementFence } from '../subscriptions/stripe-entitlement-fence.transaction.js';
+import { StripeEntitlementOutboxFence } from '../subscriptions/stripe-entitlement-outbox-fence.transaction.js';
 import { DrizzleCheckoutUnitOfWork } from './drizzle-checkout.unit-of-work.js';
 import { DrizzleStripeCheckoutSettlement } from './drizzle-stripe-checkout-settlement.transaction.js';
 
@@ -57,7 +57,6 @@ describe('Stripe Checkout settlement PostgreSQL transactions', () => {
   const inTenant = <T>(organizationId: string, work: () => Promise<T>): Promise<T> =>
     runWithOrganizationContext(context(organizationId), work);
   const fence: StripeEntitlementFence = {
-    confirmedUsage: () => Promise.resolve(null),
     authorizeChange: async (scope, organizationId) => {
       await scope.client.query(
         `insert into outbox_events (id, event_name, subject, stream, organization_id, payload)
@@ -139,6 +138,118 @@ describe('Stripe Checkout settlement PostgreSQL transactions', () => {
       }),
     );
   }
+
+  it('reuses the customer after Free and settles a new subscription without replaying the old Checkout', async () => {
+    const organizationId = randomUUID();
+    const oldSession = { ...(await reserve(organizationId)), customerId: 'cus_retained_fixture' };
+    const original = new DrizzleStripeCheckoutSettlement(runner, fence, false, freeSeats);
+    const settleOld = (eventId: string) =>
+      inTenant(organizationId, () =>
+        original.settle({ organizationId, eventId, session: oldSession, decision }),
+      );
+    expect(await settleOld('evt_retained_first')).toBe('applied');
+
+    const limits = { seats: freeSeats, storageBytes: freeStorageBytes };
+    const freeReturn = new DrizzleStripeReconciliationUnitOfWork(runner, fence);
+    await inTenant(organizationId, () =>
+      freeReturn.run(organizationId, async (transaction) => {
+        await transaction.lockBinding();
+        expect(await transaction.apply({ kind: 'apply', plan: 'free', limits })).toBe('applied');
+        await transaction.settle('evt_retained_cancellation');
+      }),
+    );
+
+    const resumed = new DrizzleCheckoutUnitOfWork(runner, 'a'.repeat(64), limits);
+    const input = {
+      organizationId,
+      actorId,
+      idempotencyKey: 'second-checkout',
+      plan: 'team' as const,
+    };
+    const claim = await inTenant(organizationId, () => resumed.claim(input));
+    if (claim.status !== 'claimed') throw new Error('Renewal reservation failed.');
+    expect(claim.customerId).toBe(oldSession.customerId);
+    const request = {
+      organizationId,
+      providerKey: claim.providerKey,
+      customerId: oldSession.customerId,
+      priceId: oldSession.priceId,
+      quantity: oldSession.quantity,
+      successUrl: 'https://app.example.test/success',
+      cancelUrl: 'https://app.example.test/cancel',
+      expiresAt: Math.floor(Date.now() / 1_000) + 2 * 60 * 60,
+    };
+    const save = (token: string, customerId: string) =>
+      inTenant(organizationId, () =>
+        resumed.saveRequest(organizationId, token, { ...request, customerId }),
+      );
+    expect(await save(claim.token, 'cus_unrelated')).toBeNull();
+    expect(await save(claim.token, oldSession.customerId)).toMatchObject({
+      status: 'first-dispatch',
+    });
+    await inTenant(organizationId, () => resumed.release(organizationId, claim.token));
+    const retry = await inTenant(organizationId, () => resumed.claim(input));
+    if (retry.status !== 'claimed') throw new Error('Renewal retry reservation failed.');
+    expect(retry.request).toEqual(request);
+    expect(await save(retry.token, oldSession.customerId)).toEqual({ status: 'retry' });
+
+    const transaction = new DrizzleStripeCheckoutSettlement(
+      runner,
+      fence,
+      false,
+      freeSeats,
+      freeStorageBytes,
+    );
+    const session = {
+      ...oldSession,
+      sessionId: 'cs_test_retained_second',
+      subscriptionId: 'sub_retained_second',
+      providerKey: claim.providerKey,
+    };
+    const settle = (eventId: string, match = session) =>
+      inTenant(organizationId, () =>
+        transaction.settle({ organizationId, eventId, session: match, decision }),
+      );
+    expect(
+      await settle('evt_retained_wrong_customer', { ...session, customerId: 'cus_unrelated' }),
+    ).toBe('retry');
+    expect(
+      await settle('evt_retained_old_subscription', {
+        ...session,
+        subscriptionId: oldSession.subscriptionId,
+      }),
+    ).toBe('retry');
+    expect(
+      (await Promise.all([settle('evt_retained_second'), settle('evt_retained_second')])).sort(),
+    ).toEqual(['applied', 'duplicate']);
+    expect(await settleOld('evt_retained_first_replayed')).toBe('duplicate');
+    expect(await counts(organizationId)).toEqual({
+      bindings: 1,
+      snapshots: 1,
+      receipts: 3,
+      outbox: 3,
+      resolved: 2,
+    });
+    const final = await inTenant(organizationId, () =>
+      runner.run(async ({ client }) => {
+        const { rows } = await client.query(
+          `select b.customer_id, b.subscription_id, b.version as revision, s.version
+           from stripe_bindings b join stripe_subscription_snapshots s using (organization_id)
+           where b.organization_id = $1`,
+          [organizationId],
+        );
+        return rows;
+      }),
+    );
+    expect(final).toEqual([
+      {
+        customer_id: oldSession.customerId,
+        subscription_id: session.subscriptionId,
+        revision: '3',
+        version: '3',
+      },
+    ]);
+  });
 
   it('atomically creates the initial binding, entitlement, outbox and receipt exactly once', async () => {
     const organizationId = orgs[0];
@@ -270,7 +381,7 @@ describe('Stripe Checkout settlement PostgreSQL transactions', () => {
       const organizationId = randomUUID();
       const session = await reserve(organizationId, quantity);
       const effectiveSeatLimit = quantity > freeSeats ? quantity : freeSeats;
-      const monotonic = new MonotonicStripeEntitlementFence(
+      const monotonic = new StripeEntitlementOutboxFence(
         { seatLimit: freeSeats, storageByteLimit: freeStorageBytes },
         {
           append: async (scope, tenantId, entitlement) => {

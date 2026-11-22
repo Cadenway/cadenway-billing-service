@@ -27,7 +27,7 @@ const settings = {
   freePlanLimits: { seats: 5, storageBytes: 2_000_000_000 },
 };
 
-function setup() {
+function setup(freeReturnEnabled = false) {
   const calls: string[] = [];
   const bindings: StripeBindingReader = {
     read: vi.fn().mockImplementation(() => {
@@ -44,7 +44,6 @@ function setup() {
   const transaction: StripeReconciliationTransaction = {
     lockBinding: vi.fn().mockResolvedValue(binding),
     isSettled: vi.fn().mockResolvedValue(false),
-    confirmedUsage: vi.fn().mockResolvedValue({ seats: 5, storageBytes: 2_000_000_000 }),
     apply: vi.fn().mockResolvedValue('applied'),
     settle: vi.fn().mockResolvedValue(undefined),
   };
@@ -64,7 +63,10 @@ function setup() {
     transaction,
     calls,
     work,
-    useCase: new ReconcileStripeSubscription(bindings, provider, work, settings),
+    useCase: new ReconcileStripeSubscription(bindings, provider, work, {
+      ...settings,
+      freeReturnEnabled,
+    }),
   };
 }
 
@@ -140,20 +142,16 @@ describe('ReconcileStripeSubscription', () => {
     expect(transaction.settle).not.toHaveBeenCalled();
   });
 
-  it('keeps a downgrade pending when current Free usage exceeds the confirmed limit', async () => {
+  it('keeps cancellation pending while returns to Free are disabled', async () => {
     const { useCase, provider, transaction } = setup();
     vi.mocked(provider.retrieve).mockResolvedValue({ ...subscription, status: 'canceled' });
-    vi.mocked(transaction.confirmedUsage).mockResolvedValue({
-      seats: 6,
-      storageBytes: 2_000_000_000,
-    });
     await expect(useCase.execute(input)).resolves.toEqual({ status: 'retry' });
     expect(transaction.apply).not.toHaveBeenCalled();
     expect(transaction.settle).not.toHaveBeenCalled();
   });
 
   it('applies Free at exactly five seats and two billion bytes', async () => {
-    const { useCase, provider, transaction } = setup();
+    const { useCase, provider, transaction } = setup(true);
     vi.mocked(provider.retrieve).mockResolvedValue({ ...subscription, status: 'canceled' });
     await expect(useCase.execute(input)).resolves.toEqual({ status: 'applied' });
     expect(transaction.apply).toHaveBeenCalledWith({
@@ -161,9 +159,10 @@ describe('ReconcileStripeSubscription', () => {
       plan: 'free',
       limits: { seats: 5, storageBytes: 2_000_000_000 },
     });
+    expect(transaction.settle).toHaveBeenCalledWith(input.eventId);
   });
 
-  it('leaves the event retryable if reduction fencing or usage proof is unavailable', async () => {
+  it('leaves the event retryable if the current snapshot does not allow the change', async () => {
     const { useCase, transaction } = setup();
     vi.mocked(transaction.apply).mockResolvedValue('deferred');
     await expect(useCase.execute(input)).resolves.toEqual({ status: 'retry' });

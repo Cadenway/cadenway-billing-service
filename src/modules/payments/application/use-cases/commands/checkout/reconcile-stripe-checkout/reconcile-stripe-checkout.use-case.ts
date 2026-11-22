@@ -94,7 +94,6 @@ export class ReconcileStripeCheckout {
       binding: { customerId: session.customerId, subscriptionId: session.subscriptionId },
       settings: this.settings,
       subscription,
-      confirmedUsage: null,
     });
     if (
       decision.kind !== 'apply' ||
