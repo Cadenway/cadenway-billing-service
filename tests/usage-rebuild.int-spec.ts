@@ -18,6 +18,7 @@ import { ApplyUsageRebuildPage } from '../src/modules/usage/application/use-case
 import { InvalidateActiveUsage } from '../src/modules/usage/application/use-cases/commands/rebuild/invalidate-active-usage/invalidate-active-usage.use-case.js';
 import { PromoteUsageRebuild } from '../src/modules/usage/application/use-cases/commands/rebuild/promote-usage-rebuild/promote-usage-rebuild.use-case.js';
 import { StartUsageRebuild } from '../src/modules/usage/application/use-cases/commands/rebuild/start-usage-rebuild/start-usage-rebuild.use-case.js';
+import type { RecordedUsageObservation } from '../src/modules/usage/domain/value-objects/observations/recorded-usage-observation.value-object.js';
 import type { UsageObservation } from '../src/modules/usage/domain/value-objects/observations/usage-observation.value-object.js';
 import { DrizzleUsageRebuildRegistryReader } from '../src/modules/usage/infrastructure/persistence/drizzle/repositories/rebuild/drizzle-usage-rebuild-registry.repository.js';
 import { DrizzleUsageRebuildStateReader } from '../src/modules/usage/infrastructure/persistence/drizzle/repositories/rebuild/drizzle-usage-rebuild-state.repository.js';
@@ -134,11 +135,13 @@ describe('usage rebuild PostgreSQL transactions', () => {
       inTenant(() =>
         uow.run(organizationId, async (tx) => {
           await tx.lockOrganization();
-          await tx.saveObservation(generationId, {
-            source: 'membership',
-            sourceId: memberId,
-            observation: { state: 'present', version: 1, value: 'member' },
-          });
+          await tx.saveObservations(generationId, [
+            {
+              source: 'membership',
+              sourceId: memberId,
+              observation: { state: 'present', version: 1, value: 'member' },
+            },
+          ]);
           throw new Error('simulate interrupted page');
         }),
       ),
@@ -146,10 +149,10 @@ describe('usage rebuild PostgreSQL transactions', () => {
     const rolledBack = await inTenant(() =>
       uow.run(organizationId, async (tx) => {
         await tx.lockOrganization();
-        return tx.loadObservation(generationId, 'membership', memberId);
+        return tx.loadObservations(generationId, 'membership', [memberId]);
       }),
     );
-    expect(rolledBack).toBeNull();
+    expect(rolledBack).toEqual([]);
 
     const page = {
       organizationId,
@@ -302,6 +305,96 @@ describe('usage rebuild PostgreSQL transactions', () => {
     await expect(
       runWithOrganizationContext(context(otherId), () => state.read(organizationId)),
     ).rejects.toThrow();
+  });
+
+  it('uses two observation statements for a full page with inserts, a replacement and an older row', async () => {
+    const batchOrganization = '01938f6e-6d1a-7c3e-9a51-2f0c4b8d7e12';
+    const removedMember = '01938f6e-8a42-7d5b-b2c9-5e1f3a6d9c26';
+    const start = new StartUsageRebuild(uow, proof);
+    const apply = new ApplyUsageRebuildPage(uow);
+    await runWithOrganizationContext(context(batchOrganization), async () => {
+      const { generationId } = await start.execute({
+        organizationId: batchOrganization,
+        brokerAtStart: progress,
+        advisoriesClear: true,
+      });
+      const page = {
+        organizationId: batchOrganization,
+        generationId,
+        source: 'membership',
+        expectedCursor: null,
+        nextCursor: 'next',
+      } as const;
+      const initial: readonly RecordedUsageObservation[] = [
+        {
+          source: 'membership',
+          sourceId: memberId,
+          observation: { state: 'present', version: 1, value: 'member' },
+        },
+        {
+          source: 'membership',
+          sourceId: removedMember,
+          observation: { state: 'absent', version: 2 },
+        },
+      ];
+      await expect(apply.execute({ ...page, items: initial })).resolves.toBe('applied');
+      const items: readonly RecordedUsageObservation[] = [
+        {
+          source: 'membership',
+          sourceId: memberId.toUpperCase(),
+          observation: { state: 'present', version: 2, value: 'guest' },
+        },
+        {
+          source: 'membership',
+          sourceId: removedMember,
+          observation: { state: 'present', version: 1, value: 'member' },
+        },
+        ...Array.from({ length: 98 }, (_, index): RecordedUsageObservation => ({
+          source: 'membership',
+          sourceId: `00000000-0000-7000-8000-${String(index).padStart(12, '0')}`,
+          observation: { state: 'present', version: 1, value: 'member' },
+        })),
+      ];
+      const query = vi.spyOn(pg.Client.prototype, 'query');
+      try {
+        await expect(
+          apply.execute({ ...page, expectedCursor: 'next', nextCursor: null, items }),
+        ).resolves.toBe('applied');
+        const observationStatements = query.mock.calls
+          .map(([input]) => {
+            const statement: unknown = input;
+            if (typeof statement === 'string') return statement;
+            return statement && typeof statement === 'object' && 'text' in statement
+              ? String(statement.text)
+              : '';
+          })
+          .filter((statement) => statement.includes('"usage_observations"'));
+        expect(observationStatements).toHaveLength(2);
+        expect(observationStatements[0]).toMatch(/^select\b/u);
+        expect(observationStatements[1]).toMatch(/^insert\b/u);
+      } finally {
+        query.mockRestore();
+      }
+      const projection = await state.read(batchOrganization);
+      expect(projection.candidate).toMatchObject({
+        totals: { seats: 98, guests: 1, storageBytes: 0 },
+        membership: { complete: true, cursor: null },
+      });
+      const stored = await uow.run(batchOrganization, async (tx) => {
+        await tx.lockOrganization();
+        return tx.loadObservations(generationId, 'membership', [memberId, removedMember]);
+      });
+      expect(stored).toEqual(
+        expect.arrayContaining([
+          {
+            source: 'membership',
+            sourceId: memberId,
+            observation: { state: 'present', version: 2, value: 'guest' },
+          },
+          initial[1],
+        ]),
+      );
+    });
   });
 
   it('discards a pending Free quota crossing after settling Team and emits a new Team crossing', async () => {

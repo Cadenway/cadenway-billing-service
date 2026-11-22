@@ -3,7 +3,7 @@ import type {
   TenantTransactionRunner,
   TransactionScope,
 } from '@cadenway/nest-common/database';
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 
 import type { UsageRebuildBrokerProgress } from '../../../../../application/models/rebuild/usage-rebuild-broker-progress.model.js';
 import type { UsageRebuildCandidate } from '../../../../../application/models/rebuild/usage-rebuild-candidate.model.js';
@@ -140,8 +140,9 @@ export class DrizzleUsageRebuildUnitOfWork implements UsageRebuildUnitOfWork {
           selectedId = row.id;
           return row.id;
         },
-        loadObservation: async (generationId, source, sourceId) => {
+        loadObservations: async (generationId, source, sourceIds) => {
           requireCandidate(generationId);
+          if (sourceIds.length === 0) return [];
           const rows = await scope.db
             .select()
             .from(usageObservations)
@@ -150,69 +151,74 @@ export class DrizzleUsageRebuildUnitOfWork implements UsageRebuildUnitOfWork {
                 eq(usageObservations.organizationId, organizationId),
                 eq(usageObservations.generationId, generationId),
                 eq(usageObservations.source, source),
-                eq(usageObservations.sourceId, sourceId),
+                inArray(usageObservations.sourceId, [...sourceIds]),
               ),
-            )
-            .limit(1);
-          const row = rows[0];
-          if (row === undefined) return null;
-          if (row.state === 'absent')
-            return {
-              source,
-              sourceId,
-              observation: { state: 'absent', version: row.sourceVersion },
-            };
-          if (row.state === 'present' && source === 'attachment' && row.attachmentBytes !== null) {
-            return {
-              source,
-              sourceId,
-              observation: {
-                state: 'present',
-                version: row.sourceVersion,
-                value: row.attachmentBytes,
-              },
-            };
-          }
-          if (
-            row.state === 'present' &&
-            source === 'membership' &&
-            (row.membershipRole === 'owner' ||
-              row.membershipRole === 'admin' ||
-              row.membershipRole === 'member' ||
-              row.membershipRole === 'guest')
-          ) {
-            return {
-              source,
-              sourceId,
-              observation: {
-                state: 'present',
-                version: row.sourceVersion,
-                value: row.membershipRole,
-              },
-            };
-          }
-          throw new Error('Stored usage observation has an invalid value.');
+            );
+          return rows.map((row): RecordedUsageObservation => {
+            if (row.state === 'absent')
+              return {
+                source,
+                sourceId: row.sourceId,
+                observation: { state: 'absent', version: row.sourceVersion },
+              };
+            if (
+              row.state === 'present' &&
+              source === 'attachment' &&
+              row.attachmentBytes !== null
+            ) {
+              return {
+                source,
+                sourceId: row.sourceId,
+                observation: {
+                  state: 'present',
+                  version: row.sourceVersion,
+                  value: row.attachmentBytes,
+                },
+              };
+            }
+            if (
+              row.state === 'present' &&
+              source === 'membership' &&
+              (row.membershipRole === 'owner' ||
+                row.membershipRole === 'admin' ||
+                row.membershipRole === 'member' ||
+                row.membershipRole === 'guest')
+            ) {
+              return {
+                source,
+                sourceId: row.sourceId,
+                observation: {
+                  state: 'present',
+                  version: row.sourceVersion,
+                  value: row.membershipRole,
+                },
+              };
+            }
+            throw new Error('Stored usage observation has an invalid value.');
+          });
         },
-        saveObservation: async (generationId: string, item: RecordedUsageObservation) => {
+        saveObservations: async (
+          generationId: string,
+          observations: readonly RecordedUsageObservation[],
+        ) => {
           requireCandidate(generationId);
-          const membershipRole =
-            item.source === 'membership' && item.observation.state === 'present'
-              ? item.observation.value
-              : null;
-          const attachmentBytes =
-            item.source === 'attachment' && item.observation.state === 'present'
-              ? item.observation.value
-              : null;
-          const values = {
+          if (observations.length === 0) return;
+          const values = observations.map((item) => ({
             organizationId,
             generationId,
             source: item.source,
             sourceId: item.sourceId,
             sourceVersion: item.observation.version,
             state: item.observation.state,
-            membershipRole,
-            attachmentBytes,
-          };
+            membershipRole:
+              item.source === 'membership' && item.observation.state === 'present'
+                ? item.observation.value
+                : null,
+            attachmentBytes:
+              item.source === 'attachment' && item.observation.state === 'present'
+                ? item.observation.value
+                : null,
+          }));
           await scope.db
             .insert(usageObservations)
             .values(values)
@@ -224,10 +230,10 @@ export class DrizzleUsageRebuildUnitOfWork implements UsageRebuildUnitOfWork {
                 usageObservations.sourceId,
               ],
               set: {
-                sourceVersion: values.sourceVersion,
-                state: values.state,
-                membershipRole,
-                attachmentBytes,
+                sourceVersion: sql`excluded.source_version`,
+                state: sql`excluded.state`,
+                membershipRole: sql`excluded.membership_role`,
+                attachmentBytes: sql`excluded.attachment_bytes`,
                 updatedAt: sql`now()`,
               },
             });

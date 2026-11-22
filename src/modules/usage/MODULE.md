@@ -71,9 +71,10 @@ below the threshold cancels publication. Candidate updates and failed writes do 
 
 The rebuild worker reads signed roster, membership and attachment pages outside transactions.
 An organization lock serializes each page, invalidation and promotion. The persisted generation
-and its version fence replay or concurrent updates. Promotion requires both scans to finish and
-JetStream to confirm continuity for all six consumers. An unavailable source or broker leaves
-the tenant eligible for a later retry.
+and its version fence replay or concurrent updates. Each page uses at most one query to read its
+existing observations and one upsert to write accepted observations before advancing the cursor.
+Promotion requires both scans to finish and JetStream to confirm continuity for all six consumers.
+An unavailable source or broker leaves the tenant eligible for a later retry.
 
 ## Decisions
 

@@ -15,17 +15,17 @@ export interface UsageRebuildTransaction {
   /** Creates and selects an empty candidate with the supplied starting observation. */
   readonly startCandidate: (brokerAtStart: UsageRebuildBrokerProgress) => Promise<string>;
 
-  /** Reads an observation belonging to the selected generation and tenant. */
-  readonly loadObservation: (
+  /** Reads the page's existing observations for its source, generation and tenant. */
+  readonly loadObservations: (
     generationId: string,
     source: RecordedUsageObservation['source'],
-    sourceId: string,
-  ) => Promise<RecordedUsageObservation | null>;
+    sourceIds: readonly string[],
+  ) => Promise<readonly RecordedUsageObservation[]>;
 
-  /** Persists a versioned source observation in the selected generation. */
-  readonly saveObservation: (
+  /** Persists the accepted observations in the selected generation. */
+  readonly saveObservations: (
     generationId: string,
-    observation: RecordedUsageObservation,
+    observations: readonly RecordedUsageObservation[],
   ) => Promise<void>;
 
   /** Commits the new totals and source cursor in the same transaction as the observations. */
