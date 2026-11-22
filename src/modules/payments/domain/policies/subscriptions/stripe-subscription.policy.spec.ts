@@ -162,12 +162,18 @@ describe('Stripe subscription reconciliation', () => {
     },
   );
 
-  it('defers a terminal snapshot from a different price before considering a downgrade', () => {
-    expect(
-      reconcile(
-        { status: 'canceled', items: [{ priceId: 'price_other', quantity: 1 }] },
-        { freeReturnEnabled: true },
-      ),
-    ).toEqual({ kind: 'reconcile', reason: 'unexpected-team-items' });
-  });
+  it.each([
+    { items: [{ priceId: 'price_retired', quantity: 1 }] },
+    { items: [] },
+    { hasMoreItems: true },
+  ])(
+    'uses terminal status of the bound subscription independently of current price items',
+    (items) => {
+      expect(reconcile({ status: 'canceled', ...items }, { freeReturnEnabled: true })).toEqual({
+        kind: 'apply',
+        plan: 'free',
+        limits: { seats: 5, storageBytes: 2_000_000_000 },
+      });
+    },
+  );
 });

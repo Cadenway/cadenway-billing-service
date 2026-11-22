@@ -98,9 +98,10 @@ None.
   context have no match. Ordinary billing reads continue to use the tenant transaction runner.
 - The quota fence permits monotonic changes and the explicitly enabled return from Team to the
   canonical Free allowance of five seats and 2,000,000,000 bytes. Billing requires the bound
-  subscription to be canceled on a current Stripe read. A scheduled cancellation alone records
-  its marker and keeps the current Team entitlement version. A deferred event has no committed
-  receipt and can be retried.
+  subscription to be canceled on a current Stripe read. The Team price allowlist governs paid
+  grants. A retired price or an altered item list on the canceled binding does not prevent the
+  return. A scheduled cancellation records its marker and keeps the current Team entitlement
+  version. A deferred event has no committed receipt and can be retried.
 - A committed Free snapshot is terminal for the old binding. Only a new paid Checkout can
   replace the bound subscription and restore Team.
 

@@ -213,7 +213,7 @@ describe('durable Stripe subscription deliveries', () => {
     });
   });
 
-  it('returns a canceled Team subscription to Free only after Stripe confirms the terminal state', async () => {
+  it('returns a canceled Team subscription to Free after Stripe confirms the terminal state with a retired price', async () => {
     const cancelCustomer = 'cus_atelier_cancel';
     const cancelSubscription = 'sub_atelier_cancel';
     const system = service().get(SystemTransactionRunner);
@@ -312,7 +312,11 @@ describe('durable Stripe subscription deliveries', () => {
       { timeout: 30_000 },
     );
 
-    retrieveSubscription.mockResolvedValue({ ...active, status: 'canceled' });
+    retrieveSubscription.mockResolvedValue({
+      ...active,
+      status: 'canceled',
+      items: [{ priceId: 'price_retired', quantity: 8 }],
+    });
     const canceledId = 'evt_cancel_confirmed';
     const canceled = await submit(
       canceledId,

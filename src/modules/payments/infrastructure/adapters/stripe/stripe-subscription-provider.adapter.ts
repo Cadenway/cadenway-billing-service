@@ -115,7 +115,7 @@ function readSubscription(
     scheduledCancellation: value.cancel_at_period_end || value.cancel_at !== null,
     collectionPaused: value.pause_collection !== null,
     hasMoreItems: value.items.has_more,
-    items: readSeatItem(value.items, id, liveMode),
+    items: value.status === 'canceled' ? [] : readSeatItem(value.items, id, liveMode),
   };
 }
 

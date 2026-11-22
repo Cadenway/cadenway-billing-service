@@ -10,7 +10,7 @@ export function effectiveTeamSeatLimit(paidQuantity: number, freeSeatLimit: numb
 }
 
 /**
- * Resolves the self-service Team entitlement from an allowlisted Stripe subscription. The
+ * Resolves the self-service entitlement from the current bound Stripe subscription. The
  * [Stripe lifecycle](https://docs.stripe.com/api/subscriptions/object#subscription_object-status)
  * keeps a subscription active or trialing until a scheduled cancellation takes effect. Billing
  * reads the current Stripe subscription for each reconciliation because webhook order is arbitrary.
@@ -37,9 +37,20 @@ export function resolveStripeSubscription({
   if (status === 'incomplete') {
     return { kind: 'ignore', reason: 'initial-payment-pending' };
   }
-  const entitled = status === 'active' || status === 'trialing';
-  const ended = status === 'canceled';
-  if ((!entitled && !ended) || (entitled && subscription.collectionPaused)) {
+
+  if (status === 'canceled') {
+    const { freePlanLimits } = settings;
+    if (!settings.freeReturnEnabled) return { kind: 'reconcile', reason: 'free-return-disabled' };
+    if (
+      !isPositiveInteger(freePlanLimits.seats) ||
+      !isPositiveInteger(freePlanLimits.storageBytes)
+    ) {
+      return { kind: 'reconcile', reason: 'invalid-free-allowance' };
+    }
+    return { kind: 'apply', plan: 'free', limits: { ...freePlanLimits } };
+  }
+
+  if ((status !== 'active' && status !== 'trialing') || subscription.collectionPaused) {
     return { kind: 'reconcile', reason: 'unresolved-status' };
   }
 
@@ -55,24 +66,15 @@ export function resolveStripeSubscription({
     return { kind: 'reconcile', reason: 'unexpected-team-items' };
   }
 
-  if (entitled) {
-    return {
-      kind: 'apply',
-      plan: 'team',
-      limits: {
-        seats: effectiveTeamSeatLimit(item.quantity, settings.freePlanLimits.seats),
-        storageBytes: teamStorageByteLimit,
-      },
-      scheduledCancellation: subscription.scheduledCancellation,
-    };
-  }
-
-  const { freePlanLimits } = settings;
-  if (!settings.freeReturnEnabled) return { kind: 'reconcile', reason: 'free-return-disabled' };
-  if (!isPositiveInteger(freePlanLimits.seats) || !isPositiveInteger(freePlanLimits.storageBytes)) {
-    return { kind: 'reconcile', reason: 'invalid-free-allowance' };
-  }
-  return { kind: 'apply', plan: 'free', limits: { ...freePlanLimits } };
+  return {
+    kind: 'apply',
+    plan: 'team',
+    limits: {
+      seats: effectiveTeamSeatLimit(item.quantity, settings.freePlanLimits.seats),
+      storageBytes: teamStorageByteLimit,
+    },
+    scheduledCancellation: subscription.scheduledCancellation,
+  };
 }
 
 function isPositiveInteger(value: number | null): value is number {

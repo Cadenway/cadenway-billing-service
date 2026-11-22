@@ -114,6 +114,24 @@ describe('Stripe subscription provider', () => {
     });
   });
 
+  it('reads terminal status when the historical item no longer qualifies for Team', async () => {
+    sdk.retrieve.mockResolvedValue({
+      ...current,
+      status: 'canceled',
+      items: {
+        ...current.items,
+        data: [{ ...item, price: { ...price, recurring: { usage_type: 'metered' } } }],
+      },
+    });
+
+    await expect(provider().retrieve(subscriptionId)).resolves.toMatchObject({
+      customerId,
+      subscriptionId,
+      status: 'canceled',
+      items: [],
+    });
+  });
+
   it.each([
     { has_more: true, data: [item] },
     { has_more: false, data: [item, item] },
