@@ -78,6 +78,13 @@
       "when": 1795337820458,
       "tag": "0010_stripe_checkout_customer",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1795423564763,
+      "tag": "0011_outbox_leases",
+      "breakpoints": true
     }
   ]
 }

@@ -138,7 +138,7 @@ const paymentsTables = [
 ] as const;
 
 /** Migrations applied on a clean or upgraded database. */
-const migrationCount = 11;
+const migrationCount = 12;
 const stripeFixtureKey = 'whsec_fixture';
 const stripeTeamPrice = 'price_team_fixture';
 
@@ -151,8 +151,8 @@ function signStripeFixture(payload: string): string {
   return `t=${timestamp},v1=${digest}`;
 }
 
-/** Verifies the billed tenant on a complete Organization membership snapshot request. */
-async function checkoutMembershipSnapshot(
+/** Verifies the billed tenant on the Organization active seat count request. */
+async function checkoutSeatCount(
   request: IncomingMessage,
   response: ServerResponse,
   verifier: InternalTokenVerifier,
@@ -168,17 +168,7 @@ async function checkoutMembershipSnapshot(
   if (caller.organizationId === null) throw new Error('Missing Checkout organization.');
   organizationReads.push(caller.organizationId);
   response.setHeader('Cache-Control', 'private, no-store');
-  response.end(
-    JSON.stringify({
-      items: Array.from({ length: quantities.get(caller.organizationId) ?? 5 }, (_, index) => ({
-        memberId: `01938f6e-0000-7000-8000-${String(index + 1).padStart(12, '0')}`,
-        state: 'active',
-        role: index === 0 ? 'owner' : 'member',
-        version: 1,
-      })),
-      nextCursor: null,
-    }),
-  );
+  response.end(JSON.stringify({ activeSeatCount: quantities.get(caller.organizationId) ?? 5 }));
 }
 
 interface StripeFixtureSession {
@@ -224,8 +214,8 @@ async function startCheckoutUpstream(verifier: InternalTokenVerifier) {
   const handle = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
     response.setHeader('Content-Type', 'application/json');
     const url = new URL(request.url ?? '/', 'http://127.0.0.1');
-    if (request.method === 'GET' && request.url === '/internal/v1/billing-memberships?limit=100') {
-      await checkoutMembershipSnapshot(request, response, verifier, organizationReads, quantities);
+    if (request.method === 'GET' && request.url === '/internal/v1/billing-active-seats') {
+      await checkoutSeatCount(request, response, verifier, organizationReads, quantities);
       return;
     }
     if (request.method === 'POST' && url.pathname === path) {
@@ -727,7 +717,21 @@ describe('billing-service wiring', () => {
     expect(journal.rows).toEqual([{ applied: migrationCount }]);
   });
 
-  it.each([1, 3, 4, 6, 7, 8, 9, 10])(
+  it('finalizes the outbox lease constraints and expiry index', async () => {
+    const checks = await migrator.query<{ convalidated: boolean }>(
+      `select convalidated from pg_constraint
+       where conrelid = 'public.outbox_events'::regclass
+         and conname in ('outbox_events_status_check', 'outbox_events_lease_check')`,
+    );
+    const index = await migrator.query<{ indisvalid: boolean }>(
+      `select indisvalid from pg_index
+       where indexrelid = 'public.outbox_events_lease_expiry_index'::regclass`,
+    );
+    expect(checks.rows).toEqual([{ convalidated: true }, { convalidated: true }]);
+    expect(index.rows).toEqual([{ indisvalid: true }]);
+  });
+
+  it.each([1, 3, 4, 6, 7, 8, 9, 10, 11])(
     'upgrades from %i applied migrations without losing rows or application privileges',
     async (previousCount) => {
       const port = hostPort('postgres', '5432');
