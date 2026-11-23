@@ -138,7 +138,7 @@ const paymentsTables = [
 ] as const;
 
 /** Migrations applied on a clean or upgraded database. */
-const migrationCount = 11;
+const migrationCount = 12;
 const stripeFixtureKey = 'whsec_fixture';
 const stripeTeamPrice = 'price_team_fixture';
 
@@ -727,7 +727,21 @@ describe('billing-service wiring', () => {
     expect(journal.rows).toEqual([{ applied: migrationCount }]);
   });
 
-  it.each([1, 3, 4, 6, 7, 8, 9, 10])(
+  it('finalizes the outbox lease constraints and expiry index', async () => {
+    const checks = await migrator.query<{ convalidated: boolean }>(
+      `select convalidated from pg_constraint
+       where conrelid = 'public.outbox_events'::regclass
+         and conname in ('outbox_events_status_check', 'outbox_events_lease_check')`,
+    );
+    const index = await migrator.query<{ indisvalid: boolean }>(
+      `select indisvalid from pg_index
+       where indexrelid = 'public.outbox_events_lease_expiry_index'::regclass`,
+    );
+    expect(checks.rows).toEqual([{ convalidated: true }, { convalidated: true }]);
+    expect(index.rows).toEqual([{ indisvalid: true }]);
+  });
+
+  it.each([1, 3, 4, 6, 7, 8, 9, 10, 11])(
     'upgrades from %i applied migrations without losing rows or application privileges',
     async (previousCount) => {
       const port = hostPort('postgres', '5432');

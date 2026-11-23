@@ -31,6 +31,10 @@ transaction runners.
 Created by `migrations/0000_platform_tables.sql`, owned by the migrator role `billing_migrator`.
 The application role `billing_app` reads and writes their rows and holds no DDL right on them.
 
+The additive outbox lease expansion accepts the historic relay's pending, sent and failed rows.
+The migrator validates the new checks and builds the expiry index concurrently after Drizzle
+commits. The existing relay remains the default while a leased relay is prepared.
+
 ## API
 
 None. The `Idempotency-Key` interceptor of `DatabaseModule` (`idempotency: true`) stores the key and

@@ -125,6 +125,42 @@ describe('StartBillingCheckout', () => {
     );
   });
 
+  it.each([1, 2, 3, 4])(
+    'persists and dispatches the authoritative quantity of %s seats',
+    async (quantity) => {
+      const { authority, work, provider, useCase } = fixture();
+      vi.mocked(authority.prepare).mockResolvedValue({ ...request, quantity });
+
+      await expect(useCase.execute(input)).resolves.toEqual({ status: 'ready', url: opened.url });
+
+      expect(work.saveRequest).toHaveBeenCalledExactlyOnceWith(
+        input.organizationId,
+        'lease-a',
+        expect.objectContaining({ providerKey: request.providerKey, quantity }),
+      );
+      expect(provider.create).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ providerKey: request.providerKey, quantity }),
+      );
+    },
+  );
+
+  it('preserves the originally reserved seat quantity on an uncertain retry', async () => {
+    const original = { ...savedRequest, quantity: 2 };
+    const { authority, provider, work, useCase } = fixture(recoveryClaim(original));
+    vi.mocked(work.findUnresolved).mockResolvedValue({ ...unresolved, quantity: 2 });
+    vi.mocked(authority.prepare).mockResolvedValue({ ...request, quantity: 4 });
+
+    await expect(useCase.execute(input)).resolves.toEqual({ status: 'ready', url: opened.url });
+
+    expect(authority.prepare).not.toHaveBeenCalled();
+    expect(work.saveRequest).toHaveBeenCalledExactlyOnceWith(
+      input.organizationId,
+      'lease-b',
+      original,
+    );
+    expect(provider.create).toHaveBeenCalledExactlyOnceWith(original);
+  });
+
   it('replays the committed response without calling Organization or Stripe', async () => {
     const { authority, provider, useCase } = fixture({
       status: 'replay',
