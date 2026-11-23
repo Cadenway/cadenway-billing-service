@@ -1,6 +1,4 @@
-import { isDeepStrictEqual } from 'node:util';
-
-import { ListBillingMembershipsInternalResponse } from '@cadenway/contracts/validators/internal/organization-service';
+import { GetBillingActiveSeatCountInternalResponse } from '@cadenway/contracts/validators/internal/organization-service';
 import { MAX_CALL_TIMEOUT_MS, remainingBudgetMs } from '@cadenway/nest-common';
 import type { InternalHttpClient } from '@cadenway/nest-common';
 import { assertNoActiveTransaction } from '@cadenway/nest-common/database';
@@ -17,8 +15,7 @@ type CheckoutSettings = Pick<CheckoutProviderRequest, 'priceId' | 'successUrl' |
   readonly freeSeatLimit: number;
 };
 
-const maxPageRows = 100;
-const maxPageBytes = 1_048_576;
+const maxCountResponseBytes = 4_096;
 
 /** Prepares Checkout from one complete Organization snapshot and Billing's committed limits. */
 export function createOrganizationCheckoutAuthority(
@@ -57,45 +54,24 @@ async function readCurrentSeats(
   const deadline = performance.now() + timeoutMs;
   const signal = AbortSignal.timeout(timeoutMs);
   try {
-    const response = await client.fetch(
-      `/internal/v1/billing-memberships?limit=${String(maxPageRows)}`,
-      {
-        claims: { actor: { type: 'system', id: 'billing-service' }, organizationId },
-        cache: 'no-store',
-        redirect: 'error',
-        signal,
-        streamTimeoutMs: timeoutMs,
-        idempotent: false,
-      },
-    );
-    const wire = await readPageBody(response, signal);
-    const page = ListBillingMembershipsInternalResponse.safeParse(wire);
-    if (
-      !page.success ||
-      !isDeepStrictEqual(wire, page.data) ||
-      page.data.nextCursor !== null ||
-      page.data.items.length > maxPageRows ||
-      signal.aborted ||
-      performance.now() >= deadline
-    ) {
-      return null;
-    }
-
-    let previousId = '';
-    let seats = 0;
-    for (const item of page.data.items) {
-      const id = item.memberId.toLowerCase();
-      if (id <= previousId) return null;
-      previousId = id;
-      if (item.state === 'active' && item.role !== 'guest') seats += 1;
-    }
-    return seats;
+    const response = await client.fetch('/internal/v1/billing-active-seats', {
+      claims: { actor: { type: 'system', id: 'billing-service' }, organizationId },
+      cache: 'no-store',
+      redirect: 'error',
+      signal,
+      streamTimeoutMs: timeoutMs,
+      idempotent: false,
+    });
+    const wire = await readCountBody(response, signal);
+    const count = GetBillingActiveSeatCountInternalResponse.safeParse(wire);
+    if (!count.success || signal.aborted || performance.now() >= deadline) return null;
+    return count.data.activeSeatCount;
   } catch {
     return null;
   }
 }
 
-async function readPageBody(response: Response, signal: AbortSignal): Promise<unknown> {
+async function readCountBody(response: Response, signal: AbortSignal): Promise<unknown> {
   const { body, headers } = response;
   const mediaType = headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase();
   const cachePolicy = headers
@@ -110,7 +86,7 @@ async function readPageBody(response: Response, signal: AbortSignal): Promise<un
     cachePolicy?.length !== 2 ||
     !cachePolicy.includes('private') ||
     !cachePolicy.includes('no-store') ||
-    (size !== null && (!/^\d+$/u.test(size) || Number(size) > maxPageBytes))
+    (size !== null && (!/^\d+$/u.test(size) || Number(size) > maxCountResponseBytes))
   ) {
     void body?.cancel().catch(() => undefined);
     return null;
@@ -130,7 +106,7 @@ async function readPageBody(response: Response, signal: AbortSignal): Promise<un
       signal.throwIfAborted();
       if (chunk.done) break;
       bytes += chunk.value.byteLength;
-      if (bytes > maxPageBytes) return null;
+      if (bytes > maxCountResponseBytes) return null;
       chunks.push(chunk.value);
     }
     const document: unknown = JSON.parse(

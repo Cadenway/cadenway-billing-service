@@ -17,22 +17,7 @@ const free: BillingEntitlement = {
   storageByteLimit: 2_000_000_000,
   version: 0,
 };
-const page = {
-  items: [
-    { memberId: memberId(1), state: 'active', role: 'owner', version: 1 },
-    { memberId: memberId(2), state: 'active', role: 'admin', version: 1 },
-    { memberId: memberId(3), state: 'active', role: 'guest', version: 1 },
-    { memberId: memberId(4), state: 'removed', version: 4 },
-    { memberId: memberId(5), state: 'active', role: 'member', version: 1 },
-    { memberId: memberId(6), state: 'active', role: 'member', version: 1 },
-    { memberId: memberId(7), state: 'active', role: 'member', version: 1 },
-  ],
-  nextCursor: null,
-};
-
-function memberId(suffix: number): string {
-  return `019a5f3d-1a2b-7c3d-8e4f-5a6b7c8d9e${suffix.toString(16).padStart(2, '0')}`;
-}
+const seatCount = { activeSeatCount: 5 };
 
 function snapshot(body: unknown, cacheControl = 'private, no-store'): Response {
   return Response.json(body, { headers: { 'Cache-Control': cacheControl } });
@@ -53,9 +38,9 @@ function fixture(entitlement: BillingEntitlement = free) {
 }
 
 describe('Organization Checkout seat authority', () => {
-  it('uses one signed complete tenant snapshot and excludes guests and removals', async () => {
+  it('uses one signed seat count for the verified tenant', async () => {
     const authority = fixture();
-    authority.fetch.mockResolvedValueOnce(snapshot(page));
+    authority.fetch.mockResolvedValueOnce(snapshot(seatCount));
 
     await expect(authority.prepare(organizationId, providerKey)).resolves.toEqual({
       organizationId,
@@ -66,7 +51,7 @@ describe('Organization Checkout seat authority', () => {
     expect(authority.readEntitlement).toHaveBeenCalledExactlyOnceWith(organizationId);
     expect(authority.fetch).toHaveBeenCalledTimes(1);
     expect(authority.fetch.mock.calls[0]).toMatchObject([
-      '/internal/v1/billing-memberships?limit=100',
+      '/internal/v1/billing-active-seats',
       {
         claims: { actor: { type: 'system', id: 'billing-service' }, organizationId },
         cache: 'no-store',
@@ -79,17 +64,7 @@ describe('Organization Checkout seat authority', () => {
     'uses the exact paid quantity for %s active billable seats',
     async (quantity) => {
       const authority = fixture();
-      const removed = { memberId: memberId(8), state: 'removed', version: 2 };
-      const guest = { memberId: memberId(7), state: 'active', role: 'guest', version: 1 };
-      const active = Array.from({ length: quantity }, (_, index) => ({
-        memberId: memberId(index + 1),
-        state: 'active',
-        role: index === 0 ? 'owner' : 'member',
-        version: 1,
-      }));
-      authority.fetch.mockResolvedValueOnce(
-        snapshot({ ...page, items: [...active, guest, removed] }),
-      );
+      authority.fetch.mockResolvedValueOnce(snapshot({ activeSeatCount: quantity }));
 
       await expect(authority.prepare(organizationId, providerKey)).resolves.toEqual({
         organizationId,
@@ -101,15 +76,13 @@ describe('Organization Checkout seat authority', () => {
   );
 
   it.each([
-    { ...page, nextCursor: 'valid-continuation' },
-    { ...page, items: page.items.slice(2, 4) },
-    { ...page, items: [...page.items, page.items[0]] },
-    { ...page, items: [{ ...page.items[0], role: 'external' }, ...page.items.slice(1)] },
-    {
-      ...page,
-      items: [{ ...page.items[0], organizationId: 'other-tenant' }, ...page.items.slice(1)],
-    },
-  ])('fails closed on incomplete, unsafe or too-small seat evidence %j', async (invalid) => {
+    { items: [], nextCursor: null },
+    { activeSeatCount: '1' },
+    { activeSeatCount: 1.5 },
+    { activeSeatCount: -1 },
+    { activeSeatCount: 0 },
+    { activeSeatCount: 1, organizationId: 'other-tenant' },
+  ])('fails closed on invalid or too-small seat evidence %j', async (invalid) => {
     const authority = fixture();
     authority.fetch.mockResolvedValueOnce(snapshot(invalid));
     await expect(authority.prepare(organizationId, providerKey)).resolves.toBeNull();
@@ -118,7 +91,7 @@ describe('Organization Checkout seat authority', () => {
 
   it('refuses Checkout if the effective Team allowance would reduce the existing seat limit', async () => {
     const authority = fixture({ ...free, seatLimit: 6 });
-    authority.fetch.mockResolvedValueOnce(snapshot(page));
+    authority.fetch.mockResolvedValueOnce(snapshot(seatCount));
     await expect(authority.prepare(organizationId, providerKey)).resolves.toBeNull();
   });
 
@@ -137,7 +110,7 @@ describe('Organization Checkout seat authority', () => {
   it('fails closed when Organization is unreachable or serves cached evidence', async () => {
     const authority = fixture();
     authority.fetch.mockRejectedValueOnce(new Error('upstream details'));
-    authority.fetch.mockResolvedValueOnce(snapshot(page, 'public, max-age=60'));
+    authority.fetch.mockResolvedValueOnce(snapshot(seatCount, 'public, max-age=60'));
     await expect(authority.prepare(organizationId, providerKey)).resolves.toBeNull();
     await expect(authority.prepare(organizationId, providerKey)).resolves.toBeNull();
   });
@@ -145,7 +118,7 @@ describe('Organization Checkout seat authority', () => {
   it('rejects an oversized body even when Organization omits Content-Length', async () => {
     const authority = fixture();
     authority.fetch.mockResolvedValueOnce(
-      new Response(new Uint8Array(1_048_577), {
+      new Response(new Uint8Array(4_097), {
         headers: { 'Cache-Control': 'private, no-store', 'Content-Type': 'application/json' },
       }),
     );

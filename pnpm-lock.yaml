@@ -172,14 +172,14 @@ importers:
   .:
     dependencies:
       '@cadenway/contracts':
-        specifier: 0.34.0
-        version: 0.34.0
+        specifier: 0.38.0
+        version: 0.38.0
       '@cadenway/nest-common':
         specifier: 0.13.0
         version: 0.13.0(@grpc/grpc-js@1.14.7)(@grpc/proto-loader@0.8.1)(@nestjs/common@12.4.2(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.4.2)(@nestjs/platform-express@12.4.2)(@opentelemetry/api@1.10.0)(drizzle-orm@0.45.4(@opentelemetry/api@1.10.0)(@types/pg@8.23.1)(pg@8.23.1))(ioredis@6.0.0)(pg@8.23.1)(reflect-metadata@0.2.2)(rxjs@7.8.2)(zod@4.6.7)
       '@cadenway/nest-messaging':
         specifier: 0.7.0
-        version: 0.7.0(@cadenway/contracts@0.34.0)(@cadenway/nest-common@0.13.0(@grpc/grpc-js@1.14.7)(@grpc/proto-loader@0.8.1)(@nestjs/common@12.4.2(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.4.2)(@nestjs/platform-express@12.4.2)(@opentelemetry/api@1.10.0)(drizzle-orm@0.45.4(@opentelemetry/api@1.10.0)(@types/pg@8.23.1)(pg@8.23.1))(ioredis@6.0.0)(pg@8.23.1)(reflect-metadata@0.2.2)(rxjs@7.8.2)(zod@4.6.7))(@nestjs/common@12.4.2(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.4.2)(@opentelemetry/api@1.10.0)(drizzle-orm@0.45.4(@opentelemetry/api@1.10.0)(@types/pg@8.23.1)(pg@8.23.1))(pg@8.23.1)(zod@4.6.7)
+        version: 0.7.0(@cadenway/contracts@0.38.0)(@cadenway/nest-common@0.13.0(@grpc/grpc-js@1.14.7)(@grpc/proto-loader@0.8.1)(@nestjs/common@12.4.2(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.4.2)(@nestjs/platform-express@12.4.2)(@opentelemetry/api@1.10.0)(drizzle-orm@0.45.4(@opentelemetry/api@1.10.0)(@types/pg@8.23.1)(pg@8.23.1))(ioredis@6.0.0)(pg@8.23.1)(reflect-metadata@0.2.2)(rxjs@7.8.2)(zod@4.6.7))(@nestjs/common@12.4.2(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.4.2)(@opentelemetry/api@1.10.0)(drizzle-orm@0.45.4(@opentelemetry/api@1.10.0)(@types/pg@8.23.1)(pg@8.23.1))(pg@8.23.1)(zod@4.6.7)
       '@nestjs/common':
         specifier: ^12.4.2
         version: 12.4.2(reflect-metadata@0.2.2)(rxjs@7.8.2)
@@ -216,7 +216,7 @@ importers:
     devDependencies:
       '@cadenway/nest-testing':
         specifier: 0.5.1
-        version: 0.5.1(270d79b3b9f43eaf3d67306b8a3d00e5)
+        version: 0.5.1(0b21a7119de2436bea710fb1f62338f9)
       '@commitlint/cli':
         specifier: ^21.2.4
         version: 21.2.4(conventional-commits-parser@7.1.4)(typescript@6.0.3)
@@ -350,8 +350,8 @@ packages:
   '@cacheable/utils@2.5.0':
     resolution: {integrity: sha512-buipgOVDkkPXNR5+xBpDw7Zk2n1EvU7qBJCNUcL7rhQ//kfpOXPAvQ511Os0vpLYJ1pZnvudNytkQt2hst3wqA==}
 
-  '@cadenway/contracts@0.34.0':
-    resolution: {integrity: sha512-w7nl2Tdh+lpeOx0+ZY9Mu5DHxV5LyvWURKA8DVo5pm8TxlPhacKnjSlp/IybGDtANyiatZUaPZ50NwlLCtgmzA==, tarball: https://npm.pkg.github.com/download/@cadenway/contracts/0.34.0/ba9cae25a2bbf846fa7ac9d2c62338fa783c4ac6}
+  '@cadenway/contracts@0.38.0':
+    resolution: {integrity: sha512-AdEebF1QdxL0GTucPCR87hR0PxXYN2XPIPGk3YIAmgpNXwx/BJUA7pSwXpWXKZcjq7kkm6KDlUtXULXDNe6Xbg==, tarball: https://npm.pkg.github.com/download/@cadenway/contracts/0.38.0/d68b8a0d4352bcff6966d6c2c6249270fa56d6a6}
 
   '@cadenway/nest-common@0.13.0':
     resolution: {integrity: sha512-how8FsKFl4umKfhol1ehPdTR8eV/amfot+fINzMupeU/94Ggs0Wd20Y/dRNVeZ0mrQp+O/6vaEsGEMB0cx7mfQ==, tarball: https://npm.pkg.github.com/download/@cadenway/nest-common/0.13.0/e9b46e321b86674b869fe2f372f8f1d75f1bf093}
@@ -3950,7 +3950,7 @@ snapshots:
       hashery: 1.5.1
       keyv: 5.6.0
 
-  '@cadenway/contracts@0.34.0':
+  '@cadenway/contracts@0.38.0':
     dependencies:
       zod: 4.6.7
 
@@ -4004,9 +4004,9 @@ snapshots:
       - supports-color
       - typeorm
 
-  '@cadenway/nest-messaging@0.7.0(@cadenway/contracts@0.34.0)(@cadenway/nest-common@0.13.0(@grpc/grpc-js@1.14.7)(@grpc/proto-loader@0.8.1)(@nestjs/common@12.4.2(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.4.2)(@nestjs/platform-express@12.4.2)(@opentelemetry/api@1.10.0)(drizzle-orm@0.45.4(@opentelemetry/api@1.10.0)(@types/pg@8.23.1)(pg@8.23.1))(ioredis@6.0.0)(pg@8.23.1)(reflect-metadata@0.2.2)(rxjs@7.8.2)(zod@4.6.7))(@nestjs/common@12.4.2(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.4.2)(@opentelemetry/api@1.10.0)(drizzle-orm@0.45.4(@opentelemetry/api@1.10.0)(@types/pg@8.23.1)(pg@8.23.1))(pg@8.23.1)(zod@4.6.7)':
+  '@cadenway/nest-messaging@0.7.0(@cadenway/contracts@0.38.0)(@cadenway/nest-common@0.13.0(@grpc/grpc-js@1.14.7)(@grpc/proto-loader@0.8.1)(@nestjs/common@12.4.2(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.4.2)(@nestjs/platform-express@12.4.2)(@opentelemetry/api@1.10.0)(drizzle-orm@0.45.4(@opentelemetry/api@1.10.0)(@types/pg@8.23.1)(pg@8.23.1))(ioredis@6.0.0)(pg@8.23.1)(reflect-metadata@0.2.2)(rxjs@7.8.2)(zod@4.6.7))(@nestjs/common@12.4.2(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.4.2)(@opentelemetry/api@1.10.0)(drizzle-orm@0.45.4(@opentelemetry/api@1.10.0)(@types/pg@8.23.1)(pg@8.23.1))(pg@8.23.1)(zod@4.6.7)':
     dependencies:
-      '@cadenway/contracts': 0.34.0
+      '@cadenway/contracts': 0.38.0
       '@cadenway/nest-common': 0.13.0(@grpc/grpc-js@1.14.7)(@grpc/proto-loader@0.8.1)(@nestjs/common@12.4.2(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.4.2)(@nestjs/platform-express@12.4.2)(@opentelemetry/api@1.10.0)(drizzle-orm@0.45.4(@opentelemetry/api@1.10.0)(@types/pg@8.23.1)(pg@8.23.1))(ioredis@6.0.0)(pg@8.23.1)(reflect-metadata@0.2.2)(rxjs@7.8.2)(zod@4.6.7)
       '@nats-io/jetstream': 3.4.0
       '@nats-io/transport-node': 3.4.0
@@ -4017,9 +4017,9 @@ snapshots:
       pg: 8.23.1
       zod: 4.6.7
 
-  '@cadenway/nest-testing@0.5.1(270d79b3b9f43eaf3d67306b8a3d00e5)':
+  '@cadenway/nest-testing@0.5.1(0b21a7119de2436bea710fb1f62338f9)':
     dependencies:
-      '@cadenway/nest-messaging': 0.7.0(@cadenway/contracts@0.34.0)(@cadenway/nest-common@0.13.0(@grpc/grpc-js@1.14.7)(@grpc/proto-loader@0.8.1)(@nestjs/common@12.4.2(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.4.2)(@nestjs/platform-express@12.4.2)(@opentelemetry/api@1.10.0)(drizzle-orm@0.45.4(@opentelemetry/api@1.10.0)(@types/pg@8.23.1)(pg@8.23.1))(ioredis@6.0.0)(pg@8.23.1)(reflect-metadata@0.2.2)(rxjs@7.8.2)(zod@4.6.7))(@nestjs/common@12.4.2(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.4.2)(@opentelemetry/api@1.10.0)(drizzle-orm@0.45.4(@opentelemetry/api@1.10.0)(@types/pg@8.23.1)(pg@8.23.1))(pg@8.23.1)(zod@4.6.7)
+      '@cadenway/nest-messaging': 0.7.0(@cadenway/contracts@0.38.0)(@cadenway/nest-common@0.13.0(@grpc/grpc-js@1.14.7)(@grpc/proto-loader@0.8.1)(@nestjs/common@12.4.2(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.4.2)(@nestjs/platform-express@12.4.2)(@opentelemetry/api@1.10.0)(drizzle-orm@0.45.4(@opentelemetry/api@1.10.0)(@types/pg@8.23.1)(pg@8.23.1))(ioredis@6.0.0)(pg@8.23.1)(reflect-metadata@0.2.2)(rxjs@7.8.2)(zod@4.6.7))(@nestjs/common@12.4.2(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.4.2)(@opentelemetry/api@1.10.0)(drizzle-orm@0.45.4(@opentelemetry/api@1.10.0)(@types/pg@8.23.1)(pg@8.23.1))(pg@8.23.1)(zod@4.6.7)
       '@nestjs/testing': 12.4.2(@nestjs/common@12.4.2(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.4.2)(@nestjs/platform-express@12.4.2)
       '@testcontainers/nats': 12.2.1(bare-buffer@3.7.1)
       '@testcontainers/postgresql': 12.2.1(bare-buffer@3.7.1)

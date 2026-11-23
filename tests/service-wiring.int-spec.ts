@@ -151,8 +151,8 @@ function signStripeFixture(payload: string): string {
   return `t=${timestamp},v1=${digest}`;
 }
 
-/** Verifies the billed tenant on a complete Organization membership snapshot request. */
-async function checkoutMembershipSnapshot(
+/** Verifies the billed tenant on the Organization active seat count request. */
+async function checkoutSeatCount(
   request: IncomingMessage,
   response: ServerResponse,
   verifier: InternalTokenVerifier,
@@ -168,17 +168,7 @@ async function checkoutMembershipSnapshot(
   if (caller.organizationId === null) throw new Error('Missing Checkout organization.');
   organizationReads.push(caller.organizationId);
   response.setHeader('Cache-Control', 'private, no-store');
-  response.end(
-    JSON.stringify({
-      items: Array.from({ length: quantities.get(caller.organizationId) ?? 5 }, (_, index) => ({
-        memberId: `01938f6e-0000-7000-8000-${String(index + 1).padStart(12, '0')}`,
-        state: 'active',
-        role: index === 0 ? 'owner' : 'member',
-        version: 1,
-      })),
-      nextCursor: null,
-    }),
-  );
+  response.end(JSON.stringify({ activeSeatCount: quantities.get(caller.organizationId) ?? 5 }));
 }
 
 interface StripeFixtureSession {
@@ -224,8 +214,8 @@ async function startCheckoutUpstream(verifier: InternalTokenVerifier) {
   const handle = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
     response.setHeader('Content-Type', 'application/json');
     const url = new URL(request.url ?? '/', 'http://127.0.0.1');
-    if (request.method === 'GET' && request.url === '/internal/v1/billing-memberships?limit=100') {
-      await checkoutMembershipSnapshot(request, response, verifier, organizationReads, quantities);
+    if (request.method === 'GET' && request.url === '/internal/v1/billing-active-seats') {
+      await checkoutSeatCount(request, response, verifier, organizationReads, quantities);
       return;
     }
     if (request.method === 'POST' && url.pathname === path) {

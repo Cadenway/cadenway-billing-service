@@ -155,8 +155,9 @@ attempt counts, age and a digest for correlation. The endpoint never stores raw 
   Billing keeps the resolved idempotency record and accepts a fresh key once the price is fixed.
   A failed retry or any other provider error keeps the reservation exclusive until reconciliation.
   Provider I/O stays outside reservation and resolution transactions.
-- Checkout creation requires one complete Organization membership page and charges the current
-  number of active billable seats. Team admission capacity is at least the Free seat limit.
+- Checkout creation requires a signed `GET /internal/v1/billing-active-seats` response from
+  Organization and charges the current number of active billable seats. Team admission capacity
+  is at least the Free seat limit.
   Creation refuses a lower effective quota than the committed quota. A paid session matching
   its reservation records the initial binding, entitlement, receipt and outbox fact in one
   tenant transaction.
