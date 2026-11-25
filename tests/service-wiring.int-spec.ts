@@ -138,7 +138,7 @@ const paymentsTables = [
 ] as const;
 
 /** Migrations applied on a clean or upgraded database. */
-const migrationCount = 12;
+const migrationCount = 13;
 const stripeFixtureKey = 'whsec_fixture';
 const stripeTeamPrice = 'price_team_fixture';
 
@@ -731,7 +731,7 @@ describe('billing-service wiring', () => {
     expect(index.rows).toEqual([{ indisvalid: true }]);
   });
 
-  it.each([1, 3, 4, 6, 7, 8, 9, 10, 11])(
+  it.each([1, 3, 4, 6, 7, 8, 9, 10, 11, 12])(
     'upgrades from %i applied migrations without losing rows or application privileges',
     async (previousCount) => {
       const port = hostPort('postgres', '5432');

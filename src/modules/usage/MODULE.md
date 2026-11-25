@@ -73,7 +73,7 @@ The rebuild worker reads signed roster, membership and attachment pages outside 
 An organization lock serializes each page, invalidation and promotion. The persisted generation
 and its version fence replay or concurrent updates. Each page uses at most one query to read its
 existing observations and one upsert to write accepted observations before advancing the cursor.
-Promotion requires both scans to finish, JetStream to confirm continuity for all six consumers, and identical clear advisory latch observations before and after the rebuild. A changed latch identity or sequence invalidates the affected generation, even after an advisory is purged. Unknown latch state delays certification and reads without invalidating a generation. Legacy generations without latch evidence are rebuilt.
+Promotion requires both scans to finish, JetStream to confirm continuity for all six consumers, and identical clear advisory latch observations before and after the rebuild. A changed latch identity or sequence invalidates the affected generation, even after an advisory is purged. Unknown latch state delays certification and reads without invalidating a generation. Legacy generations without latch evidence are rebuilt. The evidence lives in its own `usage_generations` columns, `start_advisory` for a candidate's start and `certified_advisory` for a promoted generation, outside the JSON checkpoint, so a previous release rewriting that checkpoint during a rollout keeps it; a generation that release promotes has none and is rebuilt once.
 An unavailable source or broker leaves the tenant eligible for a later retry.
 
 ## Decisions

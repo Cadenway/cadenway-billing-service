@@ -10,6 +10,7 @@ import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
+import { AdvanceUsageRebuild } from '../src/modules/usage/application/services/rebuild/advance-usage-rebuild.service.js';
 import type { UsageRebuildBrokerProgress } from '../src/modules/usage/application/models/rebuild/usage-rebuild-broker-progress.model.js';
 import type { UsageBrokerProof } from '../src/modules/usage/application/ports/outbound/messaging/rebuild/usage-broker-proof.port.js';
 import type { ReadUsagePlan } from '../src/modules/usage/application/ports/outbound/persistence/usage/read-usage-plan.port.js';
@@ -317,6 +318,88 @@ describe('usage rebuild PostgreSQL transactions', () => {
     await expect(
       runWithOrganizationContext(context(otherId), () => state.read(organizationId)),
     ).rejects.toThrow();
+  });
+
+  it('preserves certification across old checkpoint writes and rebuilds an old promotion once', async () => {
+    const tenant = '01938f6e-6d1a-7c3e-9a51-2f0c4b8d7e13';
+    const advisory = { createdAt: 'latch', lastSequence: 0 };
+    const inTenant = <T>(work: () => Promise<T>): Promise<T> =>
+      runWithOrganizationContext(context(tenant), work);
+    const start = new StartUsageRebuild(uow, proof);
+    const apply = new ApplyUsageRebuildPage(uow);
+    const promote = new PromoteUsageRebuild(uow, proof);
+    const worker = new AdvanceUsageRebuild(
+      state,
+      {
+        read: () =>
+          Promise.resolve({ advisoryState: 'clear', advisoriesClear: true, advisory, progress }),
+      },
+      proof,
+      {
+        listOrganizations: vi.fn(),
+        listMemberships: () => Promise.resolve({ items: [], nextCursor: null }),
+        listAttachments: () => Promise.resolve({ items: [], nextCursor: null }),
+      },
+      start,
+      apply,
+      promote,
+      new InvalidateActiveUsage(uow),
+      uow,
+    );
+    const advance = () => inTenant(() => worker.advance(tenant));
+    await expect(advance()).resolves.toBe('started');
+    await expect(advance()).resolves.toBe('applied');
+    await expect(advance()).resolves.toBe('applied');
+    await expect(advance()).resolves.toBe('promoted');
+    const certified = (await inTenant(() => state.read(tenant))).active;
+    if (certified === null) throw new Error('Certified generation missing.');
+    await inTenant(() =>
+      runner.run(({ client }) =>
+        client.query(
+          `update usage_generations set stream_checkpoint = $3, version = version + 1
+       where organization_id = $1 and id = $2`,
+          [
+            tenant,
+            certified.id,
+            { version: 1, start: progress, promotion: progress, verified: progress },
+          ],
+        ),
+      ),
+    );
+    expect((await inTenant(() => state.read(tenant))).active?.advisory).toEqual(advisory);
+    await expect(advance()).resolves.toBe('healthy');
+
+    const oldCandidate = await inTenant(() =>
+      start.execute({
+        organizationId: tenant,
+        brokerAtStart: progress,
+        advisoriesClear: true,
+        advisory,
+      }),
+    );
+    await inTenant(() =>
+      runner.run(async ({ client }) => {
+        await client.query(
+          `update usage_generations set status = 'ready', membership_scan_complete = true,
+         attachment_scan_complete = true, stream_checkpoint = $3, version = version + 1
+         where organization_id = $1 and id = $2`,
+          [tenant, oldCandidate.generationId, { version: 1, start: progress, promotion: progress }],
+        );
+        await client.query(
+          `update usage_organizations set active_generation_id = $2, candidate_generation_id = null
+         where organization_id = $1`,
+          [tenant, oldCandidate.generationId],
+        );
+      }),
+    );
+    expect((await inTenant(() => state.read(tenant))).active?.advisory).toBeNull();
+    await expect(advance()).resolves.toBe('invalidated');
+    await expect(advance()).resolves.toBe('started');
+    await expect(advance()).resolves.toBe('applied');
+    await expect(advance()).resolves.toBe('applied');
+    await expect(advance()).resolves.toBe('promoted');
+    await expect(advance()).resolves.toBe('healthy');
+    await expect(advance()).resolves.toBe('healthy');
   });
 
   it('uses two observation statements for a full page with inserts, a replacement and an older row', async () => {

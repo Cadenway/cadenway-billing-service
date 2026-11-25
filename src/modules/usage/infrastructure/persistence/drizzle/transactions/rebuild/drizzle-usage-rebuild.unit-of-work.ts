@@ -12,7 +12,10 @@ import type { UsageRebuildTransaction } from '../../../../../application/ports/o
 import type { UsageRebuildUnitOfWork } from '../../../../../application/ports/outbound/transactions/rebuild/usage-rebuild-unit-of-work.port.js';
 import type { QuotaThresholdReached } from '../../../../../domain/events/quotas/quota-threshold-reached.event.js';
 import type { RecordedUsageObservation } from '../../../../../domain/value-objects/observations/recorded-usage-observation.value-object.js';
-import { usageRebuildCheckpoint } from '../../mappers/rebuild/usage-rebuild-checkpoint.mapper.js';
+import {
+  usageAdvisoryEvidence,
+  usageRebuildCheckpoint,
+} from '../../mappers/rebuild/usage-rebuild-checkpoint.mapper.js';
 import {
   usageGenerations,
   usageObservations,
@@ -88,7 +91,7 @@ export class DrizzleUsageRebuildUnitOfWork implements UsageRebuildUnitOfWork {
           membership: { cursor: row.membershipCursor, complete: row.membershipScanComplete },
           attachment: { cursor: row.attachmentCursor, complete: row.attachmentScanComplete },
           brokerAtStart: parsed.data.start,
-          advisory: parsed.data.advisory ?? null,
+          advisory: usageAdvisoryEvidence.safeParse(row.startAdvisory).data ?? null,
         };
       };
       return work({
@@ -113,12 +116,13 @@ export class DrizzleUsageRebuildUnitOfWork implements UsageRebuildUnitOfWork {
         startCandidate: async (start: UsageRebuildBrokerProgress, advisory) => {
           requireLock();
           if (selectedId !== null) throw new Error('A usage candidate already exists.');
-          const startCheckpoint = usageRebuildCheckpoint.parse({ version: 1, start, advisory });
+          const startCheckpoint = usageRebuildCheckpoint.parse({ version: 1, start });
           const created = await scope.db
             .insert(usageGenerations)
             .values({
               organizationId,
               streamCheckpoint: startCheckpoint,
+              startAdvisory: advisory,
             })
             .returning({ id: usageGenerations.id });
           const row = created[0];
@@ -272,7 +276,6 @@ export class DrizzleUsageRebuildUnitOfWork implements UsageRebuildUnitOfWork {
           const completeCheckpoint = usageRebuildCheckpoint.parse({
             version: 1,
             start: current.brokerAtStart,
-            advisory: current.advisory ?? undefined,
             promotion,
           });
           const updated = await scope.db
@@ -280,6 +283,7 @@ export class DrizzleUsageRebuildUnitOfWork implements UsageRebuildUnitOfWork {
             .set({
               status: 'ready',
               streamCheckpoint: completeCheckpoint,
+              certifiedAdvisory: current.advisory,
               version: sql`${usageGenerations.version} + 1`,
               updatedAt: sql`now()`,
             })
