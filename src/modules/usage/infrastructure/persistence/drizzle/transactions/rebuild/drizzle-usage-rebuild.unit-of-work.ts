@@ -88,6 +88,7 @@ export class DrizzleUsageRebuildUnitOfWork implements UsageRebuildUnitOfWork {
           membership: { cursor: row.membershipCursor, complete: row.membershipScanComplete },
           attachment: { cursor: row.attachmentCursor, complete: row.attachmentScanComplete },
           brokerAtStart: parsed.data.start,
+          advisory: parsed.data.advisory ?? null,
         };
       };
       return work({
@@ -109,10 +110,10 @@ export class DrizzleUsageRebuildUnitOfWork implements UsageRebuildUnitOfWork {
           locked = true;
         },
         candidate,
-        startCandidate: async (start: UsageRebuildBrokerProgress) => {
+        startCandidate: async (start: UsageRebuildBrokerProgress, advisory) => {
           requireLock();
           if (selectedId !== null) throw new Error('A usage candidate already exists.');
-          const startCheckpoint = usageRebuildCheckpoint.parse({ version: 1, start });
+          const startCheckpoint = usageRebuildCheckpoint.parse({ version: 1, start, advisory });
           const created = await scope.db
             .insert(usageGenerations)
             .values({
@@ -271,6 +272,7 @@ export class DrizzleUsageRebuildUnitOfWork implements UsageRebuildUnitOfWork {
           const completeCheckpoint = usageRebuildCheckpoint.parse({
             version: 1,
             start: current.brokerAtStart,
+            advisory: current.advisory ?? undefined,
             promotion,
           });
           const updated = await scope.db

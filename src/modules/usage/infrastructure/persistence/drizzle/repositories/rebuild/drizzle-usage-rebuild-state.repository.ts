@@ -54,6 +54,7 @@ export class DrizzleUsageRebuildStateReader implements UsageRebuildStateReader {
               id: row.id,
               version: row.version,
               brokerAtPromotion: checkpoint.verified ?? checkpoint.promotion,
+              advisory: checkpoint.advisory ?? null,
             };
           } else if (row.status !== 'invalid') {
             throw new Error('Usage active generation has an invalid state.');
@@ -73,6 +74,7 @@ export class DrizzleUsageRebuildStateReader implements UsageRebuildStateReader {
             membership: { cursor: row.membershipCursor, complete: row.membershipScanComplete },
             attachment: { cursor: row.attachmentCursor, complete: row.attachmentScanComplete },
             brokerAtStart: checkpoint.start,
+            advisory: checkpoint.advisory ?? null,
           };
         }
         return { active, candidate };

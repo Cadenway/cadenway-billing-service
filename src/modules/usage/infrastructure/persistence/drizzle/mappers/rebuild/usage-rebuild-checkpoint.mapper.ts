@@ -23,6 +23,7 @@ const brokerProgress = z.object({
 export const usageRebuildCheckpoint = z.object({
   version: z.literal(1),
   start: brokerProgress,
+  advisory: z.object({ createdAt: z.string().min(1), lastSequence: sequence }).optional(),
   promotion: brokerProgress.optional(),
   verified: brokerProgress.optional(),
 });

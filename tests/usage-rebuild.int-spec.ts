@@ -121,10 +121,20 @@ describe('usage rebuild PostgreSQL transactions', () => {
 
     const [first, second] = await Promise.all([
       inTenant(() =>
-        start.execute({ organizationId, brokerAtStart: progress, advisoriesClear: true }),
+        start.execute({
+          organizationId,
+          brokerAtStart: progress,
+          advisoriesClear: true,
+          advisory: { createdAt: 'latch', lastSequence: 0 },
+        }),
       ),
       inTenant(() =>
-        start.execute({ organizationId, brokerAtStart: progress, advisoriesClear: true }),
+        start.execute({
+          organizationId,
+          brokerAtStart: progress,
+          advisoriesClear: true,
+          advisory: { createdAt: 'latch', lastSequence: 0 },
+        }),
       ),
     ]);
     expect(first.generationId).toBe(second.generationId);
@@ -236,6 +246,7 @@ describe('usage rebuild PostgreSQL transactions', () => {
           expectedCandidateVersion: expectedCandidateVersion - 1,
           brokerAtPromotion: progress,
           advisoriesClear: true,
+          advisory: { createdAt: 'latch', lastSequence: 0 },
         }),
       ),
     ).resolves.toBe('stale');
@@ -247,6 +258,7 @@ describe('usage rebuild PostgreSQL transactions', () => {
           expectedCandidateVersion,
           brokerAtPromotion: progress,
           advisoriesClear: true,
+          advisory: { createdAt: 'latch', lastSequence: 0 },
         }),
       ),
     ).resolves.toBe('promoted');
@@ -317,6 +329,7 @@ describe('usage rebuild PostgreSQL transactions', () => {
         organizationId: batchOrganization,
         brokerAtStart: progress,
         advisoriesClear: true,
+        advisory: { createdAt: 'latch', lastSequence: 0 },
       });
       const page = {
         organizationId: batchOrganization,

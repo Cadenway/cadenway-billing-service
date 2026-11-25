@@ -18,7 +18,7 @@ export class JetStreamUsageBrokerProgressAdapter implements UsageBrokerSampleRea
   public constructor(
     private readonly connection: Pick<
       MessagingConnection,
-      'isConsumerAdvisoryStreamClear' | 'watchAvailability'
+      'consumerAdvisoryStreamState' | 'watchAvailability'
     >,
     private readonly consumers: Pick<EventConsumers, 'readProgress'>,
     private readonly handlerNames: readonly string[],
@@ -54,7 +54,22 @@ export class JetStreamUsageBrokerProgressAdapter implements UsageBrokerSampleRea
       // and the consumer sample leaves this observation unsuitable for promotion.
       const clearAfter = await this.readAdvisories(cancellation);
       cancellation.throwIfAborted();
-      return { progress, advisoriesClear: clearBefore && clearAfter };
+      const held = clearBefore.state === 'held' || clearAfter.state === 'held';
+      const clear =
+        clearBefore.state === 'clear' &&
+        clearAfter.state === 'clear' &&
+        clearAfter.createdAt !== null &&
+        clearAfter.lastSequence !== null &&
+        clearBefore.createdAt === clearAfter.createdAt &&
+        clearBefore.lastSequence === clearAfter.lastSequence;
+      return {
+        progress,
+        advisoriesClear: clear,
+        advisoryState: held ? 'held' : clear ? 'clear' : 'unknown',
+        advisory: clear
+          ? { createdAt: clearAfter.createdAt, lastSequence: clearAfter.lastSequence }
+          : null,
+      };
     } catch (error) {
       if (cancellation.aborted) {
         return null;
@@ -66,8 +81,10 @@ export class JetStreamUsageBrokerProgressAdapter implements UsageBrokerSampleRea
   }
 
   /** Uses the shared kit to verify the complete advisory configuration. */
-  private readAdvisories(signal: AbortSignal): Promise<boolean> {
-    return this.connection.isConsumerAdvisoryStreamClear(
+  private readAdvisories(
+    signal: AbortSignal,
+  ): ReturnType<MessagingConnection['consumerAdvisoryStreamState']> {
+    return this.connection.consumerAdvisoryStreamState(
       advisoryStream,
       DEFAULT_EVENTS_STREAM,
       this.durables,

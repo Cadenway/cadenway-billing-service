@@ -6,6 +6,7 @@ import type { FactoryProvider } from '@nestjs/common';
 
 import type { AppConfig } from '../../../../../../config/app-config.js';
 import { GetBillingEntitlement } from '../../../../../payments/public/subscriptions/get-billing-entitlement.js';
+import { sameAdvisoryObservation } from '../../../../application/models/rebuild/usage-advisory-observation.model.js';
 import { GetBillingSubscription } from '../../../../application/use-cases/queries/subscription/get-billing-subscription/get-billing-subscription.use-case.js';
 import { BillingUsageBrokerProof } from '../../../../infrastructure/adapters/jetstream/billing-usage-broker-proof.adapter.js';
 import { JetStreamUsageBrokerProgressAdapter } from '../../../../infrastructure/adapters/jetstream/jetstream-usage-broker-progress.adapter.js';
@@ -45,7 +46,8 @@ export const getBillingSubscriptionProvider: FactoryProvider<GetBillingSubscript
           if (!sample?.advisoriesClear) return null;
           return reader.read(
             organizationId,
-            (frontier) =>
+            (frontier, advisory) =>
+              sameAdvisoryObservation(advisory, sample.advisory) &&
               proof.assess(frontier, sample.progress, sample.advisoriesClear) === 'covered',
           );
         },

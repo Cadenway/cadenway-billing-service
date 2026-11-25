@@ -18,6 +18,8 @@ import { AdvanceUsageRebuild } from './advance-usage-rebuild.service.js';
 
 const sample: UsageBrokerSample = {
   advisoriesClear: true,
+  advisoryState: 'clear',
+  advisory: { createdAt: 'latch', lastSequence: 0 },
   progress: {
     stream: 'EVENTS',
     createdAt: '2026-01-01T00:00:00Z',
@@ -34,6 +36,7 @@ const candidate: UsageRebuildCandidate = {
   membership: { cursor: null, complete: false },
   attachment: { cursor: null, complete: false },
   brokerAtStart: sample.progress,
+  advisory: sample.advisory,
 };
 
 function setup(current: UsageRebuildState): {
@@ -96,9 +99,48 @@ function setup(current: UsageRebuildState): {
 }
 
 describe('AdvanceUsageRebuild', () => {
+  it.each([
+    ['recorded and purged advisory', { createdAt: 'latch', lastSequence: 1 }],
+    ['recreated latch', { createdAt: 'new-latch', lastSequence: 0 }],
+    ['legacy generation', null],
+  ])('invalidates an active generation after %s', async (_reason, advisory) => {
+    const { service, transaction } = setup({
+      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress, advisory },
+      candidate: null,
+    });
+    await expect(service.advance('organization')).resolves.toBe('invalidated');
+    expect(transaction.invalidateActive).toHaveBeenCalledWith('active', null);
+  });
+
+  it('waits on unknown without discarding a valid generation', async () => {
+    const { service, transaction, brokerRead } = setup({
+      active: {
+        id: 'active',
+        version: 2,
+        brokerAtPromotion: sample.progress,
+        advisory: sample.advisory,
+      },
+      candidate,
+    });
+    brokerRead.mockResolvedValue({
+      ...sample,
+      advisoriesClear: false,
+      advisoryState: 'unknown',
+      advisory: null,
+    });
+    await expect(service.advance('organization')).resolves.toBe('waiting');
+    expect(transaction.invalidateActive).not.toHaveBeenCalled();
+    expect(transaction.abandon).not.toHaveBeenCalled();
+  });
+
   it('keeps a healthy active generation without starting a new candidate', async () => {
     const { service, transaction } = setup({
-      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress },
+      active: {
+        id: 'active',
+        version: 2,
+        brokerAtPromotion: sample.progress,
+        advisory: sample.advisory,
+      },
       candidate: null,
     });
     await expect(service.advance('organization')).resolves.toBe('healthy');
@@ -109,7 +151,12 @@ describe('AdvanceUsageRebuild', () => {
 
   it('advances the active continuity checkpoint when broker coverage progresses', async () => {
     const { service, transaction, brokerRead } = setup({
-      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress },
+      active: {
+        id: 'active',
+        version: 2,
+        brokerAtPromotion: sample.progress,
+        advisory: sample.advisory,
+      },
       candidate: null,
     });
     const newer = { ...sample, progress: { ...sample.progress, lastSequence: 2 } };
@@ -125,7 +172,12 @@ describe('AdvanceUsageRebuild', () => {
 
   it('does not publish pending crossings when the generation changed after the broker sample', async () => {
     const { service, transaction } = setup({
-      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress },
+      active: {
+        id: 'active',
+        version: 2,
+        brokerAtPromotion: sample.progress,
+        advisory: sample.advisory,
+      },
       candidate: null,
     });
     vi.mocked(transaction.flushThresholdIntents).mockResolvedValue(false);
@@ -136,7 +188,12 @@ describe('AdvanceUsageRebuild', () => {
 
   it('does not flush pending crossings while broker continuity is unconfirmed', async () => {
     const { service, transaction, proof } = setup({
-      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress },
+      active: {
+        id: 'active',
+        version: 2,
+        brokerAtPromotion: sample.progress,
+        advisory: sample.advisory,
+      },
       candidate: null,
     });
     vi.mocked(proof.assess).mockReturnValue('pending');
@@ -147,7 +204,12 @@ describe('AdvanceUsageRebuild', () => {
 
   it('preserves the active generation when checkpoint update loses the version race', async () => {
     const { service, transaction, brokerRead } = setup({
-      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress },
+      active: {
+        id: 'active',
+        version: 2,
+        brokerAtPromotion: sample.progress,
+        advisory: sample.advisory,
+      },
       candidate: null,
     });
     brokerRead.mockResolvedValue({ ...sample, progress: { ...sample.progress, lastSequence: 2 } });
@@ -159,10 +221,20 @@ describe('AdvanceUsageRebuild', () => {
 
   it('invalidates active usage when the advisory latch is uncleared or unverifiable', async () => {
     const { service, transaction, proof, brokerRead } = setup({
-      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress },
+      active: {
+        id: 'active',
+        version: 2,
+        brokerAtPromotion: sample.progress,
+        advisory: sample.advisory,
+      },
       candidate,
     });
-    brokerRead.mockResolvedValue({ ...sample, advisoriesClear: false });
+    brokerRead.mockResolvedValue({
+      ...sample,
+      advisoriesClear: false,
+      advisoryState: 'held',
+      advisory: null,
+    });
     vi.mocked(proof.assess).mockReturnValue('pending');
 
     await expect(service.advance('organization')).resolves.toBe('invalidated');
@@ -174,10 +246,20 @@ describe('AdvanceUsageRebuild', () => {
 
   it('keeps a newly replaced active generation when invalidation is stale', async () => {
     const { service, transaction, brokerRead } = setup({
-      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress },
+      active: {
+        id: 'active',
+        version: 2,
+        brokerAtPromotion: sample.progress,
+        advisory: sample.advisory,
+      },
       candidate: null,
     });
-    brokerRead.mockResolvedValue({ ...sample, advisoriesClear: false });
+    brokerRead.mockResolvedValue({
+      ...sample,
+      advisoriesClear: false,
+      advisoryState: 'held',
+      advisory: null,
+    });
     vi.mocked(transaction.invalidateActive).mockResolvedValue(false);
 
     await expect(service.advance('organization')).resolves.toBe('stale');
@@ -186,10 +268,20 @@ describe('AdvanceUsageRebuild', () => {
 
   it('abandons an uncertain candidate even if the active generation changed before locking', async () => {
     const { service, transaction, brokerRead } = setup({
-      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress },
+      active: {
+        id: 'active',
+        version: 2,
+        brokerAtPromotion: sample.progress,
+        advisory: sample.advisory,
+      },
       candidate,
     });
-    brokerRead.mockResolvedValue({ ...sample, advisoriesClear: false });
+    brokerRead.mockResolvedValue({
+      ...sample,
+      advisoriesClear: false,
+      advisoryState: 'held',
+      advisory: null,
+    });
     vi.mocked(transaction.invalidateActive).mockResolvedValue(false);
 
     await expect(service.advance('organization')).resolves.toBe('stale');
@@ -198,7 +290,12 @@ describe('AdvanceUsageRebuild', () => {
 
   it('waits without invalidation when no broker observation is available', async () => {
     const { service, transaction, brokerRead } = setup({
-      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress },
+      active: {
+        id: 'active',
+        version: 2,
+        brokerAtPromotion: sample.progress,
+        advisory: sample.advisory,
+      },
       candidate: null,
     });
     brokerRead.mockResolvedValue(null);
@@ -209,7 +306,12 @@ describe('AdvanceUsageRebuild', () => {
 
   it('abandons a candidate when the advisory latch is uncleared', async () => {
     const { service, transaction, proof, brokerRead } = setup({ active: null, candidate });
-    brokerRead.mockResolvedValue({ ...sample, advisoriesClear: false });
+    brokerRead.mockResolvedValue({
+      ...sample,
+      advisoriesClear: false,
+      advisoryState: 'held',
+      advisory: null,
+    });
     vi.mocked(proof.assess).mockReturnValue('pending');
 
     await expect(service.advance('organization')).resolves.toBe('invalidated');
@@ -219,7 +321,12 @@ describe('AdvanceUsageRebuild', () => {
 
   it('leaves a replacement candidate intact after an unclear advisory observation', async () => {
     const { service, transaction, brokerRead } = setup({ active: null, candidate });
-    brokerRead.mockResolvedValue({ ...sample, advisoriesClear: false });
+    brokerRead.mockResolvedValue({
+      ...sample,
+      advisoriesClear: false,
+      advisoryState: 'held',
+      advisory: null,
+    });
     vi.mocked(transaction.candidate).mockResolvedValue({ ...candidate, id: 'replacement' });
     vi.mocked(transaction.invalidateActive).mockResolvedValue(false);
 
@@ -229,7 +336,12 @@ describe('AdvanceUsageRebuild', () => {
 
   it('invalidates the observed candidate if it became active before the tenant lock', async () => {
     const { service, transaction, brokerRead } = setup({ active: null, candidate });
-    brokerRead.mockResolvedValue({ ...sample, advisoriesClear: false });
+    brokerRead.mockResolvedValue({
+      ...sample,
+      advisoriesClear: false,
+      advisoryState: 'held',
+      advisory: null,
+    });
     vi.mocked(transaction.candidate).mockResolvedValue(null);
     vi.mocked(transaction.invalidateActive).mockResolvedValue(true);
 
@@ -240,7 +352,12 @@ describe('AdvanceUsageRebuild', () => {
 
   it('invalidates only the sampled active generation when continuity was lost', async () => {
     const { service, transaction, proof } = setup({
-      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress },
+      active: {
+        id: 'active',
+        version: 2,
+        brokerAtPromotion: sample.progress,
+        advisory: sample.advisory,
+      },
       candidate: null,
     });
     vi.mocked(proof.assess).mockReturnValue('lost');
@@ -250,7 +367,12 @@ describe('AdvanceUsageRebuild', () => {
 
   it('treats an active generation changed under the lock as stale', async () => {
     const { service, transaction, proof } = setup({
-      active: { id: 'active', version: 2, brokerAtPromotion: sample.progress },
+      active: {
+        id: 'active',
+        version: 2,
+        brokerAtPromotion: sample.progress,
+        advisory: sample.advisory,
+      },
       candidate: null,
     });
     vi.mocked(proof.assess).mockReturnValue('lost');
@@ -261,7 +383,7 @@ describe('AdvanceUsageRebuild', () => {
   it('starts one candidate before reading any source page', async () => {
     const { service, memberships, transaction } = setup({ active: null, candidate: null });
     await expect(service.advance('organization')).resolves.toBe('started');
-    expect(transaction.startCandidate).toHaveBeenCalledWith(sample.progress);
+    expect(transaction.startCandidate).toHaveBeenCalledWith(sample.progress, sample.advisory);
     expect(memberships).not.toHaveBeenCalled();
   });
 

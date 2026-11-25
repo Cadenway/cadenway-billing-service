@@ -1,6 +1,7 @@
 import type { DatabaseSchema, TenantTransactionRunner } from '@cadenway/nest-common/database';
 import { and, eq } from 'drizzle-orm';
 
+import type { UsageAdvisoryObservation } from '../../../../../application/models/rebuild/usage-advisory-observation.model.js';
 import type { UsageRebuildBrokerProgress } from '../../../../../application/models/rebuild/usage-rebuild-broker-progress.model.js';
 import type { ActiveUsageReader } from '../../../../../application/ports/outbound/persistence/usage/active-usage-reader.port.js';
 import type { UsageTotals } from '../../../../../domain/value-objects/observations/usage-totals.value-object.js';
@@ -18,7 +19,10 @@ export class DrizzleActiveUsageReader implements ActiveUsageReader {
   /** Returns ready totals when the optional continuity check accepts the same generation. */
   public read(
     organizationId: string,
-    confirm?: (checkpoint: UsageRebuildBrokerProgress) => boolean,
+    confirm?: (
+      checkpoint: UsageRebuildBrokerProgress,
+      advisory: UsageAdvisoryObservation | null,
+    ) => boolean,
   ): Promise<UsageTotals | null> {
     return this.runner.run(
       async (scope) => {
@@ -56,7 +60,8 @@ export class DrizzleActiveUsageReader implements ActiveUsageReader {
         if (confirm !== undefined) {
           const checkpoint = usageRebuildCheckpoint.safeParse(streamCheckpoint);
           const frontier = checkpoint.data?.verified ?? checkpoint.data?.promotion;
-          if (frontier === undefined || !confirm(frontier)) return null;
+          if (frontier === undefined || !confirm(frontier, checkpoint.data?.advisory ?? null))
+            return null;
         }
         return totals;
       },
