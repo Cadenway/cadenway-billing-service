@@ -5,7 +5,10 @@ import type { ActiveUsageGeneration } from '../../../../../application/models/re
 import type { UsageRebuildCandidate } from '../../../../../application/models/rebuild/usage-rebuild-candidate.model.js';
 import type { UsageRebuildState } from '../../../../../application/models/rebuild/usage-rebuild-state.model.js';
 import type { UsageRebuildStateReader } from '../../../../../application/ports/outbound/persistence/rebuild/usage-rebuild-state-reader.port.js';
-import { usageRebuildCheckpoint } from '../../mappers/rebuild/usage-rebuild-checkpoint.mapper.js';
+import {
+  usageAdvisoryEvidence,
+  usageRebuildCheckpoint,
+} from '../../mappers/rebuild/usage-rebuild-checkpoint.mapper.js';
 import { usageGenerations, usageOrganizations } from '../../schemas/usage/usage.schema.js';
 
 /** Reads both generation pointers and their checkpoints in one tenant snapshot. */
@@ -54,6 +57,7 @@ export class DrizzleUsageRebuildStateReader implements UsageRebuildStateReader {
               id: row.id,
               version: row.version,
               brokerAtPromotion: checkpoint.verified ?? checkpoint.promotion,
+              advisory: usageAdvisoryEvidence.safeParse(row.certifiedAdvisory).data ?? null,
             };
           } else if (row.status !== 'invalid') {
             throw new Error('Usage active generation has an invalid state.');
@@ -73,6 +77,7 @@ export class DrizzleUsageRebuildStateReader implements UsageRebuildStateReader {
             membership: { cursor: row.membershipCursor, complete: row.membershipScanComplete },
             attachment: { cursor: row.attachmentCursor, complete: row.attachmentScanComplete },
             brokerAtStart: checkpoint.start,
+            advisory: usageAdvisoryEvidence.safeParse(row.startAdvisory).data ?? null,
           };
         }
         return { active, candidate };

@@ -19,6 +19,12 @@ const brokerProgress = z.object({
   ),
 });
 
+/** Validates advisory evidence stored separately from the version-one checkpoint. */
+export const usageAdvisoryEvidence = z.object({
+  createdAt: z.string().min(1),
+  lastSequence: sequence,
+});
+
 /** Validates persisted broker observations before a rebuild resumes. */
 export const usageRebuildCheckpoint = z.object({
   version: z.literal(1),

@@ -1,5 +1,6 @@
 import type { RecordedUsageObservation } from '../../../../../domain/value-objects/observations/recorded-usage-observation.value-object.js';
 import type { UsageTotals } from '../../../../../domain/value-objects/observations/usage-totals.value-object.js';
+import type { UsageAdvisoryObservation } from '../../../../models/rebuild/usage-advisory-observation.model.js';
 import type { UsageRebuildBrokerProgress } from '../../../../models/rebuild/usage-rebuild-broker-progress.model.js';
 import type { UsageRebuildCandidate } from '../../../../models/rebuild/usage-rebuild-candidate.model.js';
 
@@ -13,7 +14,10 @@ export interface UsageRebuildTransaction {
   readonly candidate: () => Promise<UsageRebuildCandidate | null>;
 
   /** Creates and selects an empty candidate with the supplied starting observation. */
-  readonly startCandidate: (brokerAtStart: UsageRebuildBrokerProgress) => Promise<string>;
+  readonly startCandidate: (
+    brokerAtStart: UsageRebuildBrokerProgress,
+    advisory: UsageAdvisoryObservation,
+  ) => Promise<string>;
 
   /** Reads the page's existing observations for its source, generation and tenant. */
   readonly loadObservations: (

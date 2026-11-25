@@ -1,4 +1,5 @@
 import { UsageSnapshotReadError } from '../../../domain/errors/usage-snapshot/usage-snapshot-read.error.js';
+import { sameAdvisoryObservation } from '../../models/rebuild/usage-advisory-observation.model.js';
 import type { ActiveUsageGeneration } from '../../models/rebuild/active-usage-generation.model.js';
 import type { UsageRebuildBrokerProgress } from '../../models/rebuild/usage-rebuild-broker-progress.model.js';
 import type { UsageRebuildCandidate } from '../../models/rebuild/usage-rebuild-candidate.model.js';
@@ -39,7 +40,12 @@ export class AdvanceUsageRebuild {
     const observation = await this.broker.read(signal);
     if (observation === null) return 'waiting';
 
-    if (!observation.advisoriesClear) {
+    if (observation.advisoryState === 'unknown') return 'waiting';
+    if (
+      observation.advisoryState === 'held' ||
+      (current.active !== null &&
+        !sameAdvisoryObservation(current.active.advisory, observation.advisory))
+    ) {
       return this.invalidateUncertain(organizationId, current.active, current.candidate);
     }
 
@@ -76,11 +82,15 @@ export class AdvanceUsageRebuild {
         organizationId,
         brokerAtStart: observation.progress,
         advisoriesClear: observation.advisoriesClear,
+        advisory: observation.advisory,
       });
       return started.created ? 'started' : 'stale';
     }
 
     const candidate = current.candidate;
+    if (!sameAdvisoryObservation(candidate.advisory, observation.advisory)) {
+      return this.abandon(organizationId, candidate);
+    }
     const continuity = this.proof.assess(
       candidate.brokerAtStart,
       observation.progress,
@@ -94,6 +104,7 @@ export class AdvanceUsageRebuild {
         expectedCandidateVersion: candidate.version,
         brokerAtPromotion: observation.progress,
         advisoriesClear: observation.advisoriesClear,
+        advisory: observation.advisory,
       });
       return result === 'pending' ? 'waiting' : result;
     }

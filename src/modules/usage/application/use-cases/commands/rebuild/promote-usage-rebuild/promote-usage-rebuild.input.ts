@@ -1,3 +1,4 @@
+import type { UsageAdvisoryObservation } from '../../../../models/rebuild/usage-advisory-observation.model.js';
 import type { UsageRebuildBrokerProgress } from '../../../../models/rebuild/usage-rebuild-broker-progress.model.js';
 
 /** Independent broker sample taken after both source scans completed. */
@@ -17,5 +18,8 @@ export interface PromoteUsageRebuildInput {
 
   /** Whether the persistent terminal-advisory latch was confirmed clear. */
   readonly advisoriesClear: boolean;
+
+  /** Confirmed clear latch identity. */
+  readonly advisory: UsageAdvisoryObservation | null;
   // #endregion
 }

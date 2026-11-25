@@ -1,4 +1,5 @@
 import type { UsageTotals } from '../../../domain/value-objects/observations/usage-totals.value-object.js';
+import type { UsageAdvisoryObservation } from './usage-advisory-observation.model.js';
 import type { UsageRebuildBrokerProgress } from './usage-rebuild-broker-progress.model.js';
 
 /** A candidate and its source checkpoints, read under the tenant's organization lock. */
@@ -21,5 +22,8 @@ export interface UsageRebuildCandidate {
 
   /** Broker sample captured before any authoritative source page. */
   readonly brokerAtStart: UsageRebuildBrokerProgress;
+
+  /** Certified latch identity, absent on legacy generations. */
+  readonly advisory: UsageAdvisoryObservation | null;
   // #endregion
 }

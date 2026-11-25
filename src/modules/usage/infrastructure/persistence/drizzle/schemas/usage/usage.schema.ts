@@ -71,6 +71,8 @@ export const usageGenerations = pgTable(
     attachmentScanComplete: boolean('attachment_scan_complete').notNull().default(false),
     checkpointVersion: integer('checkpoint_version').notNull().default(1),
     streamCheckpoint: jsonb('stream_checkpoint'),
+    startAdvisory: jsonb('start_advisory'),
+    certifiedAdvisory: jsonb('certified_advisory'),
     version: bigint('version', { mode: 'number' }).notNull().default(1),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),

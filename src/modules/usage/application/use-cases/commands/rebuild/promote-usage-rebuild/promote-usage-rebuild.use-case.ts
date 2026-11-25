@@ -1,3 +1,4 @@
+import { sameAdvisoryObservation } from '../../../../models/rebuild/usage-advisory-observation.model.js';
 import type { UsageBrokerProof } from '../../../../ports/outbound/messaging/rebuild/usage-broker-proof.port.js';
 import type { UsageRebuildUnitOfWork } from '../../../../ports/outbound/transactions/rebuild/usage-rebuild-unit-of-work.port.js';
 import type { PromoteUsageRebuildInput } from './promote-usage-rebuild.input.js';
@@ -25,6 +26,11 @@ export class PromoteUsageRebuild {
       )
         return 'stale';
       if (!candidate.membership.complete || !candidate.attachment.complete) return 'pending';
+      if (!input.advisoriesClear || input.advisory === null) return 'pending';
+      if (!sameAdvisoryObservation(candidate.advisory, input.advisory)) {
+        await transaction.abandon(candidate.id);
+        return 'invalidated';
+      }
       const verdict = this.proof.assess(
         candidate.brokerAtStart,
         input.brokerAtPromotion,

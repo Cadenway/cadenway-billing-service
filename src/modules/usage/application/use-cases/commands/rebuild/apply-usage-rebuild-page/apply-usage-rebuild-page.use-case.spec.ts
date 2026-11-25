@@ -22,6 +22,7 @@ const candidate: UsageRebuildCandidate = {
   membership: { cursor: null, complete: false },
   attachment: { cursor: null, complete: false },
   brokerAtStart: broker,
+  advisory: { createdAt: 'latch', lastSequence: 0 },
 };
 const member = {
   source: 'membership',

@@ -30,7 +30,7 @@ writes verify the current generation pointers under the organization lock before
 organization. The gateway proves that the user is an active owner. The endpoint reads the
 current ready projection when usage ingestion is enabled and a bounded JetStream sample confirms
 continuity against the selected generation's checkpoint. This sample also checks that the terminal
-delivery latch is empty. It pairs measured usage with the effective plan and both limits from one
+delivery latch is clear and its creation time and last sequence match the certified generation. It pairs measured usage with the effective plan and both limits from one
 Payments entitlement snapshot. Otherwise it returns `503 billing.unavailable`.
 All responses use `Cache-Control: private, no-store`.
 
@@ -73,7 +73,7 @@ The rebuild worker reads signed roster, membership and attachment pages outside 
 An organization lock serializes each page, invalidation and promotion. The persisted generation
 and its version fence replay or concurrent updates. Each page uses at most one query to read its
 existing observations and one upsert to write accepted observations before advancing the cursor.
-Promotion requires both scans to finish and JetStream to confirm continuity for all six consumers.
+Promotion requires both scans to finish, JetStream to confirm continuity for all six consumers, and identical clear advisory latch observations before and after the rebuild. A changed latch identity or sequence invalidates the affected generation, even after an advisory is purged. Unknown latch state delays certification and reads without invalidating a generation. Legacy generations without latch evidence are rebuilt. The evidence lives in its own `usage_generations` columns, `start_advisory` for a candidate's start and `certified_advisory` for a promoted generation, outside the JSON checkpoint, so a previous release rewriting that checkpoint during a rollout keeps it; a generation that release promotes has none and is rebuilt once.
 An unavailable source or broker leaves the tenant eligible for a later retry.
 
 ## Decisions

@@ -20,10 +20,16 @@ export class StartUsageRebuild {
       await transaction.lockOrganization();
       const existing = await transaction.candidate();
       if (existing !== null) return { generationId: existing.id, created: false };
-      if (!this.proof.validStart(input.brokerAtStart, input.advisoriesClear)) {
+      if (
+        input.advisory === null ||
+        !this.proof.validStart(input.brokerAtStart, input.advisoriesClear)
+      ) {
         throw new Error('The starting event stream evidence is unavailable.');
       }
-      return { generationId: await transaction.startCandidate(input.brokerAtStart), created: true };
+      return {
+        generationId: await transaction.startCandidate(input.brokerAtStart, input.advisory),
+        created: true,
+      };
     });
   }
   // #endregion

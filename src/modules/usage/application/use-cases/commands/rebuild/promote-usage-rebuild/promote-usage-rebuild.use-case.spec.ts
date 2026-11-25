@@ -23,6 +23,7 @@ const candidate: UsageRebuildCandidate = {
   membership: { cursor: null, complete: true },
   attachment: { cursor: null, complete: true },
   brokerAtStart: broker,
+  advisory: { createdAt: 'latch', lastSequence: 0 },
 };
 const input = {
   organizationId: 'organization',
@@ -30,6 +31,7 @@ const input = {
   expectedCandidateVersion: 5,
   brokerAtPromotion: broker,
   advisoriesClear: true,
+  advisory: { createdAt: 'latch', lastSequence: 0 },
 };
 
 function setup(current: UsageRebuildCandidate | null): {
@@ -79,6 +81,7 @@ describe('usage rebuild generation', () => {
         organizationId: 'organization',
         brokerAtStart: broker,
         advisoriesClear: false,
+        advisory: { createdAt: 'latch', lastSequence: 0 },
       }),
     ).resolves.toEqual({ generationId: 'generation', created: false });
     expect(proof.validStart).not.toHaveBeenCalled();
@@ -92,6 +95,7 @@ describe('usage rebuild generation', () => {
       organizationId: 'organization',
       brokerAtStart: broker,
       advisoriesClear: false,
+      advisory: { createdAt: 'latch', lastSequence: 0 },
     };
     await expect(start.execute(request)).rejects.toThrow();
     expect(transaction.startCandidate).not.toHaveBeenCalled();
@@ -100,6 +104,24 @@ describe('usage rebuild generation', () => {
       created: true,
     });
     expect(transaction.startCandidate).toHaveBeenCalledOnce();
+  });
+
+  it('rejects a candidate when an advisory was recorded and purged during the rebuild', async () => {
+    const { promote, transaction } = setup(candidate);
+    await expect(
+      promote.execute({ ...input, advisory: { createdAt: 'latch', lastSequence: 1 } }),
+    ).resolves.toBe('invalidated');
+    expect(transaction.abandon).toHaveBeenCalledWith(candidate.id);
+    expect(transaction.promote).not.toHaveBeenCalled();
+  });
+
+  it('does not promote on unknown latch evidence', async () => {
+    const { promote, transaction } = setup(candidate);
+    await expect(
+      promote.execute({ ...input, advisoriesClear: false, advisory: null }),
+    ).resolves.toBe('pending');
+    expect(transaction.promote).not.toHaveBeenCalled();
+    expect(transaction.abandon).not.toHaveBeenCalled();
   });
 
   it('checks the sampled frontier against the candidate checkpoint before switching pointers', async () => {
